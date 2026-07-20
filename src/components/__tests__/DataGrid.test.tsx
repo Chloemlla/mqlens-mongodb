@@ -1,5 +1,39 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
+
+// Monaco renders the Query Code panel; mock it as a plain textarea (same shape
+// as the other component tests) so assertions can read the generated code.
+vi.mock('@monaco-editor/react', () => ({
+  default: ({ value, wrapperProps }: { value: string; wrapperProps?: Record<string, unknown> }) => (
+    <textarea data-testid={wrapperProps?.['data-testid'] as string | undefined} value={value} readOnly />
+  ),
+}));
+
+vi.mock('@/hooks/use-theme', () => ({
+  useTheme: () => ({
+    config: {
+      presetId: 'mqlens-dark',
+      mode: 'dark',
+      fonts: { sans: 'Inter', mono: 'JetBrains Mono' },
+      fontSize: 13,
+      spacingDensity: 'cozy',
+      overrides: {},
+    },
+    resolvedMode: 'dark' as const,
+  }),
+  useThemeOptional: () => ({
+    config: {
+      presetId: 'mqlens-dark',
+      mode: 'dark',
+      fonts: { sans: 'Inter', mono: 'JetBrains Mono' },
+      fontSize: 13,
+      spacingDensity: 'cozy',
+      overrides: {},
+    },
+    resolvedMode: 'dark' as const,
+  }),
+}));
+
 import { DataGrid, getExplainTree } from '../DataGrid';
 
 // Collect every node name in the tree (depth-first) for assertions.
@@ -93,9 +127,14 @@ describe('DataGrid Component', () => {
     fireEvent.click(screen.getByRole('button', { name: /json/i }));
 
     // The continuous, line-numbered code panel (not per-document boxes).
-    expect(screen.getByTestId('json-view')).toBeInTheDocument();
-    // Line-number gutter starts at 1.
-    expect(screen.getByText('1')).toBeInTheDocument();
+    const jsonView = screen.getByTestId('json-view');
+    expect(jsonView).toBeInTheDocument();
+    // Line-number gutter starts at 1. The number is exposed via data-num and
+    // rendered through a ::before pseudo-element (not a text node) so that
+    // selecting and copying JSON never picks up the gutter numbers.
+    const firstGutter = jsonView.querySelector('.json-view-gutter');
+    expect(firstGutter).toHaveAttribute('data-num', '1');
+    expect(firstGutter).toBeEmptyDOMElement();
 
     // Foldable: each object/array opens a collapse toggle.
     const folds = screen.getAllByTestId('json-fold-btn');
@@ -185,27 +224,68 @@ describe('DataGrid Component', () => {
     expect(screen.getByText(/"David Miller"/)).toBeInTheDocument();
   });
 
-  it('shows a Query Code tab with the formatted runnable command when queryCode is provided', () => {
-    const code = 'db.products.aggregate([\n  {\n    "$count": "n"\n  }\n])';
-    render(<DataGrid documents={mockDocuments} queryCode={code} />);
+  it('shows a COLLSCAN suggestion banner in the explain panel and fires onCreateSuggestedIndex', () => {
+    const collscanExplain = JSON.stringify({
+      queryPlanner: {
+        namespace: 'shop.orders',
+        parsedQuery: { status: { $eq: 'open' } },
+        winningPlan: { stage: 'COLLSCAN' },
+      },
+    });
+    const onCreateSuggestedIndex = vi.fn();
+    render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={collscanExplain}
+        onCreateSuggestedIndex={onCreateSuggestedIndex}
+      />
+    );
 
-    // The tab appears and opens the formatted query code.
+    const btn = screen.getByTestId('create-suggested-index-btn');
+    expect(btn).toBeInTheDocument();
+    fireEvent.click(btn);
+
+    expect(onCreateSuggestedIndex).toHaveBeenCalledTimes(1);
+    const suggestion = onCreateSuggestedIndex.mock.calls[0][0];
+    expect(suggestion.namespace).toBe('shop.orders');
+    expect(suggestion.keys).toEqual({ status: 1 });
+  });
+
+  it('does not show a suggestion banner when the plan already uses an index', () => {
+    const ixscanExplain = JSON.stringify({
+      queryPlanner: {
+        namespace: 'shop.orders',
+        winningPlan: { stage: 'FETCH', inputStage: { stage: 'IXSCAN', indexName: 'status_1' } },
+      },
+    });
+    render(<DataGrid documents={mockDocuments} explainResult={ixscanExplain} />);
+    expect(screen.queryByTestId('create-suggested-index-btn')).not.toBeInTheDocument();
+  });
+
+  it('shows a Query Code tab rendering the query spec in the selected language', () => {
+    const spec = {
+      db: 'shop',
+      collection: 'products',
+      query: { queryType: 'aggregate' as const, pipeline: [{ $count: 'n' }] },
+    };
+    render(<DataGrid documents={mockDocuments} querySpec={spec} />);
+
+    // The tab appears and opens with the mongosh command by default.
     fireEvent.click(screen.getByTestId('query-code-tab'));
     expect(screen.getByTestId('query-code-panel')).toBeInTheDocument();
-    expect(screen.getByTestId('query-code-content').textContent).toBe(code);
+    const content = () => (screen.getByTestId('query-code-content') as HTMLTextAreaElement).value;
+    expect(content()).toContain('db.products.aggregate(');
+    expect(content()).toContain('$count');
+
+    // Switching the language regenerates the code.
+    fireEvent.change(screen.getByTestId('query-code-lang'), { target: { value: 'Python' } });
+    expect(content()).toContain('from pymongo import MongoClient');
+    fireEvent.change(screen.getByTestId('query-code-lang'), { target: { value: 'mongosh' } });
   });
 
-  it('hides the Query Code tab when no queryCode is provided', () => {
+  it('hides the Query Code tab when no query spec is provided', () => {
     render(<DataGrid documents={mockDocuments} />);
     expect(screen.queryByTestId('query-code-tab')).toBeNull();
-  });
-
-  it('opens the export workspace from the toolbar', () => {
-    const onOpenExport = vi.fn();
-    render(<DataGrid documents={mockDocuments} onOpenExport={onOpenExport} />);
-
-    fireEvent.click(screen.getByTestId('export-btn'));
-    expect(onOpenExport).toHaveBeenCalledTimes(1);
   });
 
   it('renders a pager footer and fires page callbacks', () => {
@@ -245,5 +325,191 @@ describe('DataGrid Component', () => {
     expect(screen.getByTestId('pager-total')).toHaveTextContent('~9');
     rerender(<DataGrid documents={[{ _id: 1 }]} />);
     expect(screen.queryByTestId('pager')).not.toBeInTheDocument();
+  });
+
+  it('switches to the chart view when the Chart toggle is clicked', () => {
+    render(<DataGrid documents={[{ region: 'NA', seats: 3 }, { region: 'EU', seats: 4 }]} />);
+    fireEvent.click(screen.getByLabelText('Chart'));
+    expect(screen.getByTestId('chart-view')).toBeTruthy();
+  });
+
+  it('opens a context menu on right-click and fires document actions', () => {
+    const onEditDocument = vi.fn();
+    render(<DataGrid documents={mockDocuments} onEditDocument={onEditDocument} onDeleteDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.contextMenu(screen.getByText('Alice Smith'));
+    expect(screen.getByTestId('context-menu')).toBeInTheDocument();
+    expect(screen.getByText('Delete document').closest('button')).toHaveClass('is-danger');
+    fireEvent.click(screen.getByText('Edit document'));
+    expect(onEditDocument).toHaveBeenCalledWith(mockDocuments[0]);
+  });
+
+  it('copies a cell value via the context menu', () => {
+    const writeText = vi.fn();
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.contextMenu(screen.getByText('Alice Smith'));
+    fireEvent.click(screen.getByText('Copy value'));
+    expect(writeText).toHaveBeenCalledWith('Alice Smith');
+  });
+
+  it('shows the same context menu in the JSON view', () => {
+    render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} onDeleteDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    fireEvent.contextMenu(screen.getByText(/"Alice Smith"/));
+    expect(screen.getByTestId('context-menu')).toBeInTheDocument();
+    expect(screen.getByText('Edit document')).toBeInTheDocument();
+    expect(screen.getByText('Compare with…')).toBeInTheDocument();
+  });
+
+  it('copies a document as pretty-printed JSON via the copy button and shows a confirmation', () => {
+    const writeText = vi.fn();
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    // No edit/delete handlers: the copy control must still be present on every document.
+    render(<DataGrid documents={mockDocuments} />);
+    // Table view renders one row (and one copy control) per document.
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    const copyButtons = screen.getAllByTestId('copy-doc-btn');
+    expect(copyButtons).toHaveLength(mockDocuments.length);
+
+    fireEvent.click(copyButtons[0]);
+    expect(writeText).toHaveBeenCalledWith(JSON.stringify(mockDocuments[0], null, 2));
+    // The control flips to a "Copied" confirmation state.
+    expect(screen.getAllByLabelText('Copied').length).toBeGreaterThan(0);
+  });
+});
+
+describe('DataGrid — Compare documents', () => {
+  const docs = [
+    { _id: { $oid: '603d779f4f102e3a185c3220' }, name: 'Alice', city: 'NYC' },
+    { _id: { $oid: '603d779f4f102e3a185c3221' }, name: 'Bob', country: 'UK' },
+    { _id: { $oid: '603d779f4f102e3a185c3222' }, name: 'Carol', country: 'FR' },
+  ];
+
+  // The JSON view is virtualized and (in JSDOM, with no real layout height)
+  // only renders the first document's lines, so the two-step flow — which
+  // needs to right-click several distinct rows — exercises Table view
+  // instead, where react-window renders every row of this small fixture.
+  const openMenuForRow = (name: string) => {
+    fireEvent.contextMenu(screen.getByText(name));
+  };
+
+  const renderInTableView = () => {
+    render(<DataGrid documents={docs} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+  };
+
+  it('two-step compare: first pick arms, second pick opens the diff modal', () => {
+    renderInTableView();
+
+    // First doc: open menu, choose "Compare with…".
+    openMenuForRow('Alice');
+    fireEvent.click(screen.getByText('Compare with…'));
+    // No modal yet — we are armed, waiting for the second pick.
+    expect(screen.queryByTestId('document-diff-modal')).not.toBeInTheDocument();
+
+    // Second doc: the menu now offers "Compare with selected".
+    openMenuForRow('Bob');
+    fireEvent.click(screen.getByText('Compare with selected'));
+
+    const modal = screen.getByTestId('document-diff-modal');
+    expect(modal).toBeInTheDocument();
+    expect(within(modal).getByTestId('diff-left')).toHaveTextContent(/"Alice"/);
+    expect(within(modal).getByTestId('diff-right')).toHaveTextContent(/"Bob"/);
+  });
+
+  it('armed source can be canceled from its own context menu', () => {
+    renderInTableView();
+
+    openMenuForRow('Alice');
+    fireEvent.click(screen.getByText('Compare with…'));
+
+    // Re-opening Alice's own menu offers a cancel action, not "compare with selected".
+    openMenuForRow('Alice');
+    expect(screen.queryByText('Compare with selected')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('Cancel compare selection'));
+
+    // Armed state cleared: Alice's menu offers "Compare with…" again, and no
+    // modal ever opened.
+    openMenuForRow('Alice');
+    expect(screen.getByText('Compare with…')).toBeInTheDocument();
+    expect(screen.queryByTestId('document-diff-modal')).not.toBeInTheDocument();
+  });
+
+  it('re-arming with a different document replaces the pending compare source', () => {
+    renderInTableView();
+
+    openMenuForRow('Alice');
+    fireEvent.click(screen.getByText('Compare with…'));
+
+    // Arm Bob instead of finishing the compare with Alice — this should
+    // replace Alice as the pending source.
+    openMenuForRow('Bob');
+    fireEvent.click(screen.getByText('Compare with… (replace selection)'));
+
+    // Finishing the compare now pairs Bob with Carol, not Alice.
+    openMenuForRow('Carol');
+    fireEvent.click(screen.getByText('Compare with selected'));
+
+    const modal = screen.getByTestId('document-diff-modal');
+    expect(within(modal).getByTestId('diff-left')).toHaveTextContent(/"Bob"/);
+    expect(within(modal).getByTestId('diff-right')).toHaveTextContent(/"Carol"/);
+    expect(within(modal).queryByText(/"Alice"/)).not.toBeInTheDocument();
+  });
+
+  it('clears an armed compare source when the documents array is replaced (query re-run)', () => {
+    const { rerender } = render(<DataGrid documents={docs} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    // Arm Alice as the compare source.
+    openMenuForRow('Alice');
+    fireEvent.click(screen.getByText('Compare with…'));
+
+    // Query re-run / paging / sorting replaces the documents array (same
+    // instance, but a fresh reference — content can even be identical).
+    const freshDocs = docs.map((d) => ({ ...d }));
+    rerender(<DataGrid documents={freshDocs} onEditDocument={() => {}} />);
+
+    // Bob's menu should offer only the plain arm action, not "Compare with
+    // selected" — the old armed source must not survive the new result set.
+    openMenuForRow('Bob');
+    expect(screen.getByText('Compare with…')).toBeInTheDocument();
+    expect(screen.queryByText('Compare with selected')).not.toBeInTheDocument();
+  });
+});
+
+describe('DataGrid column resize', () => {
+  it('renders a resize handle per table column and resizes with the keyboard', () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    const handle = screen.getByLabelText('Resize name column');
+    const headerCell = handle.parentElement as HTMLElement;
+    expect(headerCell.style.width).toBe('180px');
+    fireEvent.keyDown(handle, { key: 'ArrowRight' });
+    expect(headerCell.style.width).toBe('196px');
+    fireEvent.keyDown(handle, { key: 'ArrowLeft' });
+    fireEvent.keyDown(handle, { key: 'ArrowLeft' });
+    expect(headerCell.style.width).toBe('164px');
+  });
+
+  it('resizes the tree view key column with the keyboard', () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+    const handle = screen.getByLabelText('Resize key column');
+    fireEvent.keyDown(handle, { key: 'ArrowRight' });
+    const tree = screen.getByTestId('tree-view');
+    expect(tree.style.getPropertyValue('--treetable-keyw')).toBe('336px');
+  });
+
+  it('resizes a table column by mouse drag', () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    const handle = screen.getByLabelText('Resize name column');
+    const headerCell = handle.parentElement as HTMLElement;
+    fireEvent.mouseDown(handle, { clientX: 300 });
+    fireEvent.mouseMove(window, { clientX: 360 });
+    fireEvent.mouseUp(window);
+    expect(headerCell.style.width).toBe('240px');
   });
 });

@@ -28,10 +28,12 @@ dist-ssr
 # Local-only: internal design/process docs + AI-assistant tooling
 # (kept on disk, intentionally not published)
 docs/superpowers/
+.superpowers/
 GO-LIVE.md
 .claude/
 CLAUDE.md
 AGENTS.md
+.cursor/
 
 # Local-only: per-developer macOS signing override (auto-merged by Tauri on
 # macOS for `tauri dev`/`tauri build`). Pins the local Developer ID cert the

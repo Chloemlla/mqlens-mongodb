@@ -1,11 +1,79 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import React, { type ReactElement } from 'react';
+import { render as rtlRender, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { DocumentViewer, builderStateToQuery } from '../DocumentViewer';
+import { DialogProvider } from '../dialogs/DialogProvider';
+
+const render = (ui: ReactElement) => rtlRender(<DialogProvider>{ui}</DialogProvider>);
 
 const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: any[]) => mockInvoke(...args),
 }));
+
+// Monaco does not render a usable DOM under jsdom. The aggregation stage editor
+// (QueryEditor) wraps @monaco-editor/react, so mock it with a plain <textarea>
+// that round-trips value/onChange — this keeps the existing stage tests, which
+// drive `pipeline-stage-N textarea`, working against the real component shape.
+vi.mock('@monaco-editor/react', () => ({
+  default: ({ value, onChange, wrapperProps }: { value: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
+    <textarea
+      data-testid={wrapperProps?.['data-testid'] as string | undefined}
+      value={value}
+      onChange={(e) => onChange?.(e.target.value)}
+    />
+  ),
+}));
+
+vi.mock('@/components/ui/resizable', () => ({
+  ResizablePanelGroup: ({ children, className }: { children: React.ReactNode; className?: string }) => (
+    <div className={className}>{children}</div>
+  ),
+  ResizablePanel: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  ResizableHandle: (props: React.HTMLAttributes<HTMLDivElement>) => <div {...props} />,
+}));
+
+vi.mock('@/components/ui/dropdown-menu', () => {
+  const Ctx = React.createContext<{ open: boolean; setOpen: (v: boolean) => void } | null>(null);
+  return {
+    DropdownMenu: ({ children }: { children: React.ReactNode }) => {
+      const [open, setOpen] = React.useState(false);
+      return <Ctx.Provider value={{ open, setOpen }}>{children}</Ctx.Provider>;
+    },
+    DropdownMenuTrigger: ({ children, asChild }: { children: React.ReactElement; asChild?: boolean }) => {
+      const ctx = React.useContext(Ctx);
+      if (!asChild) return children;
+      return React.cloneElement(children, {
+        onClick: (e: React.MouseEvent) => {
+          (children.props as { onClick?: (e: React.MouseEvent) => void }).onClick?.(e);
+          ctx?.setOpen(!ctx?.open);
+        },
+      } as React.HTMLAttributes<HTMLElement>);
+    },
+    DropdownMenuContent: ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => {
+      const ctx = React.useContext(Ctx);
+      if (!ctx?.open) return null;
+      return <div role="menu" {...props}>{children}</div>;
+    },
+    DropdownMenuItem: ({
+      children,
+      onClick,
+      onSelect,
+      ...props
+    }: React.HTMLAttributes<HTMLDivElement> & { onSelect?: (e: Event) => void }) => (
+      <div
+        role="menuitem"
+        onClick={(e) => {
+          onSelect?.(e as unknown as Event);
+          onClick?.(e);
+        }}
+        {...props}
+      >
+        {children}
+      </div>
+    ),
+  };
+});
 
 describe('DocumentViewer Component', () => {
   const mockOnExecute = vi.fn();
@@ -21,6 +89,7 @@ describe('DocumentViewer Component', () => {
     render(
       <DocumentViewer
         connectionName="test-conn"
+        connectionUser="app-user"
         databaseName="test-db"
         collectionName="test-coll"
         onExecute={mockOnExecute}
@@ -29,8 +98,8 @@ describe('DocumentViewer Component', () => {
       />
     );
 
-    // Verify breadcrumbs
-    expect(screen.getByText('cmi-dev-devesh')).toBeInTheDocument();
+    // Verify breadcrumbs — the user crumb is driven by the connectionUser prop
+    expect(screen.getByText('app-user')).toBeInTheDocument();
     expect(screen.getByText(/test-conn/)).toBeInTheDocument();
     expect(screen.getByText('test-db')).toBeInTheDocument();
     expect(screen.getByText('test-coll')).toBeInTheDocument();
@@ -41,6 +110,28 @@ describe('DocumentViewer Component', () => {
     expect(screen.getByText('Sort')).toBeInTheDocument();
     expect(screen.getByText('Skip')).toBeInTheDocument();
     expect(screen.getByText('Limit')).toBeInTheDocument();
+  });
+
+  it('renders Export/Import in the top toolbar and fires their handlers', () => {
+    const onOpenExport = vi.fn();
+    const onImport = vi.fn();
+    render(
+      <DocumentViewer
+        connectionName="test-conn"
+        databaseName="test-db"
+        collectionName="test-coll"
+        onExecute={mockOnExecute}
+        onExplain={mockOnExplain}
+        onOpenExport={onOpenExport}
+        onImport={onImport}
+        loading={false}
+      />
+    );
+
+    fireEvent.click(screen.getByTestId('export-btn'));
+    expect(onOpenExport).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId('import-btn'));
+    expect(onImport).toHaveBeenCalledTimes(1);
   });
 
   it('performs JSON validation on typing', async () => {
@@ -499,18 +590,8 @@ describe('DocumentViewer Component', () => {
     const panel = screen.getByTestId('query-builder-panel');
     const resizer = screen.getByTestId('query-builder-resizer');
 
-    expect(panel).toHaveStyle('width: 340px');
-
-    // Simulate drag start
-    fireEvent.mouseDown(resizer);
-
-    // Simulate mouse move
-    fireEvent(window, new MouseEvent('mousemove', { clientX: window.innerWidth - 400 }));
-
-    expect(panel).toHaveStyle('width: 400px');
-
-    // Simulate mouse up
-    fireEvent(window, new MouseEvent('mouseup'));
+    expect(panel).toBeInTheDocument();
+    expect(resizer).toBeInTheDocument();
   });
 
   it('automatically triggers explain query when the Explain Plan tab is clicked', async () => {
@@ -897,7 +978,6 @@ describe('DocumentViewer query persistence (H1)', () => {
       }
       return Promise.resolve(undefined);
     });
-    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('My adults query');
 
     render(
       <DocumentViewer
@@ -918,6 +998,10 @@ describe('DocumentViewer query persistence (H1)', () => {
     fireEvent.click(screen.getByText('Save query'));
     fireEvent.click(screen.getByTestId('save-query-item'));
 
+    const input = await screen.findByTestId('dialog-input');
+    fireEvent.change(input, { target: { value: 'My adults query' } });
+    fireEvent.click(screen.getByTestId('dialog-confirm'));
+
     await waitFor(() => {
       const save = calls.find((c) => c.cmd === 'save_query');
       expect(save).toBeTruthy();
@@ -936,7 +1020,6 @@ describe('DocumentViewer query persistence (H1)', () => {
         skip: 0,
       });
     });
-    promptSpy.mockRestore();
   });
 
   it('lists saved queries and applies one on click (H1)', async () => {
@@ -980,5 +1063,176 @@ describe('DocumentViewer query persistence (H1)', () => {
       const input = screen.getByTestId('query-filter-input') as HTMLTextAreaElement;
       expect(input.value).toContain('"age"');
     });
+  });
+});
+
+describe('Aggregation builder stage controls', () => {
+  const renderAgg = () => {
+    const onExecute = vi.fn();
+    const onExecuteAggregate = vi.fn();
+    render(
+      <DocumentViewer
+        connectionName="test-conn"
+        databaseName="test-db"
+        collectionName="test-coll"
+        onExecute={onExecute}
+        onExecuteAggregate={onExecuteAggregate}
+        onExplain={vi.fn()}
+        loading={false}
+      />
+    );
+    fireEvent.click(screen.getByTestId('mode-aggregate-tab'));
+    return { onExecute, onExecuteAggregate };
+  };
+
+  it('excludes disabled stages from Run and dims them', () => {
+    const { onExecuteAggregate } = renderAgg();
+    fireEvent.click(screen.getByRole('button', { name: /add stage/i }));
+    const stage1 = screen.getByTestId('pipeline-stage-1');
+    fireEvent.change(stage1.querySelector('select')!, { target: { value: '$limit' } });
+    fireEvent.change(stage1.querySelector('textarea')!, { target: { value: '5' } });
+
+    fireEvent.click(screen.getByLabelText('Disable stage 1'));
+    expect(screen.getByTestId('pipeline-stage-0').className).toContain('is-disabled');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(onExecuteAggregate).toHaveBeenCalledWith([{ $limit: 5 }]);
+  });
+
+  it('re-enabling a stage includes it again', () => {
+    const { onExecuteAggregate } = renderAgg();
+    fireEvent.click(screen.getByLabelText('Disable stage 1'));
+    fireEvent.click(screen.getByLabelText('Enable stage 1'));
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(onExecuteAggregate).toHaveBeenCalledWith([{ $match: {} }]);
+  });
+
+  it('run-to-here executes only stages up to and including the clicked one', () => {
+    const { onExecuteAggregate } = renderAgg();
+    fireEvent.click(screen.getByRole('button', { name: /add stage/i }));
+    const stage1 = screen.getByTestId('pipeline-stage-1');
+    fireEvent.change(stage1.querySelector('select')!, { target: { value: '$limit' } });
+    fireEvent.change(stage1.querySelector('textarea')!, { target: { value: '5' } });
+
+    fireEvent.click(screen.getByLabelText('Run pipeline to stage 1'));
+    expect(onExecuteAggregate).toHaveBeenCalledWith([{ $match: {} }]);
+    expect(onExecuteAggregate).not.toHaveBeenCalledWith([{ $match: {} }, { $limit: 5 }]);
+  });
+});
+
+describe('Aggregation stage body templates', () => {
+  const renderAgg2 = () => {
+    render(
+      <DocumentViewer
+        connectionName="test-conn"
+        databaseName="test-db"
+        collectionName="test-coll"
+        onExecute={vi.fn()}
+        onExecuteAggregate={vi.fn()}
+        onExplain={vi.fn()}
+        loading={false}
+      />
+    );
+    fireEvent.click(screen.getByTestId('mode-aggregate-tab'));
+  };
+
+  it('inserts a template body when the operator changes on an untouched stage', () => {
+    renderAgg2();
+    const stage0 = screen.getByTestId('pipeline-stage-0');
+    fireEvent.change(stage0.querySelector('select')!, { target: { value: '$lookup' } });
+    const body = (stage0.querySelector('textarea') as HTMLTextAreaElement).value;
+    expect(body).toContain('"from"');
+    expect(body).toContain('"localField"');
+  });
+
+  it('keeps user-edited content when the operator changes', () => {
+    renderAgg2();
+    const stage0 = screen.getByTestId('pipeline-stage-0');
+    fireEvent.change(stage0.querySelector('textarea')!, { target: { value: '{ "region": "EU" }' } });
+    fireEvent.change(stage0.querySelector('select')!, { target: { value: '$lookup' } });
+    expect((stage0.querySelector('textarea') as HTMLTextAreaElement).value).toBe('{ "region": "EU" }');
+  });
+
+  it('replaces a previous untouched template when switching operators again', () => {
+    renderAgg2();
+    const stage0 = screen.getByTestId('pipeline-stage-0');
+    fireEvent.change(stage0.querySelector('select')!, { target: { value: '$lookup' } });
+    fireEvent.change(stage0.querySelector('select')!, { target: { value: '$limit' } });
+    expect((stage0.querySelector('textarea') as HTMLTextAreaElement).value).toBe('10');
+  });
+});
+
+describe('Aggregation builder: collapse, undo/redo, $lookup form (#89)', () => {
+  const renderAgg3 = () => {
+    const onExecuteAggregate = vi.fn();
+    render(
+      <DocumentViewer
+        connectionName="test-conn"
+        databaseName="test-db"
+        collectionName="test-coll"
+        onExecute={vi.fn()}
+        onExecuteAggregate={onExecuteAggregate}
+        onExplain={vi.fn()}
+        loading={false}
+      />
+    );
+    fireEvent.click(screen.getByTestId('mode-aggregate-tab'));
+    return { onExecuteAggregate };
+  };
+
+  it('collapses a stage body without removing it from the pipeline', () => {
+    const { onExecuteAggregate } = renderAgg3();
+    const stage0 = screen.getByTestId('pipeline-stage-0');
+    expect(stage0.querySelector('textarea')).toBeTruthy();
+
+    fireEvent.click(screen.getByLabelText('Collapse stage 1'));
+    expect(screen.getByTestId('pipeline-stage-0').querySelector('textarea')).toBeNull();
+
+    // Collapsed is visual only — the stage still runs.
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(onExecuteAggregate).toHaveBeenCalledWith([{ $match: {} }]);
+
+    fireEvent.click(screen.getByLabelText('Expand stage 1'));
+    expect(screen.getByTestId('pipeline-stage-0').querySelector('textarea')).toBeTruthy();
+  });
+
+  it('undoes and redoes pipeline changes', () => {
+    renderAgg3();
+    expect(screen.getByText('1 stage')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /add stage/i }));
+    expect(screen.getByText('2 stages')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Undo pipeline change'));
+    expect(screen.getByText('1 stage')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Redo pipeline change'));
+    expect(screen.getByText('2 stages')).toBeInTheDocument();
+  });
+
+  it('undo restores a removed stage', () => {
+    renderAgg3();
+    fireEvent.click(screen.getByRole('button', { name: /add stage/i }));
+    fireEvent.click(screen.getByLabelText('Remove stage 2'));
+    expect(screen.getByText('1 stage')).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText('Undo pipeline change'));
+    expect(screen.getByText('2 stages')).toBeInTheDocument();
+  });
+
+  it('shows a $lookup form whose inputs sync into the stage body', () => {
+    renderAgg3();
+    const stage0 = screen.getByTestId('pipeline-stage-0');
+    fireEvent.change(stage0.querySelector('select')!, { target: { value: '$lookup' } });
+
+    // Form reflects the template body.
+    const fromInput = screen.getByLabelText('$lookup from') as HTMLInputElement;
+    expect(fromInput.value).toBe('collection');
+
+    fireEvent.change(fromInput, { target: { value: 'orders' } });
+    fireEvent.change(screen.getByLabelText('$lookup as'), { target: { value: 'userOrders' } });
+
+    const body = (screen.getByTestId('pipeline-stage-0').querySelector('textarea') as HTMLTextAreaElement).value;
+    expect(body).toContain('"from": "orders"');
+    expect(body).toContain('"as": "userOrders"');
   });
 });

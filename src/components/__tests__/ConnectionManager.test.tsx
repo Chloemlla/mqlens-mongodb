@@ -1,11 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ReactElement } from 'react';
 import { render as rtlRender, screen, fireEvent, waitFor } from '@testing-library/react';
-import { ConnectionManager, buildUri, buildSshConfig } from '../ConnectionManager';
+import { ConnectionManager, buildUri, buildSshConfig, parseUriIntoFields, summarizeConnectionError } from '../ConnectionManager';
 import { DialogProvider } from '../dialogs/DialogProvider';
 
 // ConnectionManager now uses the in-app dialog system, so it must render inside a provider.
 const render = (ui: ReactElement) => rtlRender(<DialogProvider>{ui}</DialogProvider>);
+
+async function pickSelectOption(testId: string, optionName: RegExp | string) {
+  fireEvent.click(screen.getByTestId(testId));
+  fireEvent.click(await screen.findByRole('option', { name: optionName }));
+}
 
 // Mock Tauri invoke function
 const mockInvoke = vi.fn();
@@ -18,6 +23,20 @@ vi.mock('@tauri-apps/api/core', () => ({
       this.onmessage?.(m);
     }
   },
+}));
+
+// File dialogs and text-file IO used by URI import/export.
+const mockOpenDialog = vi.fn();
+const mockSaveDialog = vi.fn();
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  open: (...args: any[]) => mockOpenDialog(...args),
+  save: (...args: any[]) => mockSaveDialog(...args),
+}));
+const mockReadTextFile = vi.fn();
+const mockWriteTextFile = vi.fn();
+vi.mock('@tauri-apps/plugin-fs', () => ({
+  readTextFile: (...args: any[]) => mockReadTextFile(...args),
+  writeTextFile: (...args: any[]) => mockWriteTextFile(...args),
 }));
 
 const baseConn = {
@@ -41,6 +60,136 @@ const baseConn = {
   appName: '',
   defaultDb: '',
 } as any;
+
+describe('summarizeConnectionError', () => {
+  it('reports a TLS trust problem buried inside a server-selection timeout', () => {
+    const raw = 'Kind: Server selection timeout: No available servers. Topology: { Servers: [ { Address: 1.2.3.4:27017, Type: Unknown, Error: Kind: I/O error: invalid peer certificate: UnknownIssuer } ] }';
+    const { summary, hint } = summarizeConnectionError(raw);
+    expect(summary).toMatch(/certificate not trusted/i);
+    expect(hint).toMatch(/CA file|invalid certificates/i);
+  });
+
+  it('detects authentication failures', () => {
+    expect(summarizeConnectionError('Authentication failed. (18)').summary).toMatch(/authentication failed/i);
+  });
+
+  it('detects connection refused', () => {
+    expect(summarizeConnectionError('Kind: I/O error: Connection refused (os error 61)').summary).toMatch(/refused/i);
+  });
+
+  it('falls back to a trimmed first line for unknown errors', () => {
+    const { summary, hint } = summarizeConnectionError('Kind: some weird failure\nwith more lines');
+    expect(summary).toBe('some weird failure');
+    expect(hint).toBeUndefined();
+  });
+
+  it('summarizes a bare server-selection timeout when no deeper cause is present', () => {
+    expect(summarizeConnectionError('Server selection timeout: No available servers').summary).toMatch(/selection timed out/i);
+  });
+});
+
+describe('parseUriIntoFields (import → form)', () => {
+  it('extracts credentials, host/port, and default db into editable fields', () => {
+    const f = parseUriIntoFields('mongodb://alice:s3cr3t@db.example.com:27018/shop?tls=true');
+    expect(f.authUser).toBe('alice');
+    expect(f.authPass).toBe('s3cr3t');
+    expect(f.authMethod).toBe('scram-256');
+    expect(f.tlsMode).toBe('system');
+    expect(f.defaultDb).toBe('shop');
+    expect(f.hosts).toEqual([{ host: 'db.example.com', port: '27018' }]);
+    expect(f.topology).toBe('standalone');
+  });
+
+  it('splits multiple hosts and detects a replica set (with its name)', () => {
+    const f = parseUriIntoFields('mongodb://h1:27017,h2:27017,h3:27017/?replicaSet=rs0');
+    expect(f.hosts).toEqual([
+      { host: 'h1', port: '27017' },
+      { host: 'h2', port: '27017' },
+      { host: 'h3', port: '27017' },
+    ]);
+    expect(f.topology).toBe('replicaSet');
+    expect(f.replicaSetName).toBe('rs0');
+    expect(f.protocol).toBe('mongodb');
+  });
+
+  it('detects a sharded cluster from multiple hosts without a replicaSet', () => {
+    const f = parseUriIntoFields('mongodb://m1:27017,m2:27017/admin');
+    expect(f.topology).toBe('sharded');
+  });
+
+  it('detects a direct/standalone connection from directConnection=true', () => {
+    const f = parseUriIntoFields('mongodb://h1:27017,h2:27017/?directConnection=true');
+    expect(f.topology).toBe('standalone');
+    expect(f.directConnection).toBe(true);
+  });
+
+  it('maps TLS options (CA file, tlsInsecure) into the form', () => {
+    const f = parseUriIntoFields('mongodb://h:27017/?tls=true&tlsCAFile=%2Fetc%2Fca.pem&tlsInsecure=true');
+    expect(f.tlsMode).toBe('file');
+    expect(f.tlsCa).toBe('/etc/ca.pem');
+    expect(f.tlsAllowInvalidCerts).toBe(true);
+    expect(f.tlsAllowInvalidHosts).toBe(true);
+  });
+
+  it('maps individual allow-invalid TLS flags', () => {
+    const f = parseUriIntoFields('mongodb://h:27017/?tls=true&tlsAllowInvalidCertificates=true');
+    expect(f.tlsMode).toBe('system');
+    expect(f.tlsAllowInvalidCerts).toBe(true);
+    expect(f.tlsAllowInvalidHosts).toBe(false);
+  });
+
+  it('detects mongodb+srv: protocol, port-less host, sharded topology', () => {
+    const f = parseUriIntoFields('mongodb+srv://user:pw@cluster0.abcd.mongodb.net/app');
+    expect(f.protocol).toBe('mongodb+srv');
+    expect(f.hosts).toEqual([{ host: 'cluster0.abcd.mongodb.net', port: '' }]);
+    expect(f.topology).toBe('sharded');
+    expect(f.defaultDb).toBe('app');
+  });
+
+  it('handles a bare host with no credentials', () => {
+    const f = parseUriIntoFields('mongodb://localhost:27017');
+    expect(f.authUser).toBe('');
+    expect(f.authMethod).toBe('none');
+    expect(f.hosts).toEqual([{ host: 'localhost', port: '27017' }]);
+  });
+
+  it('decodes percent-encoded credentials', () => {
+    const f = parseUriIntoFields('mongodb://user%40corp:p%40ss@localhost:27017/');
+    expect(f.authUser).toBe('user@corp');
+    expect(f.authPass).toBe('p@ss');
+  });
+
+  it('round-trips with buildUri back to a standalone form', () => {
+    const f = parseUriIntoFields('mongodb://alice:s3cr3t@db.example.com:27018/shop');
+    const uri = buildUri({ ...baseConn, ...f, authPass: f.authPass });
+    expect(uri).toContain('db.example.com:27018');
+    expect(uri).toContain('alice');
+  });
+});
+
+describe('buildUri protocol + topology', () => {
+  it('emits a mongodb+srv:// scheme with port-less hosts', () => {
+    const uri = buildUri({ ...baseConn, protocol: 'mongodb+srv', topology: 'sharded', hosts: [{ host: 'cluster0.abcd.mongodb.net', port: '' }] });
+    expect(uri.startsWith('mongodb+srv://')).toBe(true);
+    expect(uri).toContain('cluster0.abcd.mongodb.net');
+    expect(uri).not.toContain(':27017');
+    expect(uri).not.toContain('directConnection');
+  });
+
+  it('sharded topology joins the host list without a replicaSet param', () => {
+    const uri = buildUri({ ...baseConn, topology: 'sharded', hosts: [{ host: 'm1', port: '27017' }, { host: 'm2', port: '27017' }] });
+    expect(uri).toContain('m1:27017,m2:27017');
+    expect(uri).not.toContain('replicaSet');
+    expect(uri).not.toContain('directConnection');
+  });
+
+  it('only emits directConnection for a single-host standalone', () => {
+    const single = buildUri({ ...baseConn, topology: 'standalone', directConnection: true, hosts: [{ host: 'h1', port: '27017' }] });
+    expect(single).toContain('directConnection=true');
+    const multi = buildUri({ ...baseConn, topology: 'standalone', directConnection: true, hosts: [{ host: 'h1', port: '27017' }, { host: 'h2', port: '27017' }] });
+    expect(multi).not.toContain('directConnection');
+  });
+});
 
 describe('buildUri TLS handling (C8)', () => {
   it('adds tlsCAFile when TLS mode is "file" and a CA path is set', () => {
@@ -222,6 +371,111 @@ describe('buildSshConfig (C7)', () => {
     });
     expect(cfg?.auth).toEqual({ type: 'password', password: 'pw' });
   });
+
+  it('builds an agent-auth config without any secret material', () => {
+    const cfg = buildSshConfig({
+      ...sshBase,
+      sshEnabled: true,
+      sshHost: 'h',
+      sshUser: 'u',
+      sshAuth: 'agent',
+      sshKey: '~/.ssh/id_ed25519', // stale form state must not leak into the config
+      sshPass: 'leftover',
+    });
+    expect(cfg?.auth).toEqual({ type: 'agent' });
+  });
+});
+
+describe('SSH agent auth in the editor (issue #130)', () => {
+  const agentProfile = {
+    id: 'p-agent',
+    name: 'Bastion',
+    uri: 'mongodb://db.internal:27017',
+    ssh: { enabled: true, host: 'jump.example.com', port: 22, user: 'ops', auth: { type: 'agent' } },
+    color_tag: null,
+  };
+
+  const renderWithProfiles = (profiles: any[], onSave: (p: any) => void = () => {}) => {
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve(profiles);
+      if (cmd === 'save_connection_profile') {
+        onSave(args.profile);
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+  };
+
+  const openSshTab = async () => {
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.click(screen.getByRole('button', { name: /ssh tunnel/i }));
+    fireEvent.click(screen.getByLabelText(/enable ssh tunnel/i));
+  };
+
+  it('selecting "SSH agent" hides key/password inputs, shows the security note, and saves auth {type: agent}', async () => {
+    let savedProfile: any = null;
+    renderWithProfiles([], (p) => { savedProfile = p; });
+
+    await openSshTab();
+    fireEvent.change(screen.getByPlaceholderText('ssh.server.com'), { target: { value: 'jump.example.com' } });
+    fireEvent.change(screen.getByPlaceholderText('deploy'), { target: { value: 'ops' } });
+
+    await pickSelectOption('ssh-auth-select', /ssh agent/i);
+
+    // Key/password inputs are hidden; the security note is shown instead.
+    expect(screen.queryByPlaceholderText('~/.ssh/id_ed25519')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('••••••••')).not.toBeInTheDocument();
+    const note = screen.getByTestId('ssh-agent-note');
+    expect(note).toHaveTextContent(/SSH_AUTH_SOCK/);
+    expect(note).toHaveTextContent(/never/i);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => {
+      expect(savedProfile?.ssh).toEqual({
+        enabled: true,
+        host: 'jump.example.com',
+        port: 22,
+        user: 'ops',
+        auth: { type: 'agent' },
+      });
+    });
+  });
+
+  it('switching back from agent to key/password restores those inputs', async () => {
+    renderWithProfiles([]);
+    await openSshTab();
+
+    await pickSelectOption('ssh-auth-select', /ssh agent/i);
+    expect(screen.getByTestId('ssh-agent-note')).toBeInTheDocument();
+
+    await pickSelectOption('ssh-auth-select', /private key/i);
+    expect(screen.queryByTestId('ssh-agent-note')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('~/.ssh/id_ed25519')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/leave blank if the key is unencrypted/i)).toBeInTheDocument();
+
+    await pickSelectOption('ssh-auth-select', /^password$/i);
+    expect(screen.queryByTestId('ssh-agent-note')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('••••••••')).toBeInTheDocument();
+  });
+
+  it('round-trips a saved profile with agent auth through edit and save', async () => {
+    let savedProfile: any = null;
+    renderWithProfiles([agentProfile], (p) => { savedProfile = p; });
+
+    fireEvent.click((await screen.findAllByText('Bastion'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+    // The SSH tab reflects the persisted agent auth without touching anything.
+    fireEvent.click(screen.getByRole('button', { name: /ssh tunnel/i }));
+    expect(screen.getByTestId('ssh-agent-note')).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('~/.ssh/id_ed25519')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => {
+      expect(savedProfile?.ssh).toEqual(agentProfile.ssh);
+    });
+  });
 });
 
 describe('ConnectionManager Component', () => {
@@ -293,6 +547,7 @@ describe('ConnectionManager Component', () => {
     expect(screen.getByText('New Connection')).toBeInTheDocument();
 
     const nameInput = screen.getByLabelText(/display name/i);
+    await pickSelectOption('topology-select', /full uri string only/i);
     const uriInput = screen.getByLabelText(/connection uri/i);
 
     fireEvent.change(nameInput, { target: { value: 'Staging DB' } });
@@ -309,6 +564,8 @@ describe('ConnectionManager Component', () => {
         name: 'Staging DB',
         uri: 'mongodb://staging:27017',
         ssh: null,
+        color_tag: null,
+        mcp_enabled: false,
       });
       // The nested modal should be closed
       expect(screen.queryByText('New Connection')).not.toBeInTheDocument();
@@ -343,6 +600,7 @@ describe('ConnectionManager Component', () => {
       expect(screen.getAllByText('Production').length).toBeGreaterThan(0);
     });
 
+    fireEvent.click(screen.getByTestId('folder-filter-select'));
     expect(screen.getByRole('option', { name: 'Production' })).toBeInTheDocument();
     expect(screen.queryByTestId('new-folder-name-input')).not.toBeInTheDocument();
 
@@ -382,6 +640,7 @@ describe('ConnectionManager Component', () => {
     const newBtn = await screen.findByRole('button', { name: /new\.\.\./i });
     fireEvent.click(newBtn);
 
+    await pickSelectOption('topology-select', /full uri string only/i);
     const uriInput = screen.getByLabelText(/connection uri/i);
     fireEvent.change(uriInput, { target: { value: 'mongodb://mock' } });
 
@@ -435,6 +694,7 @@ describe('ConnectionManager Component', () => {
     const newBtn = await screen.findByRole('button', { name: /new\.\.\./i });
     fireEvent.click(newBtn);
 
+    await pickSelectOption('topology-select', /full uri string only/i);
     const uriInput = screen.getByLabelText(/connection uri/i);
     fireEvent.change(uriInput, { target: { value: 'mongodb://invalid' } });
 
@@ -442,10 +702,16 @@ describe('ConnectionManager Component', () => {
     const testBtn = screen.getByRole('button', { name: /test connection/i });
     fireEvent.click(testBtn);
 
-    // Verify error feedback is displayed
+    // Verify summarized error feedback is displayed (raw error lives behind "Show details").
     await waitFor(() => {
-      expect(screen.getByText('Connection timed out')).toBeInTheDocument();
+      expect(screen.getByTestId('test-result-summary')).toHaveTextContent(/timed out/i);
     }, { timeout: 4000 });
+    fireEvent.click(screen.getByTestId('test-error-details-toggle'));
+    expect(screen.getByTestId('test-error-detail')).toHaveTextContent('Connection timed out');
+
+    // The result can be dismissed.
+    fireEvent.click(screen.getByTestId('test-dismiss'));
+    expect(screen.queryByTestId('test-result-summary')).toBeNull();
   });
 
   it('calls connect_db and triggers onConnect callback when Connect is clicked', async () => {
@@ -488,7 +754,7 @@ describe('ConnectionManager Component', () => {
 
     // Verify it called connect_db and passed connection ID to callback
     await waitFor(() => {
-      expect(handleConnect).toHaveBeenCalledWith('conn-abc-123', 'Mock DB 1', 'mongodb://mock', 'profile-1');
+      expect(handleConnect).toHaveBeenCalledWith('conn-abc-123', 'Mock DB 1', 'mongodb://mock', 'profile-1', undefined);
     });
   });
 
@@ -560,5 +826,383 @@ describe('ConnectionManager Component', () => {
     const connectBtn = screen.getByRole('button', { name: /already connected/i });
     expect(connectBtn).toBeInTheDocument();
     expect(connectBtn).toBeDisabled();
+  });
+
+  it('saves a color tag from the preset palette', async () => {
+    let savedProfile: any = null;
+    let profilesList: any[] = [];
+
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve(profilesList);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        profilesList = [args.profile];
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(
+      <ConnectionManager
+        isOpen={true}
+        onClose={() => {}}
+        onConnect={() => {}}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'Prod' } });
+    await pickSelectOption('topology-select', /full uri string only/i);
+    fireEvent.change(screen.getByLabelText(/connection uri/i), { target: { value: 'mongodb://prod' } });
+    fireEvent.click(screen.getByTestId('color-swatch-blue'));
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(savedProfile).toMatchObject({
+        name: 'Prod',
+        uri: 'mongodb://prod',
+        color_tag: '#3b82f6',
+      });
+    });
+  });
+
+  it('saves a custom color from the color picker', async () => {
+    let savedProfile: any = null;
+    let profilesList: any[] = [];
+
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve(profilesList);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        profilesList = [args.profile];
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(
+      <ConnectionManager
+        isOpen={true}
+        onClose={() => {}}
+        onConnect={() => {}}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'Custom' } });
+    await pickSelectOption('topology-select', /full uri string only/i);
+    fireEvent.change(screen.getByLabelText(/connection uri/i), { target: { value: 'mongodb://custom' } });
+    expect(screen.getByLabelText('Pick a custom color')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('color-picker-custom'), { target: { value: '#a1b2c3' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(savedProfile).toMatchObject({
+        name: 'Custom',
+        uri: 'mongodb://custom',
+        color_tag: '#a1b2c3',
+      });
+    });
+  });
+
+  it('shows color dots in the profile list for tagged connections', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') {
+        return Promise.resolve([
+          { id: 'p1', name: 'Staging', uri: 'mongodb://staging', color_tag: '#22c55e' },
+          { id: 'p2', name: 'Prod', uri: 'mongodb://prod' },
+        ]);
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(
+      <ConnectionManager
+        isOpen={true}
+        onClose={() => {}}
+        onConnect={() => {}}
+      />
+    );
+
+    await waitFor(() => expect(screen.getAllByText('Staging')[0]).toBeInTheDocument());
+    const dots = screen.getAllByTestId('connection-color-dot');
+    expect(dots.length).toBeGreaterThanOrEqual(1);
+    dots.forEach((dot) => {
+      expect(dot).toHaveStyle({ backgroundColor: 'rgb(34, 197, 94)' });
+    });
+  });
+
+  it('clears a saved color tag when none is selected', async () => {
+    let savedProfile: any = null;
+    const profilesList = [
+      { id: 'p1', name: 'Staging', uri: 'mongodb://staging', color_tag: '#22c55e' },
+    ];
+
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve(profilesList);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        profilesList[0] = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(
+      <ConnectionManager
+        isOpen={true}
+        onClose={() => {}}
+        onConnect={() => {}}
+      />
+    );
+
+    await waitFor(() => expect(screen.getAllByText('Staging')[0]).toBeInTheDocument());
+    fireEvent.click(screen.getAllByText('Staging')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+    fireEvent.click(screen.getByTestId('color-swatch-none'));
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(savedProfile).toMatchObject({
+        id: 'p1',
+        color_tag: null,
+      });
+    });
+  });
+});
+
+describe('MCP opt-in flag (#98)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it('saving with "Expose to MCP agents" checked round-trips mcp_enabled: true', async () => {
+    let savedProfile: any = null;
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'Agent DB' } });
+    await pickSelectOption('topology-select', /full uri string only/i);
+    fireEvent.change(screen.getByLabelText(/connection uri/i), { target: { value: 'mongodb://agent' } });
+
+    fireEvent.click(screen.getByLabelText(/expose to mcp agents/i));
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(savedProfile).toMatchObject({
+        name: 'Agent DB',
+        uri: 'mongodb://agent',
+        mcp_enabled: true,
+      });
+    });
+  });
+
+  it('editing a profile without mcp_enabled renders the checkbox unchecked', async () => {
+    const legacyProfile = { id: 'p-legacy', name: 'Legacy', uri: 'mongodb://legacy:27017' };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([legacyProfile]);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+
+    await waitFor(() => expect(screen.getAllByText('Legacy')[0]).toBeInTheDocument());
+    fireEvent.click(screen.getAllByText('Legacy')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+    expect(screen.getByLabelText(/expose to mcp agents/i)).not.toBeChecked();
+  });
+
+  it('toggling the checkbox on and saving an old profile adds mcp_enabled: true', async () => {
+    let savedProfile: any = null;
+    const legacyProfile = { id: 'p-legacy', name: 'Legacy', uri: 'mongodb://legacy:27017' };
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([legacyProfile]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+
+    await waitFor(() => expect(screen.getAllByText('Legacy')[0]).toBeInTheDocument());
+    fireEvent.click(screen.getAllByText('Legacy')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+    const checkbox = screen.getByLabelText(/expose to mcp agents/i);
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(savedProfile).toMatchObject({
+        id: 'p-legacy',
+        mcp_enabled: true,
+      });
+    });
+  });
+
+  it('duplicating an MCP-exposed profile resets "Expose to MCP agents" to unchecked, while editing it keeps it checked (final fix wave)', async () => {
+    const mcpProfile = { id: 'p-mcp', name: 'Agent DB', uri: 'mongodb://agent:27017', mcp_enabled: true };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([mcpProfile]);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+
+    await waitFor(() => expect(screen.getAllByText('Agent DB')[0]).toBeInTheDocument());
+    fireEvent.click(screen.getAllByText('Agent DB')[0]);
+
+    // Edit path: unaffected, keeps mapping the original's flag.
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+    expect(screen.getByLabelText(/expose to mcp agents/i)).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+
+    // Duplicate path: the new profile starts unexposed regardless.
+    fireEvent.click(screen.getAllByText('Agent DB')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^duplicate$/i }));
+    expect(screen.getByLabelText(/expose to mcp agents/i)).not.toBeChecked();
+  });
+});
+
+describe('URI import and export', () => {
+  const prodProfile = {
+    id: 'p1',
+    name: 'Prod',
+    uri: 'mongodb://alice:pw@db1:27017/sales?tls=true&proxyHost=p&proxyPassword=ppw',
+    ssh: { enabled: true, host: 'jump', port: 22, user: 'ops', auth: { type: 'password', password: 'sp' } },
+    color_tag: null,
+  };
+  const redacted = 'mongodb://alice@db1:27017/sales?tls=true&proxyHost=p';
+
+  const setupClipboard = () => {
+    const readText = vi.fn();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { readText, writeText },
+      configurable: true,
+    });
+    return { readText, writeText };
+  };
+
+  const renderManager = (profiles: any[] = []) => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve(profiles);
+      return Promise.resolve([]);
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+  };
+
+  const openImportMenu = async () => {
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.pointerDown(screen.getByTestId('import-uri-btn'), { button: 0, ctrlKey: false });
+  };
+
+  beforeEach(() => {
+    mockOpenDialog.mockReset();
+    mockSaveDialog.mockReset();
+    mockReadTextFile.mockReset();
+    mockWriteTextFile.mockReset();
+  });
+
+  it('imports a URI from the clipboard into the editor form', async () => {
+    const { readText } = setupClipboard();
+    readText.mockResolvedValue('MONGO_URL="mongodb://u:p@db.imported.example:27017/app"');
+    renderManager();
+
+    await openImportMenu();
+    fireEvent.click(await screen.findByTestId('import-from-clipboard'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/db\.imported\.example/)).toBeInTheDocument();
+    });
+  });
+
+  it('shows an inline error when the clipboard has no mongodb URI', async () => {
+    const { readText } = setupClipboard();
+    readText.mockResolvedValue('postgres://u:p@host/db');
+    renderManager();
+
+    await openImportMenu();
+    fireEvent.click(await screen.findByTestId('import-from-clipboard'));
+
+    expect(await screen.findByTestId('import-uri-error')).toHaveTextContent(/no mongodb/i);
+  });
+
+  it('imports the first URI found in a picked file', async () => {
+    setupClipboard();
+    mockOpenDialog.mockResolvedValue('/tmp/creds.env');
+    mockReadTextFile.mockResolvedValue('A=1\nURL=mongodb+srv://u@cluster.file.example/app\n');
+    renderManager();
+
+    await openImportMenu();
+    fireEvent.click(await screen.findByTestId('import-from-file'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/cluster\.file\.example/)).toBeInTheDocument();
+    });
+  });
+
+  it('exports a redacted URI by default, notes the SSH tunnel, and includes the password on demand', async () => {
+    const { writeText } = setupClipboard();
+    renderManager([prodProfile]);
+
+    fireEvent.click((await screen.findAllByText('Prod'))[0]);
+    fireEvent.click(screen.getByTestId('export-uri-btn'));
+
+    const preview = await screen.findByTestId('export-uri-preview');
+    expect(preview).toHaveTextContent(redacted);
+    expect(preview).not.toHaveTextContent('pw');
+    expect(screen.getByTestId('export-ssh-note')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('export-copy-btn'));
+    expect(writeText).toHaveBeenCalledWith(redacted);
+
+    fireEvent.click(screen.getByTestId('export-include-password'));
+    await waitFor(() => expect(preview).toHaveTextContent('alice:pw@'));
+
+    fireEvent.click(screen.getByTestId('export-copy-btn'));
+    expect(writeText).toHaveBeenLastCalledWith(prodProfile.uri);
+  });
+
+  it('drops the query string when connection settings are excluded', async () => {
+    setupClipboard();
+    renderManager([prodProfile]);
+
+    fireEvent.click((await screen.findAllByText('Prod'))[0]);
+    fireEvent.click(screen.getByTestId('export-uri-btn'));
+
+    const preview = await screen.findByTestId('export-uri-preview');
+    fireEvent.click(screen.getByTestId('export-include-settings'));
+    await waitFor(() => expect(preview).toHaveTextContent(/^mongodb:\/\/alice@db1:27017\/sales$/));
+  });
+
+  it('saves the export to a file via the save dialog', async () => {
+    setupClipboard();
+    mockSaveDialog.mockResolvedValue('/tmp/conn.txt');
+    mockWriteTextFile.mockResolvedValue(undefined);
+    renderManager([prodProfile]);
+
+    fireEvent.click((await screen.findAllByText('Prod'))[0]);
+    fireEvent.click(screen.getByTestId('export-uri-btn'));
+    await screen.findByTestId('export-uri-preview');
+    fireEvent.click(screen.getByTestId('export-save-btn'));
+
+    await waitFor(() => {
+      expect(mockWriteTextFile).toHaveBeenCalledWith('/tmp/conn.txt', `${redacted}\n`);
+    });
   });
 });

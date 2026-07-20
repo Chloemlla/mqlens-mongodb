@@ -10,10 +10,17 @@ pub struct ConnectionProfile {
     pub id: String,
     pub name: String,
     pub uri: String,
+    // Optional color tag for quick visual identification in the sidebar (#34).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_tag: Option<String>,
     // Optional SSH tunnel config. `#[serde(default)]` keeps older 3-field
     // connections.json files readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<crate::ssh_tunnel::SshConfig>,
+    /// Expose this profile to MCP agents (Settings → MCP / #98). Old files
+    /// without the field deserialize as false — never opted in by surprise.
+    #[serde(default)]
+    pub mcp_enabled: bool,
 }
 
 fn default_anthropic_model() -> String {
@@ -27,6 +34,57 @@ fn default_openai_model() -> String {
 }
 fn default_gemini_model() -> String {
     "gemini-1.5-flash".to_string()
+}
+fn default_update_channel() -> String {
+    "stable".to_string()
+}
+
+fn default_preset_id() -> String {
+    "mqlens-dark".to_string()
+}
+
+fn default_theme_mode() -> String {
+    "dark".to_string()
+}
+
+fn default_font_sans() -> String {
+    "Inter".to_string()
+}
+
+fn default_font_mono() -> String {
+    "JetBrains Mono".to_string()
+}
+
+fn default_font_size() -> u8 {
+    13
+}
+
+fn default_spacing_density() -> String {
+    "cozy".to_string()
+}
+
+fn default_ui_zoom() -> f32 {
+    1.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct AppearanceSettings {
+    #[serde(default = "default_preset_id")]
+    pub preset_id: String,
+    #[serde(default = "default_theme_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub overrides: std::collections::HashMap<String, String>,
+    #[serde(default = "default_font_sans")]
+    pub font_sans: String,
+    #[serde(default = "default_font_mono")]
+    pub font_mono: String,
+    #[serde(default = "default_font_size")]
+    pub font_size: u8,
+    #[serde(default = "default_spacing_density")]
+    pub spacing_density: String,
+    #[serde(default = "default_ui_zoom")]
+    pub ui_zoom: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -55,6 +113,12 @@ pub struct AppSettings {
     // Extra instructions appended to the generated system prompt for any provider.
     #[serde(default)]
     pub ai_custom_instructions: String,
+    // Auto-update channel: "stable" (default) or "dev".
+    #[serde(default = "default_update_channel")]
+    pub update_channel: String,
+    // UI appearance: theme preset, fonts, font size, spacing density.
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
 }
 
 impl Default for AppSettings {
@@ -70,6 +134,8 @@ impl Default for AppSettings {
             gemini_model: default_gemini_model(),
             local_commands: std::collections::HashMap::new(),
             ai_custom_instructions: String::new(),
+            update_channel: default_update_channel(),
+            appearance: AppearanceSettings::default(),
         }
     }
 }
@@ -438,13 +504,10 @@ pub fn reencrypt_data_files(
 }
 
 #[tauri::command]
-pub async fn test_mongosh_path(path: String) -> Result<String, String> {
-    let executable = if path.trim().is_empty() {
-        "mongosh"
-    } else {
-        path.trim()
-    };
-    let output = Command::new(executable)
+pub async fn test_mongosh_path(app_handle: tauri::AppHandle, path: String) -> Result<String, String> {
+    let app_data_dir = app_handle.path().app_data_dir().ok();
+    let executable = crate::toolsetup::resolve_mongosh_executable(&path, app_data_dir.as_deref());
+    let output = Command::new(&executable)
         .arg("--version")
         .output()
         .map_err(|e| format!("Failed to run mongosh: {}", e))?;

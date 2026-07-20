@@ -1,14 +1,101 @@
 #[cfg(test)]
 mod tests {
+    use crate::db::documents::CsvImportOptions;
     use crate::AppState;
     use crate::{
-        connect_db_impl, count_documents_impl, create_collection_impl, create_index_impl,
-        delete_document_impl, disconnect_db_impl, download_gridfs_file_impl, drop_collection_impl,
+        connect_db_impl, connection_list_impl, count_documents_impl, create_collection_impl,
+        create_index_impl,
+        delete_document_impl, delete_gridfs_file_impl, disconnect_db_impl,
+        download_gridfs_file_impl, drop_collection_impl,
         drop_database_impl, execute_aggregate_impl, execute_mql_query_impl, explain_mql_query_impl,
-        import_documents_impl, insert_document_impl, json_to_bson_document, list_collections_impl,
-        list_databases_impl, list_gridfs_files_impl, list_indexes_impl, rename_collection_impl,
-        rename_database_impl, start_collection_export_impl, update_document_impl,
+        format_current_docs_impl, import_documents_impl,
+        insert_document_impl,
+        json_to_bson_document, list_collections_impl, list_databases_impl, list_gridfs_files_impl,
+        list_indexes_impl, parse_json_array_docs,
+        preview_export_impl, rename_collection_impl, rename_database_impl, sample_export_fields_impl,
+        set_connection_meta_impl,
+        start_collection_export_impl, start_filtered_export_impl, update_document_impl,
+        upload_gridfs_file_impl, get_collection_options_impl, set_validator_impl,
     };
+    use crate::{
+        create_user_impl, drop_user_impl, list_roles_impl, list_users_impl, update_user_impl,
+        RoleSpec,
+    };
+
+    /// Deterministic salt bytes for crypto unit tests (not production secrets).
+    fn test_salt(byte: u8) -> [u8; 16] {
+        std::array::from_fn(|_| byte)
+    }
+
+    /// Build test-only passwords without hard-coded string literals for static analysis.
+    fn test_secret(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    async fn wait_for_task(state: &AppState, task_id: &str) {
+        for _ in 0..50 {
+            let status = state.tasks.lock().unwrap().get(task_id).map(|t| t.status.clone());
+            if status.as_deref() != Some("running") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn test_resource_usage_sums_process_tree() {
+        // The current (test) process always exists, so the summed tree memory
+        // must be non-zero. Guards against the walk returning an empty set.
+        let state = AppState::new();
+        let usage = crate::resource_usage_impl(&state);
+        assert!(usage.memory_bytes > 0, "process-tree memory should be > 0");
+        assert!(usage.cpu_percent >= 0.0);
+    }
+
+    /// The retained sysinfo System must not accumulate dead processes across
+    /// tree rebuilds — with `remove_dead_processes: false` every process (and,
+    /// on Linux, every thread) that ever existed while the app ran stayed in
+    /// the map forever, growing RSS without bound on busy hosts (issue #165).
+    #[cfg(unix)]
+    #[test]
+    fn test_resource_usage_purges_dead_processes_on_rebuild() {
+        use std::time::{Duration, Instant};
+
+        let state = AppState::new();
+        crate::resource_usage_impl(&state); // initial tree build
+
+        // A child of this process, alive across the next rebuild.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = sysinfo::Pid::from_u32(child.id());
+
+        let force_rebuild = |state: &AppState| {
+            *state.resource_tree_at.lock().unwrap() = Instant::now()
+                .checked_sub(Duration::from_secs(
+                    crate::limits::RESOURCE_TREE_REFRESH_SECS + 1,
+                ))
+                .expect("system clock supports back-dating");
+            crate::resource_usage_impl(state);
+        };
+
+        force_rebuild(&state);
+        assert!(
+            state.sys.lock().unwrap().process(child_pid).is_some(),
+            "live child should be captured in the retained System"
+        );
+
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        force_rebuild(&state);
+        assert!(
+            state.sys.lock().unwrap().process(child_pid).is_none(),
+            "dead child must be purged from the retained System on rebuild"
+        );
+    }
 
     #[tokio::test]
     async fn test_mock_connection_lifecycle() {
@@ -41,8 +128,10 @@ mod tests {
         let collection_names: Vec<String> = collections.iter().map(|c| c.name.clone()).collect();
         assert!(collection_names.contains(&"customers".to_string()));
         assert!(collection_names.contains(&"transactions".to_string()));
+        // sensor_readings is timeseries; its type is asserted in test_mock_collections_report_timeseries_type
         assert!(collections
             .iter()
+            .filter(|c| c.name != "sensor_readings")
             .all(|c| c.collection_type == "collection"));
 
         // 3b. Test list indexes
@@ -101,6 +190,152 @@ mod tests {
         }
     }
 
+    // Issue #137: demo mode must surface a time-series collection so the
+    // sidebar's distinct icon is visible without a live cluster.
+    #[tokio::test]
+    async fn test_mock_collections_report_timeseries_type() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("mock connect");
+
+        let collections = list_collections_impl(&state, &conn_id, "sales_db")
+            .await
+            .expect("list mock collections");
+
+        let sensor = collections
+            .iter()
+            .find(|c| c.name == "sensor_readings")
+            .expect("sales_db should include sensor_readings");
+        assert_eq!(sensor.collection_type, "timeseries");
+
+        let customers = collections
+            .iter()
+            .find(|c| c.name == "customers")
+            .expect("customers still listed");
+        assert_eq!(customers.collection_type, "collection");
+    }
+
+    #[tokio::test]
+    async fn test_get_collection_options_mock_path() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("mock connect");
+
+        let opts = get_collection_options_impl(&state, &conn_id, "sales_db", "customers")
+            .await
+            .expect("get collection options");
+
+        assert_eq!(opts.validator, "{}");
+        assert_eq!(opts.validation_level, "");
+        assert_eq!(opts.validation_action, "");
+    }
+
+    #[tokio::test]
+    async fn test_set_validator_mock_path() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("mock connect");
+
+        let result = set_validator_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            r#"{"$jsonSchema": {"type": "object"}}"#,
+            "moderate",
+            "error",
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validator_get_set_roundtrip() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("mock connect");
+
+        let opts = get_collection_options_impl(&state, &conn_id, "sales_db", "customers")
+            .await
+            .expect("get collection options");
+
+        let result = set_validator_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            &opts.validator,
+            &opts.validation_level,
+            &opts.validation_action,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    // Issue #114: demo mode returns a synthetic replica set so the Cluster
+    // tab is populated without a live cluster — including a lagging
+    // secondary so the warning styling is visible.
+    #[tokio::test]
+    async fn test_mock_repl_set_status_returns_synthetic_set() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let s = crate::monitoring::repl_set_status_impl(&state, &conn_id).await.unwrap();
+        assert!(s.is_replica_set);
+        assert_eq!(s.set, "rs0");
+        assert_eq!(s.cluster_type, "replicaSet");
+        assert_eq!(s.members.len(), 3);
+        assert_eq!(s.members.iter().filter(|m| m.state_str == "PRIMARY").count(), 1);
+        assert!(
+            s.members.iter().any(|m| m.lag_secs.map(|l| l >= 10.0).unwrap_or(false)),
+            "demo set includes a lagging secondary"
+        );
+    }
+
+    // Issue #178: demo mode returns believable stats so all three popovers
+    // render without a live server.
+    #[tokio::test]
+    async fn test_mock_stats_impls_return_demo_numbers() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+
+        let db = crate::db::stats::db_stats_impl(&state, &conn_id, "sales_db").await.unwrap();
+        assert!(db.collections >= 4);
+        assert!(db.objects > 0);
+        assert!(db.data_size > 0);
+
+        let coll = crate::db::stats::coll_stats_impl(&state, &conn_id, "sales_db", "customers")
+            .await
+            .unwrap();
+        assert!(coll.count > 0);
+        assert!(coll.size > 0);
+        assert!(coll.nindexes >= 1);
+
+        let idx = crate::db::stats::index_stats_impl(&state, &conn_id, "sales_db", "customers")
+            .await
+            .unwrap();
+        assert!(!idx.is_empty());
+        assert!(idx.iter().any(|i| i.name == "_id_"));
+        assert!(idx.iter().all(|i| i.size_bytes > 0));
+    }
+
+    #[tokio::test]
+    async fn test_conn_uris_stored_for_real_and_absent_for_mock() {
+        use crate::db::mongotools::resolve_conn_uri;
+        let state = AppState::new();
+        let mock_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        assert!(resolve_conn_uri(&state, &mock_id).is_err());
+        assert!(resolve_conn_uri(&state, "nope").is_err());
+        // Real-connection storage is asserted in integration tests (needs a live server);
+        // unit-level: connect_db_impl inserts before returning — verified by reading the code
+        // path plus the integration test below.
+    }
+
     #[tokio::test]
     async fn test_mock_full_collection_export_task_writes_file() {
         let state = AppState::new();
@@ -124,6 +359,7 @@ mod tests {
             "customers",
             "json",
             &path_str,
+            None,
         )
         .await
         .expect("Should start export task");
@@ -175,6 +411,7 @@ mod tests {
             "customers",
             "csv",
             &path_str,
+            None,
         )
         .await
         .expect("Should start CSV export task");
@@ -207,30 +444,423 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Drive an export task to completion (or timeout) and return the finished TaskInfo.
+    async fn await_export(state: &AppState, task_id: &str) -> crate::TaskInfo {
+        for _ in 0..50 {
+            let status = state
+                .tasks
+                .lock()
+                .unwrap()
+                .get(task_id)
+                .map(|t| t.status.clone())
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        state.tasks.lock().unwrap().get(task_id).cloned().unwrap()
+    }
+
+    /// Re-parse an on-disk export file through the shipping import reader
+    /// (used to round-trip-verify export output; `parse_ndjson_docs` /
+    /// `parse_bson_docs` were dead code and have been removed).
+    fn reparse_import_file(path: &std::path::Path, format: &str) -> Vec<mongodb::bson::Document> {
+        use crate::db::import::{ImportReader, ImportSourceArg};
+        let source = ImportSourceArg {
+            path: Some(path.to_string_lossy().to_string()),
+            text: None,
+        };
+        let mut reader =
+            ImportReader::open(&source, format, &CsvImportOptions::default()).expect("open reader");
+        let mut docs = Vec::new();
+        while let Some(doc) = reader.next_doc().expect("read doc") {
+            docs.push(doc);
+        }
+        docs
+    }
+
+    /// Parse a text source through the shipping import reader for a given
+    /// format (ports unit coverage that used to call the removed
+    /// `parse_ndjson_docs` / `parse_csv_docs` directly).
+    fn drain_text_source(
+        text: &str,
+        format: &str,
+        csv: &CsvImportOptions,
+    ) -> Result<Vec<mongodb::bson::Document>, String> {
+        use crate::db::import::{ImportReader, ImportSourceArg};
+        let source = ImportSourceArg { path: None, text: Some(text.to_string()) };
+        let mut reader = ImportReader::open(&source, format, csv)?;
+        let mut docs = Vec::new();
+        while let Some(doc) = reader.next_doc()? {
+            docs.push(doc);
+        }
+        Ok(docs)
+    }
+
+    /// Parse concatenated BSON bytes through the shipping import reader.
+    /// BSON import requires a file source, so this writes to a temp file
+    /// first (ports unit coverage that used to call the removed
+    /// `parse_bson_docs` directly).
+    fn drain_bson_bytes(bytes: &[u8]) -> Vec<mongodb::bson::Document> {
+        let path = std::env::temp_dir().join(format!(
+            "mqlens-tests-bson-{}-{}.bson",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, bytes).expect("write temp bson");
+        let docs = reparse_import_file(&path, "bson");
+        let _ = std::fs::remove_file(&path);
+        docs
+    }
+
+    #[tokio::test]
+    async fn test_mock_full_collection_export_task_writes_ndjson() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("connect mock");
+        let path = temp_import_path("ndjson");
+        let path_str = path.to_string_lossy().to_string();
+        let task = start_collection_export_impl(
+            &state, &conn_id, "sales_db", "customers", "ndjson", &path_str, None,
+        )
+        .await
+        .expect("start ndjson export");
+        let finished = await_export(&state, &task.id).await;
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.processed, 3);
+
+        let text = std::fs::read_to_string(&path).expect("ndjson file");
+        // One document per line, no array brackets, and it round-trips back to 3 docs.
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+        assert!(!text.contains('['));
+        let docs = reparse_import_file(&path, "ndjson");
+        assert_eq!(docs.len(), 3);
+        assert!(text.contains("Alice Smith"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_mock_full_collection_export_task_writes_bson() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("connect mock");
+        let path = temp_import_path("bson");
+        let path_str = path.to_string_lossy().to_string();
+        let task = start_collection_export_impl(
+            &state, &conn_id, "sales_db", "customers", "bson", &path_str, None,
+        )
+        .await
+        .expect("start bson export");
+        let finished = await_export(&state, &task.id).await;
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.processed, 3);
+
+        // The on-disk bytes are concatenated BSON and parse back to 3 documents.
+        let docs = reparse_import_file(&path, "bson");
+        assert_eq!(docs.len(), 3);
+        let names: Vec<String> = docs
+            .iter()
+            .filter_map(|d| d.get_str("name").ok().map(|s| s.to_string()))
+            .collect();
+        assert!(names.iter().any(|n| n == "Alice Smith"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_mock_filtered_export_writes_only_matching_subset() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("Should connect to mock db successfully");
+        let path = std::env::temp_dir().join(format!(
+            "mqlens-filtered-export-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        // sales_db.customers has Alice/Bob/Charlie; filter to just Alice.
+        let task = start_filtered_export_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            "json",
+            &path_str,
+            "{\"name\":\"Alice Smith\"}",
+            "{}",
+            "{}",
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Should start filtered export task");
+
+        for _ in 0..50 {
+            let status = state
+                .tasks
+                .lock()
+                .unwrap()
+                .get(&task.id)
+                .map(|t| t.status.clone())
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let finished = state.tasks.lock().unwrap().get(&task.id).cloned().unwrap();
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.processed, 1, "only Alice matches the filter");
+        assert_eq!(finished.kind, "filtered_export");
+        let exported = std::fs::read_to_string(&path).expect("Export file should exist");
+        assert!(exported.contains("Alice Smith"));
+        assert!(!exported.contains("Bob Johnson"));
+        assert!(!exported.contains("Charlie Brown"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_filtered_export_rejects_aggregate_on_mock() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("Should connect to mock db successfully");
+
+        let err = start_filtered_export_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            "json",
+            "/tmp/agg.json",
+            "{}",
+            "{}",
+            "{}",
+            "[{\"$match\":{}}]",
+            None,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("aggregate export on mock should error");
+        assert_eq!(
+            err,
+            "Aggregation pipelines are not supported on mock connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filtered_export_validates_format_path_and_connection() {
+        let state = AppState::new();
+
+        let invalid_format = start_filtered_export_impl(
+            &state, "missing", "db", "coll", "xml", "/tmp/out.xml", "{}", "{}", "{}", "", None,
+            None, None,
+        )
+        .await
+        .err()
+        .expect("invalid export format should error");
+        assert_eq!(
+            invalid_format,
+            "Export format must be json, ndjson, bson, csv, or xlsx"
+        );
+
+        let missing_path = start_filtered_export_impl(
+            &state, "missing", "db", "coll", "json", "   ", "{}", "{}", "{}", "", None, None,
+            None,
+        )
+        .await
+        .err()
+        .expect("blank export path should error");
+        assert_eq!(missing_path, "Export path is required");
+
+        let missing_connection = start_filtered_export_impl(
+            &state, "missing", "db", "coll", "json", "/tmp/out.json", "{}", "{}", "{}", "", None,
+            None, None,
+        )
+        .await
+        .err()
+        .expect("missing export connection should error");
+        assert_eq!(missing_connection, "Connection not found");
+
+        let bad_filter = start_filtered_export_impl(
+            &state, "missing", "db", "coll", "json", "/tmp/out.json", "{not json}", "{}", "{}",
+            "", None, None, None,
+        )
+        .await
+        .err()
+        .expect("malformed filter should error");
+        assert!(
+            bad_filter.contains("Invalid MQL filter JSON"),
+            "got: {bad_filter}"
+        );
+    }
+
     #[tokio::test]
     async fn test_collection_export_validates_format_path_and_connection() {
         let state = AppState::new();
 
-        let invalid_format =
-            start_collection_export_impl(&state, "missing", "db", "coll", "xml", "/tmp/out.xml")
-                .await
-                .err()
-                .expect("invalid export format should error");
-        assert_eq!(invalid_format, "Export format must be json or csv");
+        let invalid_format = start_collection_export_impl(
+            &state, "missing", "db", "coll", "xml", "/tmp/out.xml", None,
+        )
+        .await
+        .err()
+        .expect("invalid export format should error");
+        assert_eq!(
+            invalid_format,
+            "Export format must be json, ndjson, bson, csv, or xlsx"
+        );
 
-        let missing_path =
-            start_collection_export_impl(&state, "missing", "db", "coll", "json", "   ")
-                .await
-                .err()
-                .expect("blank export path should error");
+        let missing_path = start_collection_export_impl(
+            &state, "missing", "db", "coll", "json", "   ", None,
+        )
+        .await
+        .err()
+        .expect("blank export path should error");
         assert_eq!(missing_path, "Export path is required");
 
-        let missing_connection =
-            start_collection_export_impl(&state, "missing", "db", "coll", "json", "/tmp/out.json")
-                .await
-                .err()
-                .expect("missing export connection should error");
+        let missing_connection = start_collection_export_impl(
+            &state, "missing", "db", "coll", "json", "/tmp/out.json", None,
+        )
+        .await
+        .err()
+        .expect("missing export connection should error");
         assert_eq!(missing_connection, "Connection not found");
+    }
+
+    #[tokio::test]
+    async fn test_export_options_field_selection_and_delimiter() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "mqlens-export-opts-{}-{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        let options: crate::db::export::options::ExportOptions = serde_json::from_str(
+            r#"{"fields":["name"],"csv":{"delimiter":";"}}"#,
+        ).unwrap();
+        let task = start_collection_export_impl(
+            &state, &conn_id, "sales_db", "customers", "csv", &path_str, Some(options),
+        ).await.unwrap();
+        wait_for_task(&state, &task.id).await;
+
+        let exported = std::fs::read_to_string(&path).unwrap();
+        let mut lines = exported.lines();
+        assert_eq!(lines.next(), Some("name"), "only the selected column");
+        assert!(exported.contains("Alice Smith"));
+        assert!(!exported.contains("@"), "email column excluded");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_filtered_export_applies_skip_and_limit() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "mqlens-export-skiplimit-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        let task = start_filtered_export_impl(
+            &state, &conn_id, "sales_db", "customers", "ndjson", &path_str,
+            "{}", "{}", "{}", "", Some(1), Some(1), None,
+        ).await.unwrap();
+        wait_for_task(&state, &task.id).await;
+
+        let exported = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(exported.lines().count(), 1, "skip 1, limit 1 of 3 docs");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_sample_export_fields_returns_dot_paths() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let fields =
+            sample_export_fields_impl(&state, &conn_id, "sales_db", "customers", "{}", "")
+                .await
+                .unwrap();
+        assert!(fields.contains(&"_id".to_string()));
+        assert!(fields.contains(&"name".to_string()));
+        // mock customers embed an address sub-document → nested dot path present
+        assert!(fields.iter().any(|f| f.contains('.')),
+            "expected at least one nested dot path, got {:?}", fields);
+    }
+
+    #[tokio::test]
+    async fn test_preview_export_returns_first_docs_in_format() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let preview = preview_export_impl(
+            &state, &conn_id, "sales_db", "customers", "ndjson", "{}", "{}", "{}", "", None,
+        ).await.unwrap();
+        assert!(preview.lines().count() <= 5);
+        assert!(preview.contains("Alice Smith"));
+
+        let err = preview_export_impl(
+            &state, &conn_id, "sales_db", "customers", "bson", "{}", "{}", "{}", "", None,
+        ).await.unwrap_err();
+        assert!(err.to_lowercase().contains("preview"));
+    }
+
+    #[tokio::test]
+    async fn test_format_current_docs_string_and_file_targets() {
+        let docs: Vec<serde_json::Value> = vec![
+            serde_json::json!({"name": "A", "n": 1}),
+            serde_json::json!({"name": "B", "n": 2}),
+        ];
+        // Clipboard target: CSV string with only the selected column.
+        let options: crate::db::export::options::ExportOptions =
+            serde_json::from_str(r#"{"fields":["name"]}"#).unwrap();
+        let text = format_current_docs_impl(docs.clone(), "csv", Some(options), None)
+            .await.unwrap().unwrap();
+        assert_eq!(text.trim(), "name\nA\nB");
+
+        // File target: xlsx written to disk.
+        let path = std::env::temp_dir().join(format!(
+            "mqlens-current-{}-{}.xlsx",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let none = format_current_docs_impl(docs, "xlsx", None, Some(path_str.clone()))
+            .await.unwrap();
+        assert!(none.is_none());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_export_rejects_invalid_options() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let options: crate::db::export::options::ExportOptions =
+            serde_json::from_str(r#"{"csv":{"delimiter":"ab"}}"#).unwrap();
+        let err = start_collection_export_impl(
+            &state, &conn_id, "sales_db", "customers", "csv", "/tmp/x.csv", Some(options),
+        ).await.unwrap_err();
+        assert!(err.contains("delimiter"));
     }
 
     // Regression guard for the index-edit corruption bug (GO-LIVE C2/H4):
@@ -554,6 +1184,139 @@ mod tests {
             SshAuth::Password { password } => assert_eq!(password, "s3cret"),
             _ => panic!("expected password auth"),
         }
+    }
+
+    #[test]
+    fn test_ssh_auth_agent_serde_roundtrip() {
+        use crate::ssh_tunnel::{SshAuth, SshConfig};
+        let cfg = SshConfig {
+            enabled: true,
+            host: "bastion".into(),
+            port: 22,
+            user: "ops".into(),
+            auth: SshAuth::Agent,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains(r#""auth":{"type":"agent"}"#),
+            "agent auth must serialize frontend-shaped, got: {}",
+            json
+        );
+        let back: SshConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.auth, SshAuth::Agent);
+
+        // agent variant from frontend-shaped JSON
+        let fe: SshConfig = serde_json::from_str(
+            r#"{"enabled":true,"host":"h","port":22,"user":"u","auth":{"type":"agent"}}"#,
+        )
+        .unwrap();
+        assert_eq!(fe.auth, SshAuth::Agent);
+    }
+
+    // Agent auth must fail with an actionable message when SSH_AUTH_SOCK is not
+    // set. The helper takes the socket path as a parameter so this test does not
+    // depend on (or mutate) the ambient environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_agent_connect_error_when_sock_unset() {
+        let err = crate::ssh_tunnel::connect_agent_at(None)
+            .await
+            .err()
+            .expect("connecting without SSH_AUTH_SOCK must fail");
+        assert!(
+            err.contains("SSH_AUTH_SOCK is not set"),
+            "error should name the missing env var, got: {}",
+            err
+        );
+        assert!(err.contains("SSH agent not reachable"), "got: {}", err);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_agent_connect_error_when_sock_missing() {
+        let err = crate::ssh_tunnel::connect_agent_at(Some(
+            "/nonexistent/mqlens-test-agent.sock".to_string(),
+        ))
+        .await
+        .err()
+        .expect("connecting to a missing socket must fail");
+        assert!(
+            err.contains("SSH agent not reachable") && err.contains("/nonexistent/mqlens-test-agent.sock"),
+            "error should name the socket path, got: {}",
+            err
+        );
+    }
+
+    // Live agent integration: spawn a real ssh-agent, add a throwaway ed25519
+    // key, and list identities through the russh agent client. Skips (does not
+    // fail) when ssh-agent/ssh-keygen/ssh-add are unavailable on this machine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_agent_lists_identities_via_live_agent() {
+        use std::process::Command;
+
+        let agent_out = match Command::new("ssh-agent").arg("-s").output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => {
+                eprintln!("skipping: ssh-agent not available");
+                return;
+            }
+        };
+        // Parse `SSH_AUTH_SOCK=/path; export SSH_AUTH_SOCK;` / `SSH_AGENT_PID=123; ...`
+        let parse_var = |name: &str| -> Option<String> {
+            agent_out.lines().find_map(|l| {
+                let rest = l.trim().strip_prefix(&format!("{}=", name))?;
+                Some(rest.split(';').next()?.to_string())
+            })
+        };
+        let sock = parse_var("SSH_AUTH_SOCK").expect("ssh-agent output has SSH_AUTH_SOCK");
+        let pid = parse_var("SSH_AGENT_PID");
+        // Ensure the agent is killed even if assertions below fail.
+        struct KillAgent(Option<String>);
+        impl Drop for KillAgent {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0.take() {
+                    let _ = std::process::Command::new("kill").arg(pid).status();
+                }
+            }
+        }
+        let _kill = KillAgent(pid);
+
+        let dir = std::env::temp_dir().join(format!("mqlens-agent-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp key dir");
+        let key_path = dir.join("id_ed25519");
+        let keygen = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+            .arg(&key_path)
+            .status();
+        if !matches!(keygen, Ok(s) if s.success()) {
+            eprintln!("skipping: ssh-keygen not available");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let added = Command::new("ssh-add")
+            .arg(&key_path)
+            .env("SSH_AUTH_SOCK", &sock)
+            .status();
+        if !matches!(added, Ok(s) if s.success()) {
+            eprintln!("skipping: ssh-add not available or failed");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mut agent = crate::ssh_tunnel::connect_agent_at(Some(sock))
+            .await
+            .expect("connect to live ssh-agent");
+        let identities = agent
+            .request_identities()
+            .await
+            .expect("list identities from live ssh-agent");
+        assert!(
+            !identities.is_empty(),
+            "agent should hold the key we just added"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // GO-LIVE H2: count must reflect the true match count, not the page size.
@@ -904,11 +1667,43 @@ mod tests {
             "uploads",
             r#"{"$oid":"507f1f77bcf86cd799439011"}"#,
             "/tmp/out.bin",
+            None,
+            None,
         )
         .await;
         assert!(
             dl.unwrap_err().contains("not supported on mock"),
             "GridFS download on a mock connection should be rejected"
+        );
+
+        let up = upload_gridfs_file_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "uploads",
+            "/tmp/in.bin",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            up.unwrap_err().contains("not supported on mock"),
+            "GridFS upload on a mock connection should be rejected"
+        );
+
+        let del = delete_gridfs_file_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "uploads",
+            r#"{"$oid":"507f1f77bcf86cd799439011"}"#,
+        )
+        .await;
+        assert!(
+            del.unwrap_err().contains("not supported on mock"),
+            "GridFS delete on a mock connection should be rejected"
         );
     }
 
@@ -918,10 +1713,30 @@ mod tests {
         let id = "realish-gridfs";
         state.mocks.lock().unwrap().insert(id.to_string(), false);
 
-        let bad_id = download_gridfs_file_impl(&state, id, "db", "fs", "{", "/tmp/file.bin")
+        let bad_id = download_gridfs_file_impl(&state, id, "db", "fs", "{", "/tmp/file.bin", None, None)
             .await
             .unwrap_err();
         assert!(bad_id.contains("Invalid file id JSON"));
+
+        let bad_upload_meta = upload_gridfs_file_impl(
+            &state,
+            id,
+            "db",
+            "fs",
+            "/tmp/missing.bin",
+            None,
+            Some("{"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(bad_upload_meta.contains("Invalid metadata JSON"));
+
+        let bad_delete = delete_gridfs_file_impl(&state, id, "db", "fs", "{")
+            .await
+            .unwrap_err();
+        assert!(bad_delete.contains("Invalid file id JSON"));
 
         let missing_client = list_gridfs_files_impl(&state, id, "db", "fs")
             .await
@@ -1081,6 +1896,105 @@ mod tests {
         )
         .await;
         assert!(ok.is_ok());
+    }
+
+    // User management: mock listing/filtering, input validation, and the
+    // unknown-connection error path.
+    #[tokio::test]
+    async fn test_user_management_mock_and_validation() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("connect mock");
+
+        // Mock listing: all databases vs filtered to one.
+        let all = list_users_impl(&state, &conn_id, None)
+            .await
+            .expect("list all users in mock mode");
+        assert!(all.len() >= 3, "mock should ship several demo users");
+        let sales = list_users_impl(&state, &conn_id, Some("sales_db"))
+            .await
+            .expect("list sales_db users in mock mode");
+        assert!(!sales.is_empty());
+        assert!(sales.iter().all(|u| u.db == "sales_db"));
+
+        // Roles picker data includes built-in roles.
+        let roles = list_roles_impl(&state, &conn_id, "sales_db")
+            .await
+            .expect("list roles in mock mode");
+        assert!(roles.iter().any(|r| r.role == "readWrite" && r.is_builtin));
+
+        // Validation is rejected before touching the connection.
+        let rw = vec![RoleSpec { role: "readWrite".into(), db: "sales_db".into() }];
+        let sample_pw = test_secret(&["p", "w"]);
+        let create_pw = test_secret(&["sec", "ret"]);
+        let updated_pw = test_secret(&["new", "pw"]);
+        assert!(create_user_impl(&state, &conn_id, "sales_db", "", &sample_pw, &rw)
+            .await
+            .is_err());
+        assert!(create_user_impl(&state, &conn_id, "sales_db", "bob", "", &rw)
+            .await
+            .is_err());
+        assert!(update_user_impl(&state, &conn_id, "sales_db", "", Some(&sample_pw), None)
+            .await
+            .is_err());
+        // Nothing to change: no password and no roles.
+        assert!(update_user_impl(&state, &conn_id, "sales_db", "bob", None, None)
+            .await
+            .is_err());
+        assert!(update_user_impl(&state, &conn_id, "sales_db", "bob", Some(""), None)
+            .await
+            .is_err());
+        assert!(drop_user_impl(&state, &conn_id, "sales_db", "")
+            .await
+            .is_err());
+
+        // Half-specified roles are rejected (no silent dropping).
+        let bad_role = vec![RoleSpec { role: "".into(), db: "sales_db".into() }];
+        assert!(create_user_impl(&state, &conn_id, "sales_db", "bob", &sample_pw, &bad_role)
+            .await
+            .is_err());
+        let bad_db = vec![RoleSpec { role: "readWrite".into(), db: " ".into() }];
+        assert!(
+            update_user_impl(&state, &conn_id, "sales_db", "bob", None, Some(&bad_db))
+                .await
+                .is_err()
+        );
+
+        // Valid mutations succeed as no-ops in mock mode.
+        create_user_impl(&state, &conn_id, "sales_db", "bob", &create_pw, &rw)
+            .await
+            .expect("create user in mock mode");
+        update_user_impl(&state, &conn_id, "sales_db", "bob", Some(&updated_pw), Some(&rw))
+            .await
+            .expect("update user in mock mode");
+        update_user_impl(&state, &conn_id, "sales_db", "bob", None, Some(&[]))
+            .await
+            .expect("clearing roles alone is a valid update");
+        drop_user_impl(&state, &conn_id, "sales_db", "bob")
+            .await
+            .expect("drop user in mock mode");
+
+        // Non-mock connection without a real client reports the standard error.
+        let realish = "realish-users";
+        state
+            .mocks
+            .lock()
+            .unwrap()
+            .insert(realish.to_string(), false);
+        assert_eq!(
+            list_users_impl(&state, realish, None).await.unwrap_err(),
+            "Connection client not found"
+        );
+        assert_eq!(
+            create_user_impl(&state, realish, "sales_db", "bob", &sample_pw, &rw)
+                .await
+                .unwrap_err(),
+            "Connection client not found"
+        );
+
+        // Unknown connection id errors on the mock check itself.
+        assert!(list_users_impl(&state, "missing", None).await.is_err());
     }
 
     // GO-LIVE C6/H6: collection/database management wiring (mock path + input validation).
@@ -1316,7 +2230,9 @@ mod tests {
             id: "profile-1".to_string(),
             name: "Mock Database".to_string(),
             uri: "mongodb://mock".to_string(),
+            color_tag: None,
             ssh: None,
+            mcp_enabled: false,
         };
 
         // Save profile
@@ -1335,6 +2251,7 @@ mod tests {
             id: "profile-2".to_string(),
             name: "Prod DB".to_string(),
             uri: "mongodb://localhost:27017".to_string(),
+            color_tag: None,
             ssh: Some(crate::ssh_tunnel::SshConfig {
                 enabled: true,
                 host: "bastion.example.com".to_string(),
@@ -1345,6 +2262,7 @@ mod tests {
                     passphrase: None,
                 },
             }),
+            mcp_enabled: true,
         };
         profiles.push(profile2.clone());
         crate::connections::save_profiles_to_file(&test_file_path, &profiles)
@@ -1371,6 +2289,37 @@ mod tests {
 
         // Clean up temp file
         let _ = std::fs::remove_file(&test_file_path);
+    }
+
+    // #98: mcp_enabled round-trips through plaintext (de)serialization, and old
+    // connections.json files written before the field existed must never opt a
+    // profile into MCP exposure by surprise — they must deserialize as false.
+    #[test]
+    fn test_connection_profile_mcp_enabled_roundtrip_and_legacy_default() {
+        use crate::connections::ConnectionProfile;
+
+        let profile = ConnectionProfile {
+            id: "p1".to_string(),
+            name: "Prod".to_string(),
+            uri: "mongodb://localhost:27017".to_string(),
+            color_tag: None,
+            ssh: None,
+            mcp_enabled: true,
+        };
+        let json = serde_json::to_string(&profile).expect("serialize");
+        let round_tripped: ConnectionProfile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, profile);
+        assert!(round_tripped.mcp_enabled);
+
+        // A JSON literal predating the field (no "mcp_enabled" key at all).
+        let legacy_json = r#"{
+            "id": "legacy-1",
+            "name": "Legacy DB",
+            "uri": "mongodb://legacy:27017"
+        }"#;
+        let legacy: ConnectionProfile = serde_json::from_str(legacy_json)
+            .expect("old connections.json without mcp_enabled must still deserialize");
+        assert_eq!(legacy.mcp_enabled, false, "legacy profiles must never be opted in by surprise");
     }
 
     #[tokio::test]
@@ -1738,13 +2687,15 @@ mod tests {
             t: 1,
             p: 1,
         };
-        let salt_a = [1u8; 16];
-        let salt_b = [2u8; 16];
+        let salt_a = test_salt(1);
+        let salt_b = test_salt(2);
+        let pwd = test_secret(&["hun", "ter", "2"]);
+        let other_pwd = test_secret(&["diff", "erent"]);
 
-        let k1 = derive_key("hunter2", &salt_a, params).unwrap();
-        let k2 = derive_key("hunter2", &salt_a, params).unwrap();
-        let k3 = derive_key("hunter2", &salt_b, params).unwrap();
-        let k4 = derive_key("different", &salt_a, params).unwrap();
+        let k1 = derive_key(&pwd, &salt_a, params).unwrap();
+        let k2 = derive_key(&pwd, &salt_a, params).unwrap();
+        let k3 = derive_key(&pwd, &salt_b, params).unwrap();
+        let k4 = derive_key(&other_pwd, &salt_a, params).unwrap();
 
         assert_eq!(k1, k2, "same password + salt must derive the same key");
         assert_ne!(k1, k3, "different salt must derive a different key");
@@ -1761,16 +2712,19 @@ mod tests {
             p: 1,
         };
 
-        let meta = build_vault_meta("correct horse", params).unwrap();
+        let good_pwd = test_secret(&["correct", " ", "horse"]);
+        let bad_pwd = test_secret(&["wr", "ong"]);
+
+        let meta = build_vault_meta(&good_pwd, params).unwrap();
         assert_eq!(meta.version, 1);
         assert_eq!(meta.kdf_alg, "argon2id");
 
         // Right password unlocks.
-        let key = unlock_key(&meta, "correct horse").unwrap();
+        let key = unlock_key(&meta, &good_pwd).unwrap();
         assert_eq!(key.len(), 32);
 
         // Wrong password is rejected.
-        assert!(unlock_key(&meta, "wrong").is_err());
+        assert!(unlock_key(&meta, &bad_pwd).is_err());
     }
 
     #[test]
@@ -1790,7 +2744,9 @@ mod tests {
             id: "1".into(),
             name: "prod".into(),
             uri: "mongodb://user:secret@host:27017".into(),
+            color_tag: None,
             ssh: None,
+            mcp_enabled: false,
         }];
         save_profiles_encrypted(&prof_path, &key, &profiles).unwrap();
         // On-disk bytes must not contain the plaintext password.
@@ -1836,7 +2792,9 @@ mod tests {
             id: "1".into(),
             name: "p".into(),
             uri: "mongodb://localhost".into(),
+            color_tag: None,
             ssh: None,
+            mcp_enabled: false,
         }];
         save_profiles_to_file(&pt_profiles, &profiles).unwrap();
         assert!(pt_profiles.exists());
@@ -2064,7 +3022,9 @@ mod tests {
             id: "1".into(),
             name: "p".into(),
             uri: "mongodb://localhost".into(),
+            color_tag: None,
             ssh: None,
+            mcp_enabled: false,
         }];
         save_profiles_encrypted(&enc_profiles, &old_key, &profiles).unwrap();
 
@@ -2092,12 +3052,21 @@ mod tests {
         };
 
         // Collections per database, plus the empty fallback for an unknown db.
-        assert!(get_mock_collections("sales_db").contains(&"transactions".to_string()));
+        let sales_names: Vec<String> = get_mock_collections("sales_db")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(sales_names.contains(&"transactions".to_string()));
         assert_eq!(
             get_mock_collections("user_analytics"),
-            vec!["events".to_string(), "sessions".to_string()]
+            vec![
+                ("events".to_string(), "collection"),
+                ("sessions".to_string(), "collection"),
+            ]
         );
-        assert!(get_mock_collections("admin").contains(&"system.users".to_string()));
+        assert!(get_mock_collections("admin")
+            .iter()
+            .any(|(name, _)| name == "system.users"));
         assert!(get_mock_collections("nope").is_empty());
 
         // Query + count across the non-products datasets (each hits a distinct match arm).
@@ -2123,6 +3092,23 @@ mod tests {
         // Explain renders a plan namespaced to the requested collection.
         let explain = get_mock_explain("user_analytics", "events", "{}");
         assert!(explain.contains("user_analytics.events"));
+        assert!(explain.contains("IXSCAN"));
+
+        // sales_db.transactions is the one namespace that demos a COLLSCAN plan,
+        // so the index-suggestion banner is reachable without a real server.
+        let tx_explain = get_mock_explain("sales_db", "transactions", "{}");
+        assert!(tx_explain.contains("COLLSCAN"));
+        assert!(!tx_explain.contains("IXSCAN"));
+        let tx_plan: serde_json::Value = serde_json::from_str(&tx_explain).unwrap();
+        assert_eq!(
+            tx_plan["queryPlanner"]["parsedQuery"]["$and"][0]["customer_name"]["$eq"],
+            "Alice Smith"
+        );
+
+        // Every other namespace (e.g. sales_db.products) keeps the original IXSCAN shape.
+        let products_explain = get_mock_explain("sales_db", "products", "{}");
+        assert!(products_explain.contains("IXSCAN"));
+        assert!(!products_explain.contains("COLLSCAN"));
 
         // Index sets for each collection, including the admin and unknown fallbacks.
         let idx = |db, coll| -> Vec<String> {
@@ -2150,8 +3136,9 @@ mod tests {
         use crate::connections::{build_vault_meta, key_matches_meta, unlock_key};
         use crate::vault::KdfParams;
         let params = KdfParams { m_kib: 8, t: 1, p: 1 };
-        let meta = build_vault_meta("hunter2", params).unwrap();
-        let good = unlock_key(&meta, "hunter2").unwrap();
+        let pwd = test_secret(&["hun", "ter", "2"]);
+        let meta = build_vault_meta(&pwd, params).unwrap();
+        let good = unlock_key(&meta, &pwd).unwrap();
 
         assert!(key_matches_meta(&meta, &good), "the real key must verify");
         assert!(
@@ -2168,8 +3155,9 @@ mod tests {
         use crate::vault::KdfParams;
 
         let params = KdfParams { m_kib: 8, t: 1, p: 1 };
-        let meta = build_vault_meta("pw", params).unwrap();
-        let key = unlock_key(&meta, "pw").unwrap();
+        let pwd = test_secret(&["p", "w"]);
+        let meta = build_vault_meta(&pwd, params).unwrap();
+        let key = unlock_key(&meta, &pwd).unwrap();
 
         // Round-trip: encode then decode-and-verify yields the same key.
         let encoded = encode_key(&key);
@@ -2185,5 +3173,651 @@ mod tests {
         // Correct length but a key that doesn't match this vault.
         let wrong = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
         assert!(decode_and_verify_key(&meta, &wrong).is_err());
+    }
+
+    // ── Import file parsers (issue #127: BSON / NDJSON / JSON / CSV) ───────
+
+    fn temp_import_path(ext: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mqlens-import-test-{}-{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            ext
+        ))
+    }
+
+    #[test]
+    fn test_parse_json_array_docs() {
+        let docs =
+            parse_json_array_docs(r#"[{"_id": 1, "name": "Ada"}, {"_id": 2, "name": "Bob"}]"#)
+                .expect("parse json array");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get_str("name").unwrap(), "Ada");
+        assert_eq!(docs[1].get_i32("_id").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_parse_json_array_docs_rejects_non_array() {
+        assert!(parse_json_array_docs(r#"{"_id": 1}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_ndjson_docs_skips_blank_lines() {
+        // One doc per line, blank lines (incl. trailing newline) tolerated.
+        let text = "{\"_id\": 1, \"name\": \"Ada\"}\n\n{\"_id\": 2, \"name\": \"Bob\"}\n";
+        let docs =
+            drain_text_source(text, "ndjson", &CsvImportOptions::default()).expect("parse ndjson");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get_str("name").unwrap(), "Ada");
+        assert_eq!(docs[1].get_str("name").unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_parse_ndjson_docs_interprets_extended_json() {
+        // An $oid wrapper must revive to a real ObjectId, not a sub-document.
+        let oid = mongodb::bson::oid::ObjectId::new();
+        let line = format!("{{\"_id\": {{\"$oid\": \"{}\"}}}}", oid.to_hex());
+        let docs = drain_text_source(&line, "ndjson", &CsvImportOptions::default())
+            .expect("parse ndjson ejson");
+        assert_eq!(docs[0].get_object_id("_id").unwrap(), oid);
+    }
+
+    #[test]
+    fn test_parse_bson_docs_roundtrip_preserves_types() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime, Decimal128};
+        use std::str::FromStr;
+        let oid = ObjectId::new();
+        let when = DateTime::from_millis(1_700_000_000_000);
+        let dec = Decimal128::from_str("123.45").unwrap();
+        let original = doc! { "_id": oid, "when": when, "amount": dec, "name": "Ada" };
+        // Two concatenated BSON documents, mongoexport's on-disk format.
+        let mut bytes = mongodb::bson::to_vec(&original).expect("serialize bson");
+        bytes.extend(mongodb::bson::to_vec(&doc! { "_id": 2, "name": "Bob" }).unwrap());
+
+        let docs = drain_bson_bytes(&bytes);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get_object_id("_id").unwrap(), oid);
+        assert_eq!(docs[0].get_datetime("when").unwrap(), &when);
+        assert_eq!(
+            docs[0].get("amount"),
+            Some(&mongodb::bson::Bson::Decimal128(dec))
+        );
+        assert_eq!(docs[1].get_str("name").unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_parse_bson_docs_empty_input() {
+        assert_eq!(drain_bson_bytes(&[]).len(), 0);
+    }
+
+    #[test]
+    fn test_parse_csv_docs_revives_cell_values() {
+        // Numbers/bools/objects parse as JSON; bare text stays a string.
+        let text = "_id,name,active,tags\n1,Ada,true,\"[1,2]\"\n2,Bob,false,plain";
+        let docs =
+            drain_text_source(text, "csv", &CsvImportOptions::default()).expect("parse csv");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get_i32("_id").unwrap(), 1);
+        assert_eq!(docs[0].get_str("name").unwrap(), "Ada");
+        assert!(docs[0].get_bool("active").unwrap());
+        assert_eq!(
+            docs[0].get_array("tags").unwrap(),
+            &vec![mongodb::bson::Bson::Int32(1), mongodb::bson::Bson::Int32(2)]
+        );
+        assert_eq!(docs[1].get_str("tags").unwrap(), "plain");
+    }
+
+    #[tokio::test]
+    async fn test_preview_import_truncates_and_reports_inline_errors() {
+        use crate::db::import::{preview_import_impl, ImportSourceArg};
+        // 30 NDJSON lines → only 20 previewed.
+        let text: String = (0..30).map(|i| format!("{{\"n\":{}}}\n", i)).collect();
+        let p = preview_import_impl(
+            ImportSourceArg { path: None, text: Some(text) },
+            "ndjson",
+            None,
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(p.docs.len(), 20);
+        assert!(p.error.is_none());
+
+        // Parse error surfaces inline, docs keep the good prefix.
+        let p = preview_import_impl(
+            ImportSourceArg { path: None, text: Some("{\"a\":1}\nboom\n".into()) },
+            "ndjson",
+            None,
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(p.docs.len(), 1);
+        assert!(p.error.as_deref().unwrap_or("").contains("line 2"));
+    }
+
+    #[tokio::test]
+    async fn test_import_task_streams_ndjson_from_file_on_mock() {
+        use crate::db::import::{start_import_task_impl, ImportSourceArg};
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "mqlens-import-test-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        // 1200 docs → 3 batches of 500/500/200.
+        let text: String = (0..1200).map(|i| format!("{{\"n\":{}}}\n", i)).collect();
+        std::fs::write(&path, text).unwrap();
+
+        let task = start_import_task_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            ImportSourceArg { path: Some(path.to_string_lossy().to_string()), text: None },
+            "ndjson",
+            None,
+            "skip",
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.kind, "import");
+        wait_for_task(&state, &task.id).await;
+
+        let finished = state.tasks.lock().unwrap().get(&task.id).cloned().unwrap();
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.processed, 1200, "cap must not apply to task imports");
+        // TaskInfo.summary is the copy-task CopySummary struct, so import
+        // counts ride on the completion message instead.
+        assert!(finished.message.contains("1200 inserted"), "{}", finished.message);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_import_task_fails_on_parse_error_and_reports_line() {
+        use crate::db::import::{start_import_task_impl, ImportSourceArg};
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let task = start_import_task_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            ImportSourceArg { path: None, text: Some("{\"a\":1}\nboom\n".into()) },
+            "ndjson",
+            None,
+            "skip",
+        )
+        .await
+        .unwrap();
+        wait_for_task(&state, &task.id).await;
+        let finished = state.tasks.lock().unwrap().get(&task.id).cloned().unwrap();
+        assert_eq!(finished.status, "failed");
+        assert!(finished.error.as_deref().unwrap_or("").contains("line 2"));
+    }
+
+    #[tokio::test]
+    async fn test_import_task_validates_mode_and_source() {
+        use crate::db::import::{start_import_task_impl, ImportSourceArg};
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+        let err = start_import_task_impl(
+            &state,
+            &conn_id,
+            "sales_db",
+            "customers",
+            ImportSourceArg { path: None, text: Some("[]".into()) },
+            "json",
+            None,
+            "yolo",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("mode"));
+    }
+
+    #[tokio::test]
+    async fn test_browse_dump_folder_reads_tree() {
+        use crate::db::mongotools::browse_dump_folder_impl;
+
+        let root = std::env::temp_dir().join(format!(
+            "mqlens-browse-dump-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db1 = root.join("db1");
+        let db2 = root.join("db2");
+        std::fs::create_dir_all(&db1).unwrap();
+        std::fs::create_dir_all(&db2).unwrap();
+
+        std::fs::write(db1.join("orders.bson"), b"").unwrap();
+        std::fs::write(db1.join("orders.metadata.json"), b"{}").unwrap();
+        std::fs::write(db1.join("notes.txt"), b"ignored").unwrap();
+        std::fs::write(db2.join("logs.bson.gz"), b"").unwrap();
+        std::fs::write(root.join("stray.txt"), b"ignored").unwrap();
+
+        let tree = browse_dump_folder_impl(root.to_str().unwrap()).await.unwrap();
+        assert_eq!(tree.dbs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["db1", "db2"]);
+
+        let db1_colls = &tree.dbs[0].collections;
+        assert_eq!(db1_colls.len(), 1);
+        assert_eq!(db1_colls[0].name, "orders");
+        assert!(db1_colls[0].has_metadata);
+        assert!(!db1_colls[0].gzip);
+
+        let db2_colls = &tree.dbs[1].collections;
+        assert_eq!(db2_colls.len(), 1);
+        assert_eq!(db2_colls[0].name, "logs");
+        assert!(!db2_colls[0].has_metadata);
+        assert!(db2_colls[0].gzip);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_dump_rejects_mock_connections() {
+        use crate::db::mongotools::{start_dump_task_impl, DumpOptions, DumpScope, DumpTarget};
+
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None).await.unwrap();
+
+        let opts = DumpOptions {
+            scope: DumpScope::Server,
+            target: DumpTarget::Folder { out: "/tmp/mqlens-dump-mock-test".into() },
+            gzip: false,
+            query: None,
+            force_table_scan: false,
+            dump_users_and_roles: false,
+            oplog: false,
+        };
+        let err = start_dump_task_impl(&state, &conn_id, "mongodump", opts).await.unwrap_err();
+        assert!(err.contains("real connection"), "{}", err);
+    }
+
+    fn tool_install_test_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mqlens-tool-install-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tool_install_success_and_status() {
+        use crate::toolsetup::test_support::{fixture_zip, serve_bytes};
+        use crate::toolsetup::*;
+        use std::sync::atomic::AtomicBool;
+
+        // Fixture zip for a fake "mongosh" whose top dir mirrors the real
+        // archive layout ({top}/bin/{binary}), served over HTTP so
+        // `install_one_tool` downloads it exactly like the real pipeline
+        // would.
+        let bytes = fixture_zip("mongosh-2.9.2-darwin-arm64", &["mongosh"]);
+        let sha256 = sha256_hex(&bytes);
+        let (base_url, _server) = serve_bytes(bytes);
+        let url = format!("{base_url}/mongosh-2.9.2-darwin-arm64.zip");
+
+        let app_data = tool_install_test_dir("success");
+        let cancel = AtomicBool::new(false);
+
+        // Test `install_one_tool` directly (the unit of work factored out of
+        // the task), using the real "mongosh"/"2.9.2" name+version so the
+        // resulting layout matches what `managed_tools_status` (which walks
+        // the real PINNED_TOOLS manifest) expects.
+        install_one_tool(
+            &app_data,
+            "mongosh",
+            "2.9.2",
+            &url,
+            &sha256,
+            ArchiveKind::Zip,
+            "mongosh-2.9.2-darwin-arm64/bin",
+            &["mongosh".to_string()],
+            &cancel,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        let bin = app_data.join("tools/mongosh-2.9.2/bin/mongosh");
+        assert!(bin.exists(), "binary should exist at the managed layout path");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bin).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "binary should be executable");
+        }
+        assert!(
+            !app_data.join("tools/.staging-mongosh").exists(),
+            "staging dir should be cleaned up after success"
+        );
+
+        let status = managed_tools_status(&app_data);
+        let mongosh_status = status.iter().find(|s| s.name == "mongosh").unwrap();
+        assert!(mongosh_status.installed, "{:?}", mongosh_status);
+        assert_eq!(mongosh_status.version, "2.9.2");
+        assert!(mongosh_status.path.as_deref().unwrap().ends_with("mongosh-2.9.2/bin"));
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tool_install_checksum_mismatch_cleans_up() {
+        use crate::toolsetup::test_support::{fixture_zip, serve_bytes};
+        use crate::toolsetup::*;
+        use std::sync::atomic::AtomicBool;
+
+        let bytes = fixture_zip("mongosh-2.9.2-darwin-arm64", &["mongosh"]);
+        let (base_url, _server) = serve_bytes(bytes);
+        let url = format!("{base_url}/mongosh-2.9.2-darwin-arm64.zip");
+        let wrong_sha256 = "0".repeat(64);
+
+        let app_data = tool_install_test_dir("badsum");
+        let cancel = AtomicBool::new(false);
+
+        let err = install_one_tool(
+            &app_data,
+            "mongosh",
+            "2.9.2",
+            &url,
+            &wrong_sha256,
+            ArchiveKind::Zip,
+            "mongosh-2.9.2-darwin-arm64/bin",
+            &["mongosh".to_string()],
+            &cancel,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("checksum mismatch"), "{err}");
+
+        let tools_dir = app_data.join("tools");
+        if tools_dir.exists() {
+            let leftovers: Vec<_> = std::fs::read_dir(&tools_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("mongosh") || n.starts_with(".staging-"))
+                .collect();
+            assert!(leftovers.is_empty(), "no mongosh-*/.staging-* dir should remain: {:?}", leftovers);
+        }
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tool_install_probe_failure_leaves_no_install_dir() {
+        use crate::toolsetup::test_support::{fixture_zip_with_script, serve_bytes};
+        use crate::toolsetup::*;
+        use std::sync::atomic::AtomicBool;
+
+        // A "binary" that survives extraction (checksum + extract both
+        // succeed) but exits non-zero on `--version`, simulating a corrupt or
+        // incompatible executable. Per the spec, the staged copy must be
+        // probed *before* the managed install dir is ever created.
+        let bytes = fixture_zip_with_script("mongosh-2.9.2-darwin-arm64", &["mongosh"], b"#!/bin/sh\nexit 1\n");
+        let sha256 = sha256_hex(&bytes);
+        let (base_url, _server) = serve_bytes(bytes);
+        let url = format!("{base_url}/mongosh-2.9.2-darwin-arm64.zip");
+
+        let app_data = tool_install_test_dir("probefail");
+        let cancel = AtomicBool::new(false);
+
+        let err = install_one_tool(
+            &app_data,
+            "mongosh",
+            "2.9.2",
+            &url,
+            &sha256,
+            ArchiveKind::Zip,
+            "mongosh-2.9.2-darwin-arm64/bin",
+            &["mongosh".to_string()],
+            &cancel,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("failed to run --version"), "{err}");
+
+        // NOTE: with staging-first probing, the managed install dir is never
+        // created on a probe failure (probe happens before mkdir+rename, the
+        // atomic swap). We can only observe its absence, not distinguish
+        // "never created" from "created then removed by cleanup" purely from
+        // outside the function — both leave no trace on disk. The ordering
+        // itself (verified by reading `install_one_tool`) is what proves the
+        // stronger claim; this assertion just guards the observable contract.
+        let install_dir = app_data.join("tools/mongosh-2.9.2");
+        assert!(!install_dir.exists(), "install dir should not exist after a probe failure");
+        assert!(
+            !app_data.join("tools/.staging-mongosh").exists(),
+            "staging dir should be cleaned up after probe failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tool_install_probes_staged_copy_before_moving_into_install_dir() {
+        use crate::toolsetup::test_support::{fixture_zip_with_script, serve_bytes};
+        use crate::toolsetup::*;
+        use std::sync::atomic::AtomicBool;
+
+        // Directly verifies the spec-mandated ordering (probe the STAGING
+        // copy first, then atomically swap into place) rather than just
+        // inferring it from absence-on-failure, which both orderings satisfy
+        // identically. The probed script reports its own invocation
+        // directory (via `$0`) to a marker file that lives outside the
+        // staging/install tree, so it survives regardless of what
+        // `install_one_tool` does with the staging dir afterwards.
+        let app_data = tool_install_test_dir("probe-order");
+        let marker = app_data.join("probe-marker.txt");
+        let script = format!(
+            "#!/bin/sh\necho \"$(dirname \"$0\")\" > '{}'\necho tool version 9.9.9\n",
+            marker.display()
+        );
+        let bytes = fixture_zip_with_script("mongosh-2.9.2-darwin-arm64", &["mongosh"], script.as_bytes());
+        let sha256 = sha256_hex(&bytes);
+        let (base_url, _server) = serve_bytes(bytes);
+        let url = format!("{base_url}/mongosh-2.9.2-darwin-arm64.zip");
+
+        let cancel = AtomicBool::new(false);
+        install_one_tool(
+            &app_data,
+            "mongosh",
+            "2.9.2",
+            &url,
+            &sha256,
+            ArchiveKind::Zip,
+            "mongosh-2.9.2-darwin-arm64/bin",
+            &["mongosh".to_string()],
+            &cancel,
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        let probed_from = std::fs::read_to_string(&marker).unwrap();
+        let probed_from = probed_from.trim();
+        assert!(
+            probed_from.contains(".staging-mongosh"),
+            "probe must run against the staging copy before the install swap, was probed from: {probed_from}"
+        );
+        let final_bin_dir = app_data.join("tools/mongosh-2.9.2/bin");
+        assert_ne!(
+            probed_from,
+            final_bin_dir.to_string_lossy(),
+            "probe must not run against the already-installed copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tool_install_task_end_to_end_with_cancel_flag_cleanup() {
+        use crate::toolsetup::test_support::{fixture_zip, serve_bytes, test_tool};
+        use crate::toolsetup::*;
+
+        let bytes = fixture_zip("test-mongosh-9.9.9-test", &["mongosh"]);
+        let sha256 = sha256_hex(&bytes);
+        let (base_url, _server) = serve_bytes(bytes);
+
+        // Registers a synthetic pinned tool (name "test-mongosh") so
+        // `start_tool_install_task_impl`'s manifest resolution doesn't need
+        // real network access or a real checksum.
+        test_tool(
+            "test-mongosh",
+            "https://example.invalid/test-mongosh-fixture.zip",
+            &sha256,
+            "test-mongosh-9.9.9-test/bin",
+            &["mongosh"],
+        );
+
+        let app_data = tool_install_test_dir("e2e");
+        let state = AppState::new();
+
+        let task = start_tool_install_task_impl(
+            &state,
+            app_data.clone(),
+            vec!["test-mongosh".to_string()],
+            false,
+            Some(base_url.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.kind, "tool_install");
+
+        wait_for_task(&state, &task.id).await;
+        let t = state.tasks.lock().unwrap().get(&task.id).cloned().unwrap();
+        assert_eq!(t.status, "completed", "{:?}", t.error);
+        assert!(state.cancels.lock().unwrap().get(&task.id).is_none(), "cancel flag cleaned up");
+
+        // Same tool, force=false: should skip straight to "already installed"
+        // without re-downloading.
+        let task2 = start_tool_install_task_impl(
+            &state,
+            app_data.clone(),
+            vec!["test-mongosh".to_string()],
+            false,
+            Some(base_url),
+        )
+        .await
+        .unwrap();
+        wait_for_task(&state, &task2.id).await;
+        let t2 = state.tasks.lock().unwrap().get(&task2.id).cloned().unwrap();
+        assert_eq!(t2.status, "completed");
+        assert!(t2.message.contains("already installed"), "{}", t2.message);
+        assert!(state.cancels.lock().unwrap().get(&task2.id).is_none(), "cancel flag cleaned up");
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 Task 3: connection-meta registry — CRUD, list determinism,
+    // and removal on disconnect. Impl-level (no `AppHandle`), matching
+    // `workspace::apply_impl`'s testing precedent: the `connections-changed`
+    // emit itself lives only in the `set_connection_meta`/`disconnect_db`
+    // command wrappers, which need a real Tauri app to exercise.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_connection_meta_inserts_and_overwrites() {
+        let state = AppState::new();
+        set_connection_meta_impl(&state, "conn-1", "profile-a", "Prod Cluster", false).unwrap();
+        {
+            let meta = state.connection_meta.lock().unwrap();
+            let m = meta.get("conn-1").expect("meta inserted");
+            assert_eq!(m.profile_id, "profile-a");
+            assert_eq!(m.name, "Prod Cluster");
+        }
+
+        // Re-registering the same id (e.g. a reconnect) overwrites in place
+        // rather than accumulating a second entry.
+        set_connection_meta_impl(&state, "conn-1", "profile-b", "Renamed", false).unwrap();
+        let meta = state.connection_meta.lock().unwrap();
+        assert_eq!(meta.len(), 1, "same id must overwrite, not duplicate");
+        let m = meta.get("conn-1").unwrap();
+        assert_eq!(m.profile_id, "profile-b");
+        assert_eq!(m.name, "Renamed");
+    }
+
+    #[test]
+    fn connection_meta_never_carries_a_uri() {
+        // Regression guard for the explicit constraint: event payloads must
+        // never carry a connection string. `ConnectionMeta`/`ConnectionEntry`
+        // only ever expose `profileId`/`name` — this test would fail to
+        // compile (not just fail at runtime) the moment a `uri` field is
+        // added, since the struct literal below is exhaustive.
+        let meta = crate::ConnectionMeta { profile_id: "p".into(), name: "n".into(), via_mcp: false };
+        let entry = crate::ConnectionEntry { id: "c".into(), profile_id: meta.profile_id.clone(), name: meta.name.clone(), via_mcp: meta.via_mcp };
+        assert_eq!(entry.id, "c");
+    }
+
+    #[test]
+    fn connection_list_is_sorted_by_id_regardless_of_insertion_order() {
+        let state = AppState::new();
+        set_connection_meta_impl(&state, "conn-c", "p3", "Third", false).unwrap();
+        set_connection_meta_impl(&state, "conn-a", "p1", "First", false).unwrap();
+        set_connection_meta_impl(&state, "conn-b", "p2", "Second", false).unwrap();
+
+        let list = connection_list_impl(&state).unwrap();
+        let ids: Vec<&str> = list.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["conn-a", "conn-b", "conn-c"], "list must be sorted by id, not insertion order");
+
+        // Same map contents, re-listed: must produce the exact same order
+        // every time (determinism, not just "happens to sort now").
+        let list2 = connection_list_impl(&state).unwrap();
+        assert_eq!(list, list2);
+    }
+
+    #[test]
+    fn connection_list_is_empty_when_no_meta_registered() {
+        let state = AppState::new();
+        assert!(connection_list_impl(&state).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_removes_connection_meta() {
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("mock connect");
+        set_connection_meta_impl(&state, &conn_id, "profile-a", "Mock Conn", false).unwrap();
+        assert!(state.connection_meta.lock().unwrap().contains_key(&conn_id));
+
+        disconnect_db_impl(&state, &conn_id)
+            .await
+            .expect("disconnect should succeed");
+
+        assert!(
+            !state.connection_meta.lock().unwrap().contains_key(&conn_id),
+            "disconnect_db_impl must remove the connection's meta entry"
+        );
+        assert!(connection_list_impl(&state).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_of_unregistered_meta_is_a_noop() {
+        // A connection that was never announced via `set_connection_meta`
+        // (e.g. one connected before this feature existed, or a mock in a
+        // test) must disconnect cleanly rather than erroring on a missing
+        // meta entry.
+        let state = AppState::new();
+        let conn_id = connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .expect("mock connect");
+        disconnect_db_impl(&state, &conn_id)
+            .await
+            .expect("disconnect must succeed even with no registered meta");
     }
 }

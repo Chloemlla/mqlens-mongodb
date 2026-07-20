@@ -1,14 +1,23 @@
 use serde_json::Value;
 
-pub fn get_mock_collections(db: &str) -> Vec<String> {
+// (name, type) pairs — type is "collection" or "timeseries", matching the
+// strings list_collections_impl reports for real clusters.
+pub fn get_mock_collections(db: &str) -> Vec<(String, &'static str)> {
     match db {
         "sales_db" => vec![
-            "customers".to_string(),
-            "transactions".to_string(),
-            "products".to_string(),
+            ("customers".to_string(), "collection"),
+            ("transactions".to_string(), "collection"),
+            ("products".to_string(), "collection"),
+            ("sensor_readings".to_string(), "timeseries"),
         ],
-        "user_analytics" => vec!["events".to_string(), "sessions".to_string()],
-        "admin" => vec!["system.users".to_string(), "system.version".to_string()],
+        "user_analytics" => vec![
+            ("events".to_string(), "collection"),
+            ("sessions".to_string(), "collection"),
+        ],
+        "admin" => vec![
+            ("system.users".to_string(), "collection"),
+            ("system.version".to_string(), "collection"),
+        ],
         _ => vec![],
     }
 }
@@ -124,7 +133,7 @@ pub fn execute_mock_query(
     // Paginate mock documents
     let total_len = docs.len();
     let skip_index = (skip as usize).min(total_len);
-    let max_limit = if limit <= 0 { 50 } else { limit as usize };
+    let max_limit = crate::limits::normalize_query_limit(limit) as usize;
     let limit_index = (skip_index + max_limit).min(total_len);
 
     let sliced = docs[skip_index..limit_index].to_vec();
@@ -136,19 +145,38 @@ pub fn execute_mock_query(
 }
 
 pub fn get_mock_explain(database: &str, collection: &str, filter: &str) -> String {
+    // Only sales_db.transactions returns a COLLSCAN plan, so the index-suggestion
+    // banner has somewhere to demo without a real server. Every other namespace
+    // keeps the pre-existing IXSCAN shape.
+    let winning_plan = if database == "sales_db" && collection == "transactions" {
+        serde_json::json!({
+            "stage": "SORT",
+            "sortPattern": { "timestamp": -1 },
+            "inputStage": { "stage": "COLLSCAN" }
+        })
+    } else {
+        serde_json::json!({
+            "stage": "IXSCAN",
+            "keyPattern": { "category": 1 },
+            "indexName": "category_1",
+            "isMultiKey": false,
+            "direction": "forward"
+        })
+    };
+
+    let parsed_query = if database == "sales_db" && collection == "transactions" {
+        serde_json::json!({ "$and": [ { "customer_name": { "$eq": "Alice Smith" } } ] })
+    } else {
+        serde_json::from_str::<serde_json::Value>(filter).unwrap_or_default()
+    };
+
     let plan = serde_json::json!({
         "explainVersion": "1",
         "queryPlanner": {
             "namespace": format!("{}.{}", database, collection),
             "indexFilterSet": false,
-            "parsedQuery": serde_json::from_str::<serde_json::Value>(filter).unwrap_or_default(),
-            "winningPlan": {
-                "stage": "IXSCAN",
-                "keyPattern": { "category": 1 },
-                "indexName": "category_1",
-                "isMultiKey": false,
-                "direction": "forward"
-            }
+            "parsedQuery": parsed_query,
+            "winningPlan": winning_plan
         },
         "executionStats": {
             "executionSuccess": true,
@@ -276,6 +304,31 @@ fn get_mock_data(database: &str, collection: &str) -> Vec<Value> {
                 }),
             ]
         }
+        ("sales_db", "sensor_readings") => {
+            vec![
+                serde_json::json!({
+                    "_id": { "$oid": "603d779f4f102e3a105c3320" },
+                    "timestamp": "2026-07-10T08:00:00Z",
+                    "sensor_id": "temp-01",
+                    "value": 21.4,
+                    "unit": "C"
+                }),
+                serde_json::json!({
+                    "_id": { "$oid": "603d779f4f102e3a105c3321" },
+                    "timestamp": "2026-07-10T08:05:00Z",
+                    "sensor_id": "temp-01",
+                    "value": 21.9,
+                    "unit": "C"
+                }),
+                serde_json::json!({
+                    "_id": { "$oid": "603d779f4f102e3a105c3322" },
+                    "timestamp": "2026-07-10T08:10:00Z",
+                    "sensor_id": "hum-02",
+                    "value": 44.0,
+                    "unit": "%"
+                }),
+            ]
+        }
         _ => vec![],
     }
 }
@@ -307,6 +360,7 @@ pub fn get_mock_indexes(db: &str, collection: &str) -> Vec<crate::IndexInfo> {
         ("sales_db", "customers") => vec!["_id_", "email_1", "tier_1"],
         ("sales_db", "transactions") => vec!["_id_", "timestamp_-1", "customer_name_1"],
         ("sales_db", "products") => vec!["_id_", "price_1", "category_1"],
+        ("sales_db", "sensor_readings") => vec!["_id_", "timestamp_-1"],
         ("user_analytics", "events") => vec!["_id_", "event_type_1", "timestamp_-1"],
         ("user_analytics", "sessions") => vec!["_id_", "session_id_1"],
         ("admin", "system.users") => vec!["_id_", "user_1_db_1"],

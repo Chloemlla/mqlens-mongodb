@@ -1,21 +1,33 @@
 import React, { useState, useMemo, useEffect, useContext } from 'react';
 import { DocumentViewerContext } from './DocumentViewer';
 import { List } from 'react-window';
-import { Table, Braces, ChevronRight, ChevronDown, ListFilter, Copy, Check, Edit, Trash2, Plus, Download, Upload, Table2 } from 'lucide-react';
+import { Table, Braces, ChevronRight, ChevronDown, ListFilter, Copy, Check, Edit, Trash2, Plus, Table2, BarChart3, Lightbulb, GitCompareArrows } from 'lucide-react';
+import { ChartView } from './ChartView';
+import { ContextMenu, type ContextMenuItem } from './ContextMenu';
+import { DocumentDiffModal } from './DocumentDiffModal';
+import Editor from '@monaco-editor/react';
+import { generateQueryCode, CODE_LANGUAGES, CODE_LANGUAGE_MONACO_IDS, type CodeLanguage, type QueryCodeSpec } from '../lib/queryCodeGen';
+import { suggestESRIndex, type IndexSuggestion } from '../lib/indexSuggestions';
+import { useMonacoTheme } from '../lib/useMonacoTheme';
 import { EJSON, ObjectId, Long, Decimal128, Int32, Double, Binary, Timestamp } from 'bson';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { useThemeOptional } from '@/hooks/use-theme';
+import { getScaledRowHeight } from '@/lib/themes/ui-scale';
+import { cn } from '@/lib/utils';
+import type { SpacingDensity } from '@/lib/themes/schema';
 
 interface DataGridProps {
   documents: Array<Record<string, any>>;
   density?: 'roomy' | 'cozy' | 'compact';
   explainResult?: string | null;
-  // The full mongosh-runnable command for the query that produced these results,
-  // shown formatted in the "Query Code" tab. Null when no query has run yet.
-  queryCode?: string | null;
+  // The query that produced these results, rendered as runnable driver code
+  // (per selected language) in the "Query Code" tab. Null before any run.
+  querySpec?: QueryCodeSpec | null;
   onInsertDocument?: () => void;
   onEditDocument?: (doc: Record<string, any>) => void;
+  onDuplicateDocument?: (doc: Record<string, any>) => void;
   onDeleteDocument?: (doc: Record<string, any>) => void;
-  onOpenExport?: () => void;
-  onImport?: () => void;
   onAnalyzeSchema?: () => void;
   onUpdateMany?: () => void;
   onDeleteMany?: () => void;
@@ -26,9 +38,11 @@ interface DataGridProps {
   limit?: number;
   onPageChange?: (newSkip: number) => void;
   onPageSizeChange?: (newLimit: number) => void;
+  // Fired when the user accepts the COLLSCAN suggestion banner's "Create Index" CTA.
+  onCreateSuggestedIndex?: (suggestion: IndexSuggestion) => void;
 }
 
-type ViewMode = 'table' | 'tree' | 'json';
+type ViewMode = 'table' | 'tree' | 'json' | 'chart';
 
 interface ExplainNode {
   name: string;
@@ -38,41 +52,41 @@ interface ExplainNode {
 }
 
 const GridIcon = () => (
-  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-sky-500">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-primary">
     <rect x="3" y="3" width="18" height="18" rx="2" />
     <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
   </svg>
 );
 
 const ResultIcon = () => (
-  <div className="relative w-8 h-8 flex items-center justify-center bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
+  <div className="relative flex h-8 w-8 items-center justify-center rounded-lg border border-success/20 bg-success/10">
     <GridIcon />
-    <span className="absolute -bottom-1 -right-1 bg-emerald-500 text-white rounded-full flex items-center justify-center w-4 h-4 text-[8px] font-bold shadow border border-[var(--bg-panel)]">
+    <span className="absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-card bg-success text-[8px] font-bold text-primary-foreground shadow">
       ✓
     </span>
   </div>
 );
 
 const ScanIcon = () => (
-  <div className="relative w-8 h-8 flex items-center justify-center bg-blue-500/10 border border-blue-500/20 rounded-lg">
+  <div className="relative flex h-8 w-8 items-center justify-center rounded-lg border border-primary/20 bg-primary/10">
     <GridIcon />
-    <span className="absolute -bottom-1 -right-1 bg-blue-500 text-white rounded-full flex items-center justify-center w-4 h-4 text-[8px] font-bold shadow border border-[var(--bg-panel)]">
+    <span className="absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-card bg-primary text-[8px] font-bold text-primary-foreground shadow">
       ↓
     </span>
   </div>
 );
 
 const IndexIcon = () => (
-  <div className="relative w-8 h-8 flex items-center justify-center bg-purple-500/10 border border-purple-500/20 rounded-lg">
+  <div className="relative flex h-8 w-8 items-center justify-center rounded-lg border border-chart-4/20 bg-chart-4/10">
     <GridIcon />
-    <span className="absolute -bottom-1 -right-1 bg-purple-500 text-white rounded-full flex items-center justify-center w-4 h-4 text-[8px] font-bold shadow border border-[var(--bg-panel)]">
+    <span className="absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-card bg-chart-4 text-[8px] font-bold text-primary-foreground shadow">
       🔑
     </span>
   </div>
 );
 
 const CollectionIcon = () => (
-  <div className="w-8 h-8 flex items-center justify-center bg-[var(--bg-item-hover)] border border-[var(--border-color)] rounded-lg">
+  <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-accent">
     <GridIcon />
   </div>
 );
@@ -222,46 +236,54 @@ export const getExplainTree = (explainStr: string): ExplainNode => {
   }
 };
 
+const explainNodeHover: Record<ExplainNode['type'], string> = {
+  result: 'hover:border-success/40',
+  stage: 'hover:border-primary/40',
+  collection: 'hover:border-border',
+  index: 'hover:border-warning/40',
+};
+
 const RenderTreeNode: React.FC<{ node: ExplainNode }> = ({ node }) => {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
-      {/* Node Box */}
-      <div className={`mql-explain-node mql-explain-node-${node.type}`}>
-        <div className="mql-explain-node-left">
-          <div className="mql-explain-icon">
+    <div className="flex w-full flex-col items-center">
+      <div
+        className={cn(
+          'relative flex w-full shrink-0 items-stretch gap-3.5 rounded-[10px] border border-border bg-card px-4 py-3.5 shadow-sm transition-all hover:-translate-y-px hover:shadow-md',
+          explainNodeHover[node.type]
+        )}
+      >
+        <div className="flex items-start pt-0.5">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-border">
             {node.type === 'result' && <ResultIcon />}
             {node.type === 'stage' && <ScanIcon />}
             {node.type === 'collection' && <CollectionIcon />}
             {node.type === 'index' && <IndexIcon />}
           </div>
         </div>
-        
-        <div className="mql-explain-node-body">
-          <div className="mql-explain-node-title">
-            <span className="mql-explain-name">{node.name}</span>
+
+        <div className="flex min-w-0 flex-1 flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-foreground">{node.name}</span>
           </div>
           {node.type === 'stage' && node.detail && (
-            <span className={`mql-stage-pill stage-pill-${node.detail.toLowerCase().split(' ')[0]}`}>
+            <Badge variant="secondary" className="w-fit font-mono text-[10px]">
               {node.detail.split(' ')[0]}
-            </span>
+            </Badge>
           )}
           {node.type !== 'stage' && node.detail && (
-            <span className="mql-explain-detail">{node.detail}</span>
+            <span className="font-mono text-[11px] text-muted-foreground">{node.detail}</span>
           )}
         </div>
       </div>
-      
-      {/* Connector and Children */}
+
       {node.children && node.children.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
-          <div className="mql-explain-connector">
-            <div className="mql-explain-connector-line" />
-            <div className="mql-explain-connector-arrow">
-              <ChevronDown size={10} className="text-[var(--border-color)]" />
-            </div>
+        <div className="flex w-full flex-col items-center">
+          <div className="flex flex-col items-center py-1">
+            <div className="h-4 w-px bg-border" />
+            <ChevronDown size={10} className="text-border" />
           </div>
-          
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, width: '100%', alignItems: 'center' }}>
+
+          <div className="flex w-full flex-col items-center gap-4">
             {node.children.map((child, idx) => (
               <RenderTreeNode key={idx} node={child} />
             ))}
@@ -291,7 +313,7 @@ interface JsonLine {
   doc?: Record<string, any>;
 }
 
-const jsonPunct = (text: string) => <span className="text-[var(--text-dim)]">{text}</span>;
+const jsonPunct = (text: string) => <span className="text-muted-foreground">{text}</span>;
 const jsonKeyNode = (k: string) => (
   <>
     <span className="text-syntax-key">"{k}"</span>
@@ -316,16 +338,107 @@ interface TreeRow {
   doc?: Record<string, any>;
 }
 
+// Extra (per-render) data handed to the JSON view's virtualized rows.
+interface JsonRowExtra {
+  lines: JsonLine[];
+  collapsedFolds: Set<number>;
+  toggleFold: (id: number) => void;
+  documents: Array<Record<string, any>>;
+  openCtxMenu: (
+    e: React.MouseEvent,
+    doc: Record<string, any> | undefined,
+    field?: string,
+    value?: any,
+  ) => void;
+  renderContent: (line: JsonLine) => React.ReactNode;
+  hasRowActions: boolean;
+  RowActions: React.ComponentType<{ doc: Record<string, any> }>;
+}
+
+// Virtualized row for the JSON view (one descriptor per row).
+//
+// Defined at module scope on purpose: react-window remounts every row whenever
+// the `rowComponent` reference changes, and a remount replaces the row's DOM —
+// which silently wipes out any active text selection. When this lived inline in
+// DataGrid it was a brand-new function on each render, so any unrelated
+// re-render dropped the user's selection mid-copy. A stable identity lets
+// re-renders reconcile in place, so the selection survives. Per-render data is
+// passed through `rowProps` instead of closures.
+const JsonRow = ({
+  index,
+  style,
+  lines,
+  collapsedFolds,
+  toggleFold,
+  documents,
+  openCtxMenu,
+  renderContent,
+  hasRowActions,
+  RowActions,
+}: { index: number; style: React.CSSProperties } & JsonRowExtra) => {
+  const line = lines[index];
+  if (!line) return null;
+  const folded = line.foldId !== undefined && collapsedFolds.has(line.foldId);
+  return (
+    <div
+      style={style}
+      className={cn(
+        'flex items-center whitespace-pre hover:bg-accent',
+        line.docIndex % 2 === 0 ? 'bg-background' : 'bg-card',
+        line.isDocRoot && line.docIndex > 0 && 'border-t border-border'
+      )}
+      data-doc-even={line.docIndex % 2 === 0}
+      onContextMenu={(e) => openCtxMenu(e, documents[line.docIndex], line.kind === 'scalar' ? line.keyName ?? undefined : undefined, line.value)}
+    >
+      <span
+        className="json-view-gutter sticky left-0 w-[52px] shrink-0 select-none bg-inherit pr-3 text-right text-[10px] text-muted-foreground before:content-[attr(data-num)]"
+        data-num={line.num}
+        aria-hidden="true"
+      />
+      <span className="sticky left-[52px] flex w-4 shrink-0 items-center justify-center bg-inherit text-muted-foreground">
+        {line.foldId !== undefined && (
+          <button
+            type="button"
+            onClick={() => toggleFold(line.foldId!)}
+            className="flex cursor-pointer items-center justify-center rounded-sm hover:bg-accent hover:text-foreground"
+            data-testid="json-fold-btn"
+            aria-label={folded ? 'Expand' : 'Collapse'}
+          >
+            {folded ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+          </button>
+        )}
+      </span>
+      <span
+        className="flex-1 whitespace-pre pr-4 text-foreground select-text [&_*]:select-text"
+        style={{ paddingLeft: line.depth * 18 }}
+      >
+        {renderContent(line)}
+        {folded && (
+          <span className="text-muted-foreground">
+            {' … '}
+            {line.closeChar}
+            {line.hasComma ? ',' : ''}
+          </span>
+        )}
+        {line.isDocRoot && hasRowActions && line.doc && (
+          <span className="ml-2.5 inline-flex align-middle opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
+            <RowActions doc={line.doc} />
+          </span>
+        )}
+      </span>
+    </div>
+  );
+};
+
 export const DataGrid: React.FC<DataGridProps> = ({
   documents,
-  density = 'cozy',
+  density: densityProp,
   explainResult = null,
-  queryCode = null,
+  querySpec = null,
   onInsertDocument,
   onEditDocument,
+  onDuplicateDocument,
   onDeleteDocument,
-  onOpenExport,
-  onImport,
   onAnalyzeSchema,
   onUpdateMany,
   onDeleteMany,
@@ -336,12 +449,158 @@ export const DataGrid: React.FC<DataGridProps> = ({
   limit,
   onPageChange,
   onPageSizeChange,
+  onCreateSuggestedIndex,
 }) => {
+  const themeCtx = useThemeOptional();
+  const density: SpacingDensity =
+    densityProp ?? themeCtx?.config.spacingDensity ?? 'cozy';
+
+  // ESR-rule suggestion derived from the current explain plan (null unless it's a COLLSCAN).
+  const indexSuggestion = useMemo(
+    () => (explainResult ? suggestESRIndex(explainResult) : null),
+    [explainResult]
+  );
+
+  // Right-click context menu shared by all result views (Table / Tree / JSON).
+  const [ctxMenu, setCtxMenu] = useState<
+    { x: number; y: number; doc: Record<string, any>; field?: string; value?: any } | null
+  >(null);
+
+  // Two-step "Compare with…" flow: the first pick is held here as the armed
+  // source; the second pick (a different document) opens the diff modal.
+  const [pendingCompare, setPendingCompare] = useState<Record<string, any> | null>(null);
+  const [diffPair, setDiffPair] = useState<{ a: Record<string, any>; b: Record<string, any> } | null>(null);
+
+  // A new result set invalidates any armed compare source: the armed doc may
+  // no longer exist (or may differ) in the fresh documents array, and matching
+  // is by reference — silently diffing a stale doc would mislead. An OPEN diff
+  // modal is deliberately left alone: it deep-copied its two docs and stays
+  // valid regardless of what the grid refreshes to underneath it.
+  useEffect(() => {
+    setPendingCompare(null);
+  }, [documents]);
+
+  const writeClipboard = (text: string) => {
+    try { navigator.clipboard?.writeText(text); } catch { /* clipboard unavailable */ }
+  };
+  const valueToText = (v: any): string => {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'object') {
+      try { return EJSON.stringify(v); } catch { return JSON.stringify(v); }
+    }
+    return String(v);
+  };
+  const openCtxMenu = (
+    e: React.MouseEvent,
+    doc: Record<string, any> | undefined,
+    field?: string,
+    value?: any,
+  ) => {
+    if (!doc) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu({ x: e.clientX, y: e.clientY, doc, field, value });
+  };
+  const buildCtxItems = (m: NonNullable<typeof ctxMenu>): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [];
+    if (onEditDocument) items.push({ label: 'Edit document', icon: <Edit size={13} />, onClick: () => onEditDocument(m.doc) });
+    if (onDuplicateDocument) items.push({ label: 'Duplicate document', icon: <Plus size={13} />, onClick: () => onDuplicateDocument(m.doc) });
+    items.push({ label: 'Copy document (JSON)', icon: <Copy size={13} />, onClick: () => writeClipboard(JSON.stringify(m.doc, null, 2)) });
+    if (!pendingCompare) {
+      items.push({
+        label: 'Compare with…',
+        icon: <GitCompareArrows size={13} />,
+        separatorBefore: true,
+        onClick: () => setPendingCompare(m.doc),
+      });
+    } else if (pendingCompare === m.doc) {
+      items.push({
+        label: 'Cancel compare selection',
+        icon: <GitCompareArrows size={13} />,
+        separatorBefore: true,
+        onClick: () => setPendingCompare(null),
+      });
+    } else {
+      items.push({
+        label: 'Compare with selected',
+        icon: <GitCompareArrows size={13} />,
+        separatorBefore: true,
+        onClick: () => {
+          setDiffPair({ a: pendingCompare, b: m.doc });
+          setPendingCompare(null);
+        },
+      });
+      items.push({
+        label: 'Compare with… (replace selection)',
+        icon: <GitCompareArrows size={13} />,
+        onClick: () => setPendingCompare(m.doc),
+      });
+    }
+    if (m.field) {
+      items.push({ label: 'Copy value', icon: <Copy size={13} />, separatorBefore: true, onClick: () => writeClipboard(valueToText(m.value)) });
+      items.push({ label: 'Copy field name', icon: <Copy size={13} />, onClick: () => writeClipboard(m.field!) });
+    }
+    if (onDeleteDocument) items.push({ label: 'Delete document', icon: <Trash2 size={13} />, danger: true, separatorBefore: true, onClick: () => onDeleteDocument(m.doc) });
+    return items;
+  };
   const docViewerContext = useContext(DocumentViewerContext);
   const [viewMode, setViewMode] = useState<ViewMode>('json');
   const [activeTab, setActiveTab] = useState<'results' | 'explain' | 'query'>('results');
+
+  // Column resize: table view keeps per-column widths (session-scoped — the
+  // column set changes per collection); the tree view's key column persists.
+  const [colWidths, setColWidths] = useState<Record<string, number>>({});
+  const colWidth = (col: string) => colWidths[col] ?? 180;
+  const [treeKeyWidth, setTreeKeyWidth] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('mqlens-treekey-width'));
+    return saved >= 140 && saved <= 800 ? saved : 320;
+  });
+  useEffect(() => { localStorage.setItem('mqlens-treekey-width', String(treeKeyWidth)); }, [treeKeyWidth]);
+
+  const clampCol = (w: number, min = 80, max = 800) => Math.min(max, Math.max(min, w));
+  const startColResize = (e: React.MouseEvent, startWidth: number, apply: (w: number) => void, min = 80) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const move = (ev: MouseEvent) => apply(clampCol(startWidth + ev.clientX - startX, min));
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  };
+  // Shared handle: drag or focus + arrow keys. A render helper (not a nested
+  // component) so re-renders update the same DOM node instead of remounting.
+  const renderColResizer = (label: string, width: number, apply: (w: number) => void, min = 80) => (
+    <div
+      className="absolute right-[-4px] top-0 z-[2] h-full w-2 cursor-col-resize hover:bg-primary/45 focus-visible:bg-primary/45 focus-visible:outline-none"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={`Resize ${label} column`}
+      tabIndex={0}
+      onMouseDown={(e) => startColResize(e, width, apply, min)}
+      onKeyDown={(e) => {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault();
+        apply(clampCol(width + (e.key === 'ArrowRight' ? 16 : -16), min));
+      }}
+    />
+  );
   const [copied, setCopied] = useState(false);
   const [queryCopied, setQueryCopied] = useState(false);
+
+  // Query Code tab: generate runnable driver code in the selected language.
+  const monacoTheme = useMonacoTheme();
+  const [codeLang, setCodeLang] = useState<CodeLanguage>(() => {
+    const saved = localStorage.getItem('mqlens-codegen-lang') as CodeLanguage | null;
+    return saved && (CODE_LANGUAGES as readonly string[]).includes(saved) ? saved : 'mongosh';
+  });
+  useEffect(() => { localStorage.setItem('mqlens-codegen-lang', codeLang); }, [codeLang]);
+  const queryCode = useMemo(
+    () => (querySpec ? generateQueryCode(codeLang, querySpec) : null),
+    [querySpec, codeLang],
+  );
 
   const handleCopyQueryCode = () => {
     if (!queryCode) return;
@@ -405,16 +664,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
     });
     return Array.from(keys);
   }, [documents]);
-
-  const renderCellContent = (val: any): string => {
-    if (val === null || val === undefined) return '';
-    if (typeof val === 'object') {
-      if (val.$oid) return val.$oid;
-      if (val.$date) return typeof val.$date === 'string' ? val.$date : JSON.stringify(val.$date);
-      return JSON.stringify(val);
-    }
-    return String(val);
-  };
 
   const isBsonObject = (val: any): boolean => {
     if (val === null || val === undefined) return false;
@@ -502,6 +751,34 @@ export const DataGrid: React.FC<DataGridProps> = ({
           <span className="text-syntax-number">{val.toString()}</span>)
         </>
       );
+    }
+    return <span>{String(val)}</span>;
+  };
+
+  // Colored Table cell — same syntax palette as the Tree/JSON views (strings,
+  // numbers, booleans, BSON types) so the Table is visually consistent.
+  const renderColoredCell = (val: any): React.ReactNode => {
+    if (val === null || val === undefined) return '';
+    if (typeof val === 'string') return <span className="text-syntax-string">{val}</span>;
+    if (typeof val === 'number') return <span className="text-syntax-number">{String(val)}</span>;
+    if (typeof val === 'boolean') return <span className="text-syntax-boolean font-bold">{val ? 'true' : 'false'}</span>;
+    if (typeof val === 'object') {
+      if (isBsonObject(val)) return renderBsonValueNode(val);
+      if (typeof val.$oid === 'string') return <span className="text-syntax-string">{val.$oid}</span>;
+      if (val.$date !== undefined) {
+        const s =
+          typeof val.$date === 'string'
+            ? val.$date
+            : val.$date?.$numberLong
+              ? new Date(Number(val.$date.$numberLong)).toISOString()
+              : JSON.stringify(val.$date);
+        return <span className="text-syntax-string">{s}</span>;
+      }
+      if (val.$numberLong !== undefined) return <span className="text-syntax-number">{String(val.$numberLong)}</span>;
+      if (val.$numberDecimal !== undefined) return <span className="text-syntax-number">{String(val.$numberDecimal)}</span>;
+      if (val.$numberInt !== undefined) return <span className="text-syntax-number">{String(val.$numberInt)}</span>;
+      if (val.$numberDouble !== undefined) return <span className="text-syntax-number">{String(val.$numberDouble)}</span>;
+      return <span className="text-muted-foreground">{JSON.stringify(val)}</span>;
     }
     return <span>{String(val)}</span>;
   };
@@ -758,24 +1035,50 @@ export const DataGrid: React.FC<DataGridProps> = ({
   const renderTreeValue = (row: TreeRow): React.ReactNode => {
     if (row.kind === 'scalar') return renderBsonValueNode(row.value);
     if (row.kind === 'array')
-      return <span className="text-[var(--text-dim)]">{`[ ${row.childCount} ${row.childCount === 1 ? 'element' : 'elements'} ]`}</span>;
-    return <span className="text-[var(--text-dim)]">{`{ ${row.childCount} ${row.childCount === 1 ? 'field' : 'fields'} }`}</span>;
+      return <span className="text-muted-foreground">{`[ ${row.childCount} ${row.childCount === 1 ? 'element' : 'elements'} ]`}</span>;
+    return <span className="text-muted-foreground">{`{ ${row.childCount} ${row.childCount === 1 ? 'field' : 'fields'} }`}</span>;
   };
 
-  const hasRowActions = Boolean(onEditDocument || onDeleteDocument);
+  // Every document now carries at least a copy control, so the actions
+  // area is always present; edit/delete remain gated on their handlers.
+  const hasRowActions = true;
 
-  // Per-row edit/delete controls, shared across all view modes.
+  // One-click "Copy JSON" for a single document, with a brief "Copied"
+  // confirmation. Copies the pretty-printed (2-space) document, matching the
+  // "Copy document (JSON)" context-menu action.
+  const CopyDocButton = ({ doc }: { doc: Record<string, any> }) => {
+    const [copied, setCopied] = useState(false);
+    const handleCopy = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      writeClipboard(JSON.stringify(doc, null, 2));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    };
+    return (
+      <button
+        onClick={handleCopy}
+        className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary"
+        title={copied ? 'Copied' : 'Copy document (JSON)'}
+        aria-label={copied ? 'Copied' : 'Copy document'}
+        data-testid="copy-doc-btn"
+      >
+        {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
+      </button>
+    );
+  };
+
+  // Per-row copy/edit/delete controls, shared across all view modes.
   const RowActions = ({ doc }: { doc: Record<string, any> }) => {
-    if (!hasRowActions) return null;
     return (
       <div className="flex items-center gap-1 flex-shrink-0">
+        <CopyDocButton doc={doc} />
         {onEditDocument && (
           <button
             onClick={(e) => {
               e.stopPropagation();
               onEditDocument(doc);
             }}
-            className="p-1 rounded text-[var(--text-dim)] hover:text-[var(--accent-blue)] hover:bg-[var(--bg-item-active)] cursor-pointer"
+            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary"
             title="Edit document"
             data-testid="edit-doc-btn"
           >
@@ -788,7 +1091,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
               e.stopPropagation();
               onDeleteDocument(doc);
             }}
-            className="p-1 rounded text-[var(--text-dim)] hover:text-rose-400 hover:bg-rose-950/20 cursor-pointer"
+            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
             title="Delete document"
             data-testid="delete-doc-btn"
           >
@@ -806,24 +1109,26 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
     // Table mode
     return (
-      <div 
-        style={style} 
-        className="border-b border-[var(--border-color)] flex items-center hover:bg-[var(--bg-item-hover)] font-mono text-xs"
+      <div
+        style={style}
+        className="flex items-center border-b border-border font-mono text-xs hover:bg-accent"
+        onContextMenu={(e) => openCtxMenu(e, rawDoc)}
       >
-        <div className="flex items-center h-full border-r border-[var(--border-color)] justify-center select-none text-[var(--text-dim)] text-[10px] w-12 flex-shrink-0">
+        <div className="flex h-full w-12 shrink-0 select-none items-center justify-center border-r border-border text-[10px] text-muted-foreground">
           {index + 1}
         </div>
         {columns.map((col) => (
           <div
             key={col}
-            className="px-3 border-r border-[var(--border-color)] h-full flex items-center truncate text-[var(--text-main)]"
-            style={{ width: '180px', flexShrink: 0 }}
+            className="flex h-full items-center truncate border-r border-border px-3 text-foreground"
+            style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
+            onContextMenu={(e) => openCtxMenu(e, rawDoc, col, rawDoc[col])}
           >
-            {renderCellContent(rawDoc[col])}
+            {renderColoredCell(rawDoc[col])}
           </div>
         ))}
         {hasRowActions && (
-          <div className="px-2 h-full flex items-center justify-center" style={{ width: '72px', flexShrink: 0 }}>
+          <div className="flex h-full w-[72px] shrink-0 items-center justify-center px-2">
             <RowActions doc={rawDoc} />
           </div>
         )}
@@ -834,66 +1139,19 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
   // Row height depends on viewMode and density
   const getRowHeight = () => {
-    // JSON view rows are single lines (one entry per row).
     if (viewMode === 'json') {
-      if (density === 'roomy') return 24;
-      if (density === 'compact') return 17;
-      return 20; // cozy
+      if (density === 'roomy') return getScaledRowHeight(24, density);
+      if (density === 'compact') return getScaledRowHeight(17, density);
+      return getScaledRowHeight(20, density);
     }
-    // Tree-table rows are single entries (one field per row).
     if (viewMode === 'tree') {
-      if (density === 'roomy') return 28;
-      if (density === 'compact') return 20;
-      return 24; // cozy
+      if (density === 'roomy') return getScaledRowHeight(28, density);
+      if (density === 'compact') return getScaledRowHeight(20, density);
+      return getScaledRowHeight(24, density);
     }
-    // Table mode
-    if (density === 'roomy') return 32;
-    if (density === 'compact') return 20;
-    return 24; // cozy
-  };
-
-  // Virtualized row for the JSON view (one descriptor per row).
-  const JsonRow = ({ index, style }: { index: number; style: React.CSSProperties }) => {
-    const line = visibleJsonLines[index];
-    if (!line) return null;
-    const folded = line.foldId !== undefined && collapsedFolds.has(line.foldId);
-    return (
-      <div
-        style={style}
-        className={`mql-jsonview-line${line.isDocRoot && line.docIndex > 0 ? ' mql-jsonview-doc-start' : ''}`}
-        data-doc-even={line.docIndex % 2 === 0}
-      >
-        <span className="mql-jsonview-num">{line.num}</span>
-        <span className="mql-jsonview-fold">
-          {line.foldId !== undefined && (
-            <button
-              type="button"
-              onClick={() => toggleFold(line.foldId!)}
-              className="mql-jsonview-fold-btn"
-              data-testid="json-fold-btn"
-              aria-label={folded ? 'Expand' : 'Collapse'}
-            >
-              {folded ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-            </button>
-          )}
-        </span>
-        <span className="mql-jsonview-content" style={{ paddingLeft: line.depth * 18 }}>
-          {renderJsonLineContent(line)}
-          {folded && (
-            <span className="text-[var(--text-dim)]">
-              {' … '}
-              {line.closeChar}
-              {line.hasComma ? ',' : ''}
-            </span>
-          )}
-          {line.isDocRoot && hasRowActions && line.doc && (
-            <span className="mql-jsonview-actions">
-              <RowActions doc={line.doc} />
-            </span>
-          )}
-        </span>
-      </div>
-    );
+    if (density === 'roomy') return getScaledRowHeight(32, density);
+    if (density === 'compact') return getScaledRowHeight(20, density);
+    return getScaledRowHeight(24, density);
   };
 
   // Virtualized row for the tree-table view (Key | Value | Type).
@@ -904,54 +1162,59 @@ export const DataGrid: React.FC<DataGridProps> = ({
     return (
       <div
         style={style}
-        className={`mql-treetable-row${row.isDocRoot && row.docIndex > 0 ? ' mql-treetable-doc-start' : ''}`}
+        className={cn(
+          'flex items-center border-b border-border font-mono text-[11.5px] hover:bg-accent',
+          row.docIndex % 2 === 0 ? 'bg-background' : 'bg-card',
+          row.isDocRoot && row.docIndex > 0 && 'border-t border-border'
+        )}
         data-doc-even={row.docIndex % 2 === 0}
+        onContextMenu={(e) => openCtxMenu(e, documents[row.docIndex], row.kind === 'scalar' ? row.keyName : undefined, row.value)}
       >
-        <div className="mql-treetable-key" style={{ paddingLeft: 6 + row.depth * 14 }}>
+        <div className="flex min-w-0 items-center border-r border-border" style={{ width: treeKeyWidth, paddingLeft: 6 + row.depth * 14 }}>
           {row.foldId !== undefined ? (
             <button
               type="button"
               onClick={() => toggleTreeFold(row.foldId!)}
-              className="mql-treetable-fold-btn"
+              className="mr-1 flex shrink-0 items-center text-muted-foreground hover:text-foreground"
               data-testid="tree-fold-btn"
               aria-label={collapsed ? 'Expand' : 'Collapse'}
             >
               {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
             </button>
           ) : (
-            <span className="mql-treetable-fold-spacer" />
+            <span className="mr-1 inline-block w-[11px] shrink-0" />
           )}
-          <span className="text-syntax-key truncate" title={row.keyName}>{row.keyName}</span>
+          <span className="truncate text-syntax-key" title={row.keyName}>{row.keyName}</span>
         </div>
-        <div className="mql-treetable-value">
+        <div className="flex min-w-0 flex-1 items-center gap-2 border-r border-border px-3">
           <span className="truncate">{renderTreeValue(row)}</span>
           {row.isDocRoot && hasRowActions && row.doc && (
-            <span className="mql-jsonview-actions">
+            <span className="ml-auto inline-flex opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
               <RowActions doc={row.doc} />
             </span>
           )}
         </div>
-        <div className="mql-treetable-type">{row.type}</div>
+        <div className="w-28 shrink-0 px-3 text-muted-foreground">{row.type}</div>
       </div>
     );
   };
   return (
-    <div className="mql-datagrid flex-1 flex flex-col h-full overflow-hidden bg-[var(--bg-base)]">
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
       {/* Control Bar */}
       <div
-        className="h-9 border-b border-[var(--border-color)] flex items-center justify-between px-3 bg-[var(--bg-sidebar)] select-none"
-        style={{ position: 'relative', zIndex: 30, overflow: 'visible' }}
+        className="relative z-30 flex h-9 select-none items-center justify-between overflow-visible border-b border-border bg-sidebar px-3"
       >
-        
-        {/* Left Side: Results and Explain Tabs */}
-        <div className="mql-pane-tabs">
+
+        <div className="flex items-center gap-0.5 rounded-lg bg-muted/50 p-0.5">
           <button
             onClick={() => setActiveTab('results')}
-            className={`mql-pane-tab ${activeTab === 'results' ? 'is-active' : ''}`}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-xs font-medium transition-all',
+              activeTab === 'results' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
+            )}
           >
-            <span>Results</span>
+            Results
           </button>
-          
           <button
             onClick={() => {
               setActiveTab('explain');
@@ -959,19 +1222,24 @@ export const DataGrid: React.FC<DataGridProps> = ({
                 docViewerContext.handleExplain();
               }
             }}
-            className={`mql-pane-tab ${activeTab === 'explain' ? 'is-active' : ''}`}
+            className={cn(
+              'rounded-md px-2.5 py-1 text-xs font-medium transition-all',
+              activeTab === 'explain' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
+            )}
             data-testid="explain-plan-tab"
           >
-            <span>Explain Plan</span>
+            Explain Plan
           </button>
-
           {queryCode && (
             <button
               onClick={() => setActiveTab('query')}
-              className={`mql-pane-tab ${activeTab === 'query' ? 'is-active' : ''}`}
+              className={cn(
+                'rounded-md px-2.5 py-1 text-xs font-medium transition-all',
+                activeTab === 'query' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'
+              )}
               data-testid="query-code-tab"
             >
-              <span>Query Code</span>
+              Query Code
             </button>
           )}
         </div>
@@ -979,165 +1247,201 @@ export const DataGrid: React.FC<DataGridProps> = ({
         {/* Right Side Controls */}
         <div className="flex items-center gap-2">
           {activeTab === 'results' && onInsertDocument && (
-            <button
+            <Button
+              variant="outline"
+              size="sm"
               onClick={onInsertDocument}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium border border-[var(--border-color)] text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-item-hover)] cursor-pointer transition-all"
+              className="h-7 gap-1.5 text-[11px]"
               title="Insert a new document"
               data-testid="insert-doc-btn"
             >
               <Plus size={12} />
-              <span>Insert</span>
-            </button>
-          )}
-          {activeTab === 'results' && onOpenExport && (
-            <button
-              type="button"
-              onClick={onOpenExport}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium border border-[var(--border-color)] text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-item-hover)] cursor-pointer transition-all"
-              title="Open export workspace"
-              data-testid="export-btn"
-            >
-              <Download size={12} />
-              <span>Export</span>
-            </button>
-          )}
-          {activeTab === 'results' && onImport && (
-            <button
-              onClick={onImport}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium border border-[var(--border-color)] text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-item-hover)] cursor-pointer transition-all"
-              title="Import documents from a file"
-              data-testid="import-btn"
-            >
-              <Upload size={12} />
-              <span>Import</span>
-            </button>
+              Insert
+            </Button>
           )}
           {activeTab === 'results' && onAnalyzeSchema && (
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={onAnalyzeSchema}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium border border-[var(--border-color)] text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-item-hover)] cursor-pointer transition-all"
+              className="h-7 gap-1.5 text-[11px]"
               title="Analyze the collection's field schema"
               data-testid="analyze-schema-btn"
             >
               <Table2 size={12} />
-              <span>Schema</span>
-            </button>
+              Schema
+            </Button>
           )}
           {activeTab === 'results' && onUpdateMany && (
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={onUpdateMany}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium border border-[var(--border-color)] text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-item-hover)] cursor-pointer transition-all"
+              className="h-7 gap-1.5 text-[11px]"
               title="Update all documents matching the current filter"
               data-testid="update-many-btn"
             >
               <Edit size={12} />
-              <span>Update Many</span>
-            </button>
+              Update Many
+            </Button>
           )}
           {activeTab === 'results' && onDeleteMany && (
-            <button
+            <Button
               type="button"
+              variant="outline"
+              size="sm"
               onClick={onDeleteMany}
-              className="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium border border-rose-900/30 bg-rose-950/10 text-rose-400 hover:bg-rose-950/20 cursor-pointer transition-all"
+              className="h-7 gap-1.5 border-destructive/30 bg-destructive/10 text-[11px] text-destructive hover:bg-destructive/20"
               title="Delete all documents matching the current filter"
               data-testid="delete-many-btn"
             >
               <Trash2 size={12} />
-              <span>Delete Many</span>
-            </button>
+              Delete Many
+            </Button>
           )}
           {activeTab === 'results' ? (
-            /* Toggle selectors */
-            <div className="flex items-center bg-[var(--bg-base)] border border-[var(--border-color)] rounded-md p-0.5">
-              <button 
+            <div className="flex items-center rounded-md border border-border bg-background p-0.5">
+              <button
                 role="button"
                 aria-label="Table"
                 onClick={() => setViewMode('table')}
-                className={`px-2 py-1 rounded flex items-center gap-1.5 text-[11px] font-medium transition-all cursor-pointer ${viewMode === 'table' ? 'bg-[var(--bg-item-active)] text-[var(--accent-blue)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}
+                className={cn(
+                  'flex cursor-pointer items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium transition-all',
+                  viewMode === 'table' ? 'bg-accent text-primary' : 'text-muted-foreground hover:text-foreground'
+                )}
               >
                 <Table size={12} />
                 <span>Table</span>
               </button>
-              
-              <button 
+
+              <button
                 role="button"
                 aria-label="Tree"
                 onClick={() => setViewMode('tree')}
-                className={`px-2 py-1 rounded flex items-center gap-1.5 text-[11px] font-medium transition-all cursor-pointer ${viewMode === 'tree' ? 'bg-[var(--bg-item-active)] text-[var(--accent-blue)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}
+                className={cn(
+                  'flex cursor-pointer items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium transition-all',
+                  viewMode === 'tree' ? 'bg-accent text-primary' : 'text-muted-foreground hover:text-foreground'
+                )}
               >
                 <ChevronRight size={12} />
                 <span>Tree</span>
               </button>
 
-              <button 
+              <button
                 role="button"
                 aria-label="JSON"
                 onClick={() => setViewMode('json')}
-                className={`px-2 py-1 rounded flex items-center gap-1.5 text-[11px] font-medium transition-all cursor-pointer ${viewMode === 'json' ? 'bg-[var(--bg-item-active)] text-[var(--accent-blue)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}
+                className={cn(
+                  'flex cursor-pointer items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium transition-all',
+                  viewMode === 'json' ? 'bg-accent text-primary' : 'text-muted-foreground hover:text-foreground'
+                )}
               >
                 <Braces size={12} />
                 <span>JSON</span>
               </button>
+
+              <button
+                role="button"
+                aria-label="Chart"
+                onClick={() => setViewMode('chart')}
+                className={cn(
+                  'flex cursor-pointer items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium transition-all',
+                  viewMode === 'chart' ? 'bg-accent text-primary' : 'text-muted-foreground hover:text-foreground'
+                )}
+              >
+                <BarChart3 size={12} />
+                <span>Chart</span>
+              </button>
             </div>
           ) : activeTab === 'explain' ? (
-            /* Explain Tools */
             explainResult && (
-              <button
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={handleCopy}
-                className="px-2.5 py-1 rounded bg-[var(--bg-item-active)] hover:bg-[var(--bg-item-hover)] text-[var(--text-muted)] hover:text-[var(--text-main)] border border-[var(--border-color)] flex items-center gap-1.5 text-[11px] font-semibold transition-all cursor-pointer"
+                className="h-7 gap-1.5 text-[11px] font-semibold"
                 title="Copy Explain Plan"
               >
-                {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+                {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
                 <span>{copied ? 'Copied!' : 'Copy Plan'}</span>
-              </button>
+              </Button>
             )
           ) : (
-            /* Query Code Tools */
             queryCode && (
-              <button
-                onClick={handleCopyQueryCode}
-                className="px-2.5 py-1 rounded bg-[var(--bg-item-active)] hover:bg-[var(--bg-item-hover)] text-[var(--text-muted)] hover:text-[var(--text-main)] border border-[var(--border-color)] flex items-center gap-1.5 text-[11px] font-semibold transition-all cursor-pointer"
-                title="Copy query code"
-                data-testid="copy-query-code-btn"
-              >
-                {queryCopied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
-                <span>{queryCopied ? 'Copied!' : 'Copy'}</span>
-              </button>
+              <>
+                <select
+                  value={codeLang}
+                  onChange={(e) => setCodeLang(e.target.value as CodeLanguage)}
+                  className="h-7 rounded-md border border-border bg-background px-2 text-[11px] text-foreground"
+                  aria-label="Code language"
+                  data-testid="query-code-lang"
+                >
+                  {CODE_LANGUAGES.map((lang) => (
+                    <option key={lang} value={lang}>{lang}</option>
+                  ))}
+                </select>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCopyQueryCode}
+                  className="h-7 gap-1.5 text-[11px] font-semibold"
+                  title="Copy query code"
+                  data-testid="copy-query-code-btn"
+                >
+                  {queryCopied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
+                  <span>{queryCopied ? 'Copied!' : 'Copy'}</span>
+                </Button>
+              </>
             )
           )}
         </div>
       </div>
 
       {activeTab === 'results' ? (
-        !documents || documents.length === 0 ? (
-          <div className="flex-1 flex flex-col items-center justify-center text-[var(--text-dim)] p-8">
-            <ListFilter size={24} className="mb-2 text-[var(--text-dim)]" />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {!documents || documents.length === 0 ? (
+          <div className="flex flex-1 flex-col items-center justify-center p-8 text-muted-foreground">
+            <ListFilter size={24} className="mb-2 text-muted-foreground" />
             <div>No documents found matching the criteria.</div>
           </div>
         ) : viewMode === 'json' ? (
-          /* Virtualized, line-numbered, collapsible JSON code panel */
-          <div className="mql-jsonview flex-1 flex flex-col min-h-0 min-w-0" data-testid="json-view">
-            <div className="flex-1 min-w-0 overflow-auto">
-              <List<{}>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed" data-testid="json-view">
+            <div className="min-h-0 flex-1 min-w-0 overflow-auto">
+              <List<JsonRowExtra>
                 rowCount={visibleJsonLines.length}
                 rowHeight={getRowHeight()}
                 rowComponent={JsonRow}
-                rowProps={{}}
+                rowProps={{
+                  lines: visibleJsonLines,
+                  collapsedFolds,
+                  toggleFold,
+                  documents,
+                  openCtxMenu,
+                  renderContent: renderJsonLineContent,
+                  hasRowActions,
+                  RowActions,
+                }}
                 style={{ height: '100%', width: `${jsonMaxWidthPx}px`, minWidth: '100%' }}
               />
             </div>
           </div>
         ) : viewMode === 'tree' ? (
-          /* Virtualized tree-table: Key | Value | Type */
-          <div className="mql-treetable flex-1 flex flex-col min-h-0 min-w-0" data-testid="tree-view">
-            <div className="mql-treetable-head">
-              <div className="mql-treetable-key">Key</div>
-              <div className="mql-treetable-value">Value</div>
-              <div className="mql-treetable-type">Type</div>
+          <div
+            className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-[11.5px]"
+            data-testid="tree-view"
+            style={{ '--treetable-keyw': `${treeKeyWidth}px` } as React.CSSProperties}
+          >
+            <div className="flex h-6 shrink-0 select-none items-center border-b border-border bg-sidebar text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+              <div className="relative border-r border-border" style={{ width: treeKeyWidth, paddingLeft: 6 }}>
+                Key
+                {renderColResizer('key', treeKeyWidth, setTreeKeyWidth, 140)}
+              </div>
+              <div className="flex-1 border-r border-border px-3">Value</div>
+              <div className="w-28 shrink-0 px-3">Type</div>
             </div>
-            <div className="flex-1 min-w-0">
+            <div className="min-h-0 flex-1 min-w-0 overflow-hidden">
               <List<{}>
                 rowCount={visibleTreeRows.length}
                 rowHeight={getRowHeight()}
@@ -1147,21 +1451,24 @@ export const DataGrid: React.FC<DataGridProps> = ({
               />
             </div>
           </div>
+        ) : viewMode === 'chart' ? (
+          <ChartView documents={parsedDocs} columns={columns} density={density} />
         ) : (
-          <div className="flex-1 overflow-auto flex flex-col min-w-0">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             {viewMode === 'table' && (
               /* Table Headers */
-              <div className="flex bg-[var(--bg-sidebar)] border-b border-[var(--border-color)] h-6 flex-shrink-0 text-[10px] font-bold text-[var(--text-muted)] uppercase tracking-wider select-none">
-                <div className="flex items-center justify-center border-r border-[var(--border-color)] w-12 flex-shrink-0">
+              <div className="flex h-6 shrink-0 select-none items-center border-b border-border bg-sidebar text-ui-2xs font-bold uppercase tracking-wider text-muted-foreground">
+                <div className="flex items-center justify-center border-r border-border w-12 flex-shrink-0">
                   #
                 </div>
                 {columns.map((col) => (
                   <div
                     key={col}
-                    className="px-3 border-r border-[var(--border-color)] flex items-center truncate"
-                    style={{ width: '180px', flexShrink: 0 }}
+                    className="px-3 border-r border-border flex items-center truncate relative"
+                    style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
                   >
                     {col}
+                    {renderColResizer(col, colWidth(col), (w) => setColWidths((p) => ({ ...p, [col]: w })))}
                   </div>
                 ))}
                 {hasRowActions && (
@@ -1173,74 +1480,108 @@ export const DataGrid: React.FC<DataGridProps> = ({
             )}
 
             {/* Virtualized list */}
-            <div className="flex-1 min-w-0">
+            <div className="min-h-0 flex-1 min-w-0 overflow-auto">
               <List<{}>
                 rowCount={documents.length}
                 rowHeight={getRowHeight()}
                 rowComponent={Row}
                 rowProps={{}}
-                style={{ height: '100%', width: '100%', minWidth: viewMode === 'table' ? `${(columns.length * 180) + 48 + (hasRowActions ? 72 : 0)}px` : '100%' }}
+                style={{ height: '100%', width: '100%', minWidth: viewMode === 'table' ? `${columns.reduce((s, c) => s + colWidth(c), 0) + 48 + (hasRowActions ? 72 : 0)}px` : '100%' }}
               />
             </div>
           </div>
-        )
+        )}
+        </div>
       ) : activeTab === 'explain' ? (
         /* Explain Plan Workspace */
         <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden" data-testid="explain-panel">
           {docViewerContext?.explainLoading ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-[var(--text-muted)] select-none p-6 bg-[var(--bg-base)]" data-testid="explain-loading">
+            <div className="flex flex-1 flex-col items-center justify-center bg-background p-6 text-muted-foreground select-none" data-testid="explain-loading">
               <div className="flex flex-col items-center gap-2 select-none">
-                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-[var(--accent-blue)]"></div>
+                <div className="h-5 w-5 animate-spin rounded-full border-b-2 border-primary"></div>
                 <span className="text-xs">Generating query plan...</span>
               </div>
             </div>
           ) : explainResult ? (
             <>
-              {/* Sub-header with toggles */}
-              <div className="h-8 border-b border-[var(--border-color)] flex items-center justify-between px-3 bg-[var(--bg-sidebar)] select-none flex-shrink-0">
+              <div className="flex h-8 shrink-0 select-none items-center justify-between border-b border-border bg-sidebar px-3">
                 <div className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                  <span className="text-[10px] font-bold text-[var(--text-muted)] uppercase tracking-wider">Query Plan Generated</span>
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success"></span>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Query Plan Generated</span>
                 </div>
-                
-                <div className="flex items-center bg-[var(--bg-base)] border border-[var(--border-color)] rounded-md p-0.5">
+
+                <div className="flex items-center rounded-md border border-border bg-background p-0.5">
                   <button
                     onClick={() => setExplainView('visual')}
-                    className={`px-2 py-0.5 rounded flex items-center gap-1.5 text-[10px] font-semibold transition-all cursor-pointer ${explainView === 'visual' ? 'bg-[var(--bg-item-active)] text-[var(--accent-blue)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}
+                    className={cn(
+                      'flex cursor-pointer items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-semibold transition-all',
+                      explainView === 'visual' ? 'bg-accent text-primary' : 'text-muted-foreground hover:text-foreground'
+                    )}
                   >
                     <Table size={11} />
                     <span>Visual Tree</span>
                   </button>
-                  
+
                   <button
                     onClick={() => setExplainView('json')}
-                    className={`px-2 py-0.5 rounded flex items-center gap-1.5 text-[10px] font-semibold transition-all cursor-pointer ${explainView === 'json' ? 'bg-[var(--bg-item-active)] text-[var(--accent-blue)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}
+                    className={cn(
+                      'flex cursor-pointer items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-semibold transition-all',
+                      explainView === 'json' ? 'bg-accent text-primary' : 'text-muted-foreground hover:text-foreground'
+                    )}
                   >
                     <Braces size={11} />
                     <span>Raw JSON</span>
                   </button>
                 </div>
               </div>
-              
-              {/* Explain plan content */}
+
+              {indexSuggestion && (
+                <div
+                  className="mx-3 mt-3 flex shrink-0 items-start gap-2.5 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2.5"
+                  data-testid="index-suggestion-banner"
+                >
+                  <Lightbulb size={16} className="mt-0.5 shrink-0 text-warning" />
+                  <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                    <p className="text-xs leading-relaxed text-foreground">{indexSuggestion.reason}</p>
+                    <code className="w-fit rounded bg-background/60 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                      {JSON.stringify(indexSuggestion.keys)}
+                    </code>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="h-7 shrink-0 gap-1.5 text-[11px] font-semibold"
+                    onClick={() => onCreateSuggestedIndex?.(indexSuggestion)}
+                    data-testid="create-suggested-index-btn"
+                  >
+                    Create Index
+                  </Button>
+                </div>
+              )}
+
               {explainView === 'visual' ? (
-                <div className="mql-explain-canvas">
-                  <div className="mql-explain-card">
+                <div
+                  className="flex flex-1 flex-col items-center gap-5 overflow-auto bg-background px-8 py-6"
+                  style={{
+                    backgroundImage: 'radial-gradient(hsl(var(--border)) 1.2px, transparent 0)',
+                    backgroundSize: '16px 16px',
+                  }}
+                >
+                  <div className="flex w-full max-w-[640px] flex-col items-center">
                     <RenderTreeNode node={getExplainTree(explainResult)} />
                   </div>
                 </div>
               ) : (
-                <div className="flex-1 overflow-auto bg-[var(--bg-base)] p-4 select-text">
-                  <pre className="text-[11px] text-sky-200 font-mono select-text leading-relaxed whitespace-pre-wrap">
+                <div className="flex-1 overflow-auto bg-background p-4 select-text">
+                  <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-syntax-key select-text">
                     {explainResult}
                   </pre>
                 </div>
               )}
             </>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-[var(--text-muted)] select-none p-6 bg-[var(--bg-base)]">
-              <span className="text-xs italic mb-2 text-[var(--text-dim)]">No explain plan generated yet.</span>
-              <span className="text-[11px] text-[var(--text-dim)] max-w-sm text-center leading-relaxed">
+            <div className="flex flex-1 flex-col items-center justify-center bg-background p-6 text-muted-foreground select-none">
+              <span className="mb-2 text-xs italic text-muted-foreground">No explain plan generated yet.</span>
+              <span className="max-w-sm text-center text-[11px] leading-relaxed text-muted-foreground">
                 To generate one, open the <strong>Run</strong> dropdown split menu in the query editor toolbar and select <strong>Run Explain</strong>.
               </span>
             </div>
@@ -1250,17 +1591,33 @@ export const DataGrid: React.FC<DataGridProps> = ({
         /* Query Code Workspace */
         <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden" data-testid="query-code-panel">
           {queryCode ? (
-            <div className="flex-1 overflow-auto bg-[var(--bg-base)] p-4 select-text">
-              <pre
-                className="text-[11px] text-sky-200 font-mono select-text leading-relaxed whitespace-pre-wrap"
-                data-testid="query-code-content"
-              >
-                {queryCode}
-              </pre>
+            <div className="min-h-0 flex-1 bg-background">
+              <Editor
+                height="100%"
+                language={CODE_LANGUAGE_MONACO_IDS[codeLang]}
+                value={queryCode}
+                theme={monacoTheme}
+                wrapperProps={{ 'data-testid': 'query-code-content' }}
+                options={{
+                  readOnly: true,
+                  domReadOnly: true,
+                  minimap: { enabled: false },
+                  lineNumbers: 'on',
+                  lineNumbersMinChars: 3,
+                  scrollBeyondLastLine: false,
+                  wordWrap: 'on',
+                  fontSize: 12,
+                  fontFamily: 'JetBrains Mono, SF Mono, Consolas, monospace',
+                  renderLineHighlight: 'none',
+                  automaticLayout: true,
+                  contextmenu: false,
+                  padding: { top: 10 },
+                }}
+              />
             </div>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-[var(--text-muted)] select-none p-6 bg-[var(--bg-base)]">
-              <span className="text-xs italic text-[var(--text-dim)]">No query has run yet.</span>
+            <div className="flex flex-1 flex-col items-center justify-center bg-background p-6 text-muted-foreground select-none">
+              <span className="text-xs italic text-muted-foreground">No query has run yet.</span>
             </div>
           )}
         </div>
@@ -1275,36 +1632,53 @@ export const DataGrid: React.FC<DataGridProps> = ({
         const prevDisabled = page <= 1;
         const nextDisabled = totalPages !== undefined ? page >= totalPages : documents.length < lim;
         return (
-          <div className="mql-pager" data-testid="pager">
-            <div className="mql-pager-info">
+          <div className="flex shrink-0 select-none items-center justify-between border-t border-border bg-sidebar px-3 py-1.5 text-[11px] text-muted-foreground" data-testid="pager">
+            <div className="flex items-center gap-3">
               <span>showing {from}{documents.length ? `–${to}` : ''}</span>
-              <span className="mql-pager-page" data-testid="pager-page">
+              <span className="font-semibold text-foreground" data-testid="pager-page">
                 Page {page}{totalPages !== undefined ? ` / ${totalPages}` : ''}
               </span>
-              <span className="mql-pager-total" data-testid="pager-total">
+              <span data-testid="pager-total">
                 {countLoading ? '…' : typeof totalCount === 'number' ? `${estimated ? '~' : ''}${totalCount} docs` : '…'}
               </span>
             </div>
-            <div className="mql-pager-controls">
+            <div className="flex items-center gap-1.5">
               <select
                 data-testid="pager-size"
                 value={lim}
                 onChange={(e) => onPageSizeChange(Number(e.target.value))}
+                className="h-7 rounded-md border border-border bg-background px-2 text-[11px] text-foreground"
               >
                 {[25, 50, 100, 200].map((s) => (
                   <option key={s} value={s}>{s} / page</option>
                 ))}
               </select>
-              <button type="button" data-testid="pager-prev" disabled={prevDisabled} onClick={() => onPageChange(Math.max(0, sk - lim))}>
+              <Button type="button" variant="outline" size="sm" className="h-7 px-2 text-[11px]" data-testid="pager-prev" disabled={prevDisabled} onClick={() => onPageChange(Math.max(0, sk - lim))}>
                 &lsaquo; Prev
-              </button>
-              <button type="button" data-testid="pager-next" disabled={nextDisabled} onClick={() => onPageChange(sk + lim)}>
+              </Button>
+              <Button type="button" variant="outline" size="sm" className="h-7 px-2 text-[11px]" data-testid="pager-next" disabled={nextDisabled} onClick={() => onPageChange(sk + lim)}>
                 Next &rsaquo;
-              </button>
+              </Button>
             </div>
           </div>
         );
       })()}
+      {diffPair && (
+        <DocumentDiffModal
+          isOpen
+          left={diffPair.a}
+          right={diffPair.b}
+          onClose={() => setDiffPair(null)}
+        />
+      )}
+      {ctxMenu && (
+        <ContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          items={buildCtxItems(ctxMenu)}
+          onClose={() => setCtxMenu(null)}
+        />
+      )}
     </div>
   );
 };

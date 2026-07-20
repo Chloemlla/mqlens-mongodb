@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/mqlens/mqlens-mongodb/actions/workflows/ci.yml/badge.svg)](https://github.com/mqlens/mqlens-mongodb/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-enabled-brightgreen.svg)](.github/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/mqlens/mqlens-mongodb)](https://github.com/mqlens/mqlens-mongodb/releases)
+[![Downloads](https://img.shields.io/github/downloads/mqlens/mqlens-mongodb/total)](https://github.com/mqlens/mqlens-mongodb/releases)
+[![Stars](https://img.shields.io/github/stars/mqlens/mqlens-mongodb?style=flat)](https://github.com/mqlens/mqlens-mongodb/stargazers)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **A fast, native desktop GUI for MongoDB** — built with [Tauri](https://tauri.app)
 (Rust) and React + TypeScript.
@@ -53,6 +57,9 @@ queries actually do — from a single cross-platform desktop app.
 - **GridFS** — browse files in a bucket and download them to disk.
 - **Import / export** — JSON and CSV, including full-collection background
   exports.
+- **Data generation** — seed collections with realistic fake documents:
+  schema-aware templates, nested objects and arrays, preview before you
+  insert, background tasks for big counts.
 - **mongosh shell** — an embedded shell backed by a real `mongosh` binary.
 - **AI query assistant** — natural-language → MQL generation, with multiple
   providers (Anthropic / OpenAI / Gemini and local agent CLIs); the API key
@@ -60,6 +67,15 @@ queries actually do — from a single cross-platform desktop app.
 - **Encrypted credentials** — a master password gates the app; connection
   profiles and settings are encrypted at rest with AES-256-GCM (Argon2id key
   derivation).
+- **Split panes** — drag a tab to any pane edge to split the workspace; compare
+  collections side by side, keep a shell under your results.
+- **Detachable windows** — pop a tab out into its own window and spread your
+  workspace across monitors.
+- **Session restore** — your splits and tabs come back after a restart;
+  reconnect per connection with one click.
+- **MCP server** — expose your connections to Claude Code, Cursor, and other agents as
+  [Model Context Protocol tools](docs/mcp-tools.md); per-connection opt-in, writes gated behind
+  explicit confirmation, off by default.
 
 ## Install
 
@@ -67,10 +83,66 @@ Grab the latest build for your OS from
 **[Releases](https://github.com/mqlens/mqlens-mongodb/releases/latest)**:
 
 - **macOS** — download the `.dmg` (Apple-notarized; Touch ID unlock supported).
-- **Windows** — download the `.msi` or `.exe` (signed via Azure Trusted Signing).
-- **Linux** — download the `.AppImage` (`chmod +x` and run) or install the `.deb`.
+
+### Windows
+
+Download the `.exe` or `.msi` installer from the
+[latest release](https://github.com/mqlens/mqlens-mongodb/releases/latest).
+Requires Windows 10 or later (x64). Installers are signed via Azure Trusted
+Signing.
+
+**Setup (.exe, recommended)**
+
+1. Double-click `MQLens_*_x64-setup.exe`.
+2. Approve the UAC prompt if Windows asks for permission.
+3. Follow the setup wizard, then launch **MQLens** from the Start menu.
+
+**Setup (.msi)**
+
+Double-click `MQLens_*.msi` and follow the prompts, or install from an elevated
+Command Prompt or PowerShell:
+
+```powershell
+msiexec /i MQLens_*.msi
+```
+
+If SmartScreen shows "Windows protected your PC", choose **More info** → **Run
+anyway**. The installer is signed; SmartScreen may still warn on first download
+until reputation builds.
+
+### Linux
+
+Download the `.deb` or `.AppImage` from the
+[latest release](https://github.com/mqlens/mqlens-mongodb/releases/latest).
+
+**Debian / Ubuntu (.deb)**
+
+```bash
+sudo apt install ./MQLens_*.deb
+# or:
+sudo dpkg -i MQLens_*.deb
+```
+
+**Any distro (.AppImage)**
+
+```bash
+chmod +x MQLens_*.AppImage
+./MQLens_*.AppImage
+```
+
+If the AppImage won't start ("Permission denied"), the execute bit was likely
+stripped on download — run `chmod +x` on the file again.
 
 No account, no sign-up, no telemetry.
+
+## Trust & privacy
+
+- **No telemetry** — nothing is tracked or phoned home.
+- **No account required** — just download and connect.
+- **Credentials encrypted locally** with AES-256-GCM and Argon2id key derivation.
+- **Signed release assets** (detached signatures on every artifact).
+- **macOS notarized** builds and **Windows signed** installers.
+- **Apache-2.0** — fully open source.
 
 ## MQLens vs. the alternatives
 
@@ -78,12 +150,13 @@ No account, no sign-up, no telemetry.
 |---|---|---|---|
 | Price | **Free (Apache-2.0)** | Free | Paid |
 | Engine | **Native (Tauri/Rust)** | Electron | Java |
-| All auth (X.509 / AWS / Kerberos / LDAP) | ✅ | partial | ✅ |
-| SSH tunnel / SOCKS5 proxy | ✅ | ❌ | ✅ |
+| Enterprise auth (X.509 / AWS / Kerberos / LDAP) | ✅ | ✅ | ✅ |
+| SSH tunnel | ✅ | ✅ | ✅ |
+| SOCKS5 proxy | ✅ | Not clearly exposed | Varies |
 | Aggregation + explain tree | ✅ | ✅ | ✅ |
 | Embedded `mongosh` | ✅ | ✅ | ✅ |
 | AI query assistant (bring-your-own key) | ✅ | ✅ | partial |
-| Encrypted creds + biometric unlock | ✅ | ❌ | partial |
+| Biometric-unlocked encrypted vault | ✅ | ❌ | partial |
 | Telemetry | **None** | yes | yes |
 
 *Comparison reflects publicly documented behavior at time of writing; tools change — corrections welcome via an issue.*
@@ -108,6 +181,11 @@ No account, no sign-up, no telemetry.
 npm install
 npm run tauri dev      # run the desktop app with hot reload
 ```
+
+For something to point the app at, seed the
+[local demo database](docs/demo-database.md) — synthetic collections, indexes,
+a view, and GridFS files that exercise every major workflow (and match the
+screenshots above).
 
 Other useful commands:
 

@@ -1,10 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Editor from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { AlertCircle, Braces, CornerDownLeft, Eraser, Play, Sparkles, Terminal } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { AIChatPanel } from './AIChatPanel';
 import { buildRunnableCommand, guardScriptRun, type GeneratedQuery } from '../lib/mongoCommand';
 import { DataGrid } from './DataGrid';
+import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
+import { useMonacoTheme } from '../lib/useMonacoTheme';
+import { registerMqlensMonacoThemes } from '../lib/monacoAppTheme';
+import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 
 type ShellTab = 'console' | 'viewer';
 
@@ -39,6 +55,9 @@ interface MongoShellProps {
   initialCommand?: string;
   density?: 'roomy' | 'cozy' | 'compact';
   onOpenSettings?: () => void;
+  onInstallTools?: () => void;
+  /** Bump this (e.g. after a tool install completes) to re-attempt the mongosh session. */
+  reconnectSignal?: number;
 }
 
 interface ParsedCall {
@@ -157,7 +176,7 @@ const stringifyShellValue = (value: unknown, indent = 0): string => {
 };
 
 const HighlightedValue: React.FC<{ value: unknown }> = ({ value }) => (
-  <pre className="mql-shell-pre">{stringifyShellValue(value)}</pre>
+  <pre className="m-0 whitespace-pre-wrap font-mono text-xs text-foreground">{stringifyShellValue(value)}</pre>
 );
 
 const createLogId = () => {
@@ -191,6 +210,8 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   initialCommand,
   density = 'cozy',
   onOpenSettings,
+  onInstallTools,
+  reconnectSignal,
 }) => {
   const [currentDb, setCurrentDb] = useState(databaseName);
   const startupLogId = useMemo(createLogId, []);
@@ -202,6 +223,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     [collectionName, initialCommand]
   );
   const [command, setCommand] = useState(defaultCommand);
+  const monacoTheme = useMonacoTheme();
   const [isAIOpen, setIsAIOpen] = useState(false);
   const [pendingDestructive, setPendingDestructive] =
     useState<{ command: string; operation: string } | null>(null);
@@ -216,10 +238,42 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionAttempted, setSessionAttempted] = useState(false);
   const [retryNonce, setRetryNonce] = useState(0);
+  // Guided setup on session failure: a working mongosh found outside the
+  // configured path (offered as one click), or null when nothing was found.
+  const [detectedMongosh, setDetectedMongosh] = useState<
+    { path: string; version: string; source: string } | null
+  >(null);
+  // Reuses the retry-nonce mechanism above: when a parent-driven reconnect signal
+  // changes (e.g. the guided tool-install dialog finished), re-attempt the session
+  // the same way the gate's own Retry button does.
+  const reconnectSignalRef = useRef(reconnectSignal);
+  useEffect(() => {
+    if (reconnectSignal !== undefined && reconnectSignal !== reconnectSignalRef.current) {
+      reconnectSignalRef.current = reconnectSignal;
+      // The signal fires after ANY tool install completes — only re-attempt
+      // when no session is attached (failed/not running). A healthy session
+      // must not be restarted; that would drop its state mid-work.
+      if (sessionId === null) setRetryNonce((n) => n + 1);
+    }
+    // sessionId is only read when the signal actually changed; including it
+    // keeps the read fresh without re-triggering (the ref guard above).
+  }, [reconnectSignal, sessionId]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const runRef = useRef<() => void>(() => {});
   const autoRunRef = useRef(false);
+  // Tracks the latest result docs so the Monaco completion provider (registered
+  // once in onMount) can derive field names from the current results.
+  const viewerRef = useRef<{ docs: Record<string, any>[] } | null>(null);
+  // Collection names for the current db, for `db.<coll>` completions in the shell.
+  const collectionsRef = useRef<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    invoke<Array<{ name: string }>>('list_collections', { id: connectionId, db: currentDb })
+      .then((cols) => { if (alive) collectionsRef.current = cols.map((c) => c.name); })
+      .catch(() => { if (alive) collectionsRef.current = []; });
+    return () => { alive = false; };
+  }, [connectionId, currentDb]);
 
   useEffect(() => {
     setCommand(defaultCommand);
@@ -337,6 +391,64 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [entries, tab]);
+
+  // When the session failed to attach, probe for a usable mongosh (managed
+  // install, PATH, well-known locations) so the gate can offer a one-click
+  // fix instead of only pointing at Settings.
+  useEffect(() => {
+    if (!sessionAttempted || sessionId !== null || mongoshPath === null) return;
+    let alive = true;
+    invoke<{ path: string; version: string; source: string } | null>('detect_mongosh_binary', {
+      configured: mongoshPath || '',
+    })
+      .then((found) => {
+        if (!alive) return;
+        // A hit at the configured path means the session failure has some
+        // other cause — offering "use this path" would be a no-op.
+        setDetectedMongosh(found && found.source !== 'configured' ? found : null);
+      })
+      .catch(() => {
+        if (alive) setDetectedMongosh(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [sessionAttempted, sessionId, mongoshPath, retryNonce]);
+
+  // Persist a newly chosen mongosh path and re-attempt the session. The
+  // retry-nonce bump matters when the picked path equals the current one
+  // (setMongoshPath alone would be a no-op state update, so no re-attempt).
+  const saveMongoshPath = async (path: string) => {
+    try {
+      const current = await invoke<AppSettings>('load_app_settings').catch(() => ({} as AppSettings));
+      await invoke('save_app_settings', {
+        settings: { ...current, mongosh_path: path },
+      });
+    } catch {
+      /* settings persistence is best-effort — still try the new path below */
+    }
+    setDetectedMongosh(null);
+    setMongoshPath(path);
+    setRetryNonce((n) => n + 1);
+  };
+
+  const browseForMongosh = async () => {
+    try {
+      const picked = await openFileDialog({ multiple: false, title: 'Locate the mongosh binary' });
+      if (typeof picked === 'string' && picked) await saveMongoshPath(picked);
+    } catch {
+      /* user cancelled */
+    }
+  };
+
+  // OS-specific manual install hint for the gate card.
+  const installHint = useMemo(() => {
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+    if (/mac/i.test(ua)) return 'brew install mongosh';
+    if (/win/i.test(ua)) return 'winget install MongoDB.Shell (or the MSI from mongodb.com)';
+    if (/linux/i.test(ua)) return 'sudo apt install mongodb-mongosh (or your distro’s package)';
+    return 'install mongosh from mongodb.com';
+  }, []);
 
   const executeFind = async (
     collName: string,
@@ -542,6 +654,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   };
 
   runRef.current = () => runCommand();
+  viewerRef.current = viewer;
 
   useEffect(() => {
     if (!initialCommand || autoRunRef.current || !sessionAttempted || !sessionId) return;
@@ -574,38 +687,70 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   // body with a starting spinner or a setup screen (Open Settings / Retry).
   if (!sessionId) {
     return (
-      <div className="mql-shell" data-testid="shell-session-gate" style={{ height: '100%' }}>
-        <div className="flex-1 flex flex-col items-center justify-center text-center gap-3 p-8 h-full select-none">
+      <div className="flex h-full flex-col bg-background" data-testid="shell-session-gate">
+        <div className="flex h-full flex-1 flex-col items-center justify-center gap-3 p-8 text-center select-none">
           {!sessionAttempted ? (
             <>
-              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-[var(--accent-blue)]" />
-              <span className="text-sm text-[var(--text-muted)]">Starting mongosh session…</span>
+              <div className="h-6 w-6 animate-spin rounded-full border-b-2 border-primary" />
+              <span className="text-sm text-muted-foreground">Starting mongosh session…</span>
             </>
           ) : (
             <>
-              <Terminal size={28} className="text-[var(--text-dim)]" />
-              <div className="text-sm font-semibold text-[var(--text-main)]">MongoShell requires mongosh</div>
-              <div className="text-[12px] text-[var(--text-dim)] max-w-sm leading-relaxed">
+              <Terminal size={28} className="text-muted-foreground" />
+              <div className="text-sm font-semibold text-foreground">MongoShell requires mongosh</div>
+              <div className="max-w-sm text-xs leading-relaxed text-muted-foreground">
                 A live mongosh session is required to run queries and scripts here.
-                Install mongosh and set its path in Settings, then retry.
               </div>
-              <div className="flex items-center gap-2 mt-1">
-                {onOpenSettings && (
-                  <button
-                    className="mql-btn mql-btn-primary"
-                    onClick={onOpenSettings}
-                    data-testid="gate-open-settings"
-                  >
-                    Open Settings
-                  </button>
-                )}
-                <button
-                  className="mql-btn mql-btn-ghost mql-btn-outlined"
-                  onClick={() => setRetryNonce((n) => n + 1)}
-                  data-testid="gate-retry"
+              {detectedMongosh && (
+                <div
+                  className="max-w-sm rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs"
+                  data-testid="shell-detected-mongosh"
                 >
+                  <div className="text-foreground">
+                    Found <span className="font-semibold">mongosh {detectedMongosh.version}</span>
+                  </div>
+                  <div className="truncate font-mono text-ui-2xs text-muted-foreground" title={detectedMongosh.path}>
+                    {detectedMongosh.path}
+                  </div>
+                  <Button
+                    size="sm"
+                    className="mt-1.5"
+                    onClick={() => void saveMongoshPath(detectedMongosh.path)}
+                    data-testid="shell-use-detected-btn"
+                  >
+                    Use this binary
+                  </Button>
+                </div>
+              )}
+              <div className="mt-1 flex items-center gap-2">
+                {onInstallTools && (
+                  <Button onClick={onInstallTools} data-testid="shell-install-tools-btn">
+                    Install tools…
+                  </Button>
+                )}
+                <Button variant="outline" onClick={() => void browseForMongosh()} data-testid="shell-browse-mongosh-btn">
+                  Browse for binary…
+                </Button>
+                {onOpenSettings && (
+                  <Button variant="outline" onClick={onOpenSettings} data-testid="gate-open-settings">
+                    Open Settings
+                  </Button>
+                )}
+                <Button variant="outline" onClick={() => setRetryNonce((n) => n + 1)} data-testid="gate-retry">
                   Retry
+                </Button>
+              </div>
+              <div className="max-w-sm text-ui-2xs text-muted-foreground" data-testid="shell-install-hint">
+                Or install it yourself: <code className="font-mono">{installHint}</code> — see the{' '}
+                <button
+                  type="button"
+                  className="text-primary underline-offset-2 hover:underline"
+                  onClick={() => void openUrl('https://www.mongodb.com/docs/mongodb-shell/install/')}
+                  data-testid="shell-mongosh-docs-link"
+                >
+                  mongosh install docs
                 </button>
+                .
               </div>
             </>
           )}
@@ -615,35 +760,41 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   }
 
   return (
-    <div className="mql-shell-with-ai" style={{ display: 'flex', flexDirection: 'row', height: '100%' }}>
-    <div className="mql-shell" ref={wrapRef} data-testid="mongo-shell" style={{ flex: 1, minWidth: 0 }}>
-      <div className="mql-shell-editor" style={topHeight != null ? { height: topHeight, flex: 'none' } : undefined}>
-        <div className="mql-shell-toolbar">
-          <Terminal size={12} color="var(--accent-green)" />
-          <span className="mql-shell-toolbar-title">mongosh</span>
-          <span className="mql-mono mql-shell-toolbar-ns">{connectionName} · {currentDb}</span>
-          <span style={{ flex: 1 }} />
-          <span className="mql-shell-run-hint mql-mono">Ctrl/⌘↵</span>
-          <button className="mql-btn mql-btn-primary" onClick={() => runRef.current()} disabled={running}>
-            <Play size={11} fill="white" />
+    <div className="flex h-full flex-row">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background" ref={wrapRef} data-testid="mongo-shell">
+      <div
+        className="flex min-h-0 flex-col border-b border-border"
+        style={topHeight != null ? { height: topHeight, flex: 'none' } : { flex: 1 }}
+      >
+        <div className="flex items-center gap-2 border-b border-border bg-card px-3 py-2">
+          <Terminal size={12} className="text-success" />
+          <span className="text-xs font-semibold text-foreground">mongosh</span>
+          <span className="font-mono text-[11px] text-muted-foreground">{connectionName} · {currentDb}</span>
+          <span className="flex-1" />
+          <span className="font-mono text-[10px] text-muted-foreground">
+            {formatShortcut(shortcutById('run-query')!)}
+          </span>
+          <Button size="sm" onClick={() => runRef.current()} disabled={running}>
+            <Play size={11} />
             Run
-          </button>
-          <button
-            className="mql-btn mql-btn-ghost mql-btn-outlined"
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => setIsAIOpen((v) => !v)}
             data-testid="shell-ai-toggle"
             title="AI assistant"
           >
             <Sparkles size={11} />
             AI
-          </button>
+          </Button>
         </div>
-        <div className="mql-shell-monaco">
+        <div className="min-h-0 flex-1">
           <Editor
             value={command}
             onChange={(value) => setCommand(value || '')}
             defaultLanguage="javascript"
-            theme="vs-dark"
+            theme={monacoTheme}
             options={{
               fontFamily: 'JetBrains Mono, SF Mono, Consolas, monospace',
               fontSize: 13,
@@ -657,14 +808,45 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               automaticLayout: true,
               tabSize: 2,
               contextmenu: false,
+              // Enter accepts an open suggestion; otherwise inserts a newline.
+              acceptSuggestionOnEnter: 'on',
             }}
             onMount={(editor, monaco) => {
-              editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runRef.current());
+              registerMqlensMonacoThemes(monaco);
+              monaco.editor.setTheme(monacoTheme);
+              // Enter accepts an open suggestion, else newline. Ctrl/Cmd+Enter
+              // runs — scoped via onKeyDown (not addCommand, which leaks globally).
+              editor.onKeyDown((e) => {
+                if ((e.ctrlKey || e.metaKey) && e.keyCode === monaco.KeyCode.Enter) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  runRef.current();
+                }
+              });
               editor.focus();
+              registerMongoCompletionProvider(monaco);
+              const model = editor.getModel();
+              if (model) {
+                const uri = model.uri.toString();
+                setModelMeta(uri, {
+                  surface: 'shell',
+                  getFields: () => {
+                    const docs = viewerRef.current?.docs ?? [];
+                    const keys = new Set<string>(['_id']);
+                    docs.forEach((d) => {
+                      if (d && typeof d === 'object') Object.keys(d).forEach((k) => keys.add(k));
+                    });
+                    return Array.from(keys);
+                  },
+                  getSchema: () => undefined,
+                  getCollections: () => collectionsRef.current,
+                });
+                editor.onDidDispose(() => clearModelMeta(uri));
+              }
             }}
             loading={
-              <div className="mql-shell-monaco-loading">
-                <Terminal size={22} color="var(--text-dim)" />
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+                <Terminal size={22} />
                 <span>Loading editor...</span>
               </div>
             }
@@ -673,53 +855,71 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       </div>
 
       <div
-        className="mql-shell-divider"
+        className="flex h-1 flex-shrink-0 cursor-row-resize items-center justify-center bg-border/50 hover:bg-primary/30"
         onMouseDown={() => {
           dragging.current = true;
           document.body.style.cursor = 'row-resize';
         }}
       >
-        <span className="mql-shell-divider-grip" />
+        <span className="h-0.5 w-8 rounded-full bg-muted-foreground/40" />
       </div>
 
-      <div className="mql-shell-output">
-        <div className="mql-shell-tabs">
-          <button className={`mql-shell-tab ${tab === 'console' ? 'is-active' : ''}`} onClick={() => setTab('console')}>
-            <Terminal size={12} color={tab === 'console' ? 'var(--accent-green)' : 'currentColor'} />
-            <span>Console</span>
-          </button>
-          {viewer && (
-            <button className={`mql-shell-tab ${tab === 'viewer' ? 'is-active' : ''}`} onClick={() => setTab('viewer')}>
-              <Braces size={12} color={tab === 'viewer' ? 'var(--accent-blue)' : 'currentColor'} />
-              <span>Data Viewer</span>
-              <span className="mql-shell-tab-count">{viewer.docs.length}</span>
-            </button>
-          )}
-          <span style={{ flex: 1 }} />
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex items-center gap-1 border-b border-border bg-card px-2 py-1">
+          <Tabs value={tab} onValueChange={(v) => setTab(v as ShellTab)}>
+            <TabsList className="h-8 bg-transparent p-0">
+              <TabsTrigger
+                value="console"
+                className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
+                onClick={() => setTab('console')}
+              >
+                <Terminal size={12} className={tab === 'console' ? 'text-success' : ''} />
+                Console
+              </TabsTrigger>
+              {viewer && (
+                <TabsTrigger
+                  value="viewer"
+                  className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
+                  onClick={() => setTab('viewer')}
+                >
+                  <Braces size={12} className={tab === 'viewer' ? 'text-primary' : ''} />
+                  Data Viewer
+                  <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">{viewer.docs.length}</Badge>
+                </TabsTrigger>
+              )}
+            </TabsList>
+          </Tabs>
+          <span className="flex-1" />
           {tab === 'console' ? (
-            <button className="mql-icon-btn" title="Clear console" onClick={() => setEntries([])}>
+            <Button type="button" variant="ghost" size="icon" className="h-7 w-7" title="Clear console" onClick={() => setEntries([])}>
               <Eraser size={12} />
-            </button>
+            </Button>
           ) : (
-            viewer && <span className="mql-mono mql-shell-viewer-src">{viewer.label} · {viewer.ms} ms</span>
+            viewer && (
+              <span className="font-mono text-[10px] text-muted-foreground">
+                {viewer.label} · {viewer.ms} ms
+              </span>
+            )
           )}
         </div>
 
         {tab === 'console' ? (
-          <div className="mql-shell-scroll" ref={scrollRef}>
-            {entries.length === 0 && <div className="mql-shell-empty">Console cleared - run a command above.</div>}
+          <div className="min-h-0 flex-1 overflow-y-auto p-2 font-mono text-xs" ref={scrollRef}>
+            {entries.length === 0 && (
+              <div className="py-4 text-center text-muted-foreground">Console cleared - run a command above.</div>
+            )}
             {entries.map((entry, index) => {
               if (entry.kind === 'input') {
                 return (
-                  <div className="mql-shell-line mql-shell-input-echo" key={index}>
-                    <span className="mql-shell-prompt">{entry.db}&gt;</span>
-                    <span className="mql-shell-cmd">{entry.text}</span>
+                  <div className="flex gap-2 py-0.5 text-foreground" key={index}>
+                    <span className="text-success">{entry.db}&gt;</span>
+                    <span>{entry.text}</span>
                   </div>
                 );
               }
               if (entry.kind === 'note') {
                 return (
-                  <div className="mql-shell-line mql-shell-note" key={index}>
+                  <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground" key={index}>
                     <CornerDownLeft size={12} />
                     <span>{entry.text}</span>
                   </div>
@@ -727,14 +927,18 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               }
               if (entry.kind === 'error') {
                 return (
-                  <div className="mql-shell-line mql-shell-err" key={index}>
+                  <div className="flex items-center gap-1.5 py-0.5 text-destructive" key={index}>
                     <AlertCircle size={12} />
                     <span>{entry.message}</span>
                   </div>
                 );
               }
               if (entry.kind === 'text') {
-                return <pre className="mql-shell-pre mql-shell-text" key={index}>{entry.lines.join('\n')}</pre>;
+                return (
+                  <pre className="m-0 whitespace-pre-wrap py-0.5 text-muted-foreground" key={index}>
+                    {entry.lines.join('\n')}
+                  </pre>
+                );
               }
               return <HighlightedValue key={index} value={entry.value} />;
             })}
@@ -755,71 +959,41 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       onInsertAndRunQuery={handleAIInsertAndRun}
     />
     {pendingDestructive && (
-      <div
-        className="mql-modal-overlay"
-        data-testid="destructive-confirm"
-        style={{
-          position: 'fixed',
-          inset: 0,
-          zIndex: 50,
-          background: 'rgba(0,0,0,0.5)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-        }}
-      >
-        <div
-          className="mql-modal"
-          style={{
-            background: 'var(--bg-panel, #1e1e1e)',
-            border: '1px solid var(--border, #333)',
-            borderRadius: 8,
-            padding: 20,
-            maxWidth: 520,
-            width: '90%',
-            boxShadow: '0 10px 40px rgba(0,0,0,0.5)',
+      <Dialog open onOpenChange={() => {}}>
+        <DialogContent
+          className="sm:max-w-[520px] [&>button.absolute]:hidden"
+          data-testid="destructive-confirm"
+          onPointerDownOutside={(e) => e.preventDefault()}
+          onInteractOutside={(e) => e.preventDefault()}
+          onEscapeKeyDown={(e) => {
+            e.preventDefault();
+            cancelDestructive();
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-            <AlertCircle size={18} color="var(--accent-red, #f87171)" />
-            <span style={{ fontWeight: 600, color: 'var(--text-main)' }}>Destructive operation</span>
-          </div>
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 10 }}>
-            This script runs <strong>{pendingDestructive.operation}</strong>, which can permanently
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-sm">
+              <AlertCircle size={18} className="text-destructive" />
+              Destructive operation
+            </DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            This script runs <strong className="text-foreground">{pendingDestructive.operation}</strong>, which can permanently
             delete data. Review it before running.
           </p>
-          <pre
-            className="mql-shell-pre"
-            style={{
-              maxHeight: 200,
-              overflow: 'auto',
-              marginBottom: 16,
-              padding: 10,
-              background: 'var(--bg-code, #111)',
-              borderRadius: 6,
-            }}
-          >
+          <pre className="max-h-[200px] overflow-auto rounded-md bg-muted p-3 font-mono text-xs text-foreground">
             {pendingDestructive.command}
           </pre>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-            <button
-              className="mql-btn mql-btn-ghost mql-btn-outlined"
-              onClick={cancelDestructive}
-              data-testid="destructive-cancel"
-            >
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={cancelDestructive} data-testid="destructive-cancel">
               Cancel
-            </button>
-            <button
-              className="mql-btn mql-btn-primary"
-              onClick={confirmDestructive}
-              data-testid="destructive-run"
-            >
-              <Play size={11} fill="white" />
+            </Button>
+            <Button type="button" variant="destructive" onClick={confirmDestructive} data-testid="destructive-run">
+              <Play size={11} />
               Run anyway
-            </button>
-          </div>
-        </div>
-      </div>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     )}
     </div>
   );

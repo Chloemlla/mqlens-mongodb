@@ -9,36 +9,64 @@ use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use uuid::Uuid;
 
+pub mod limits;
 pub mod ai;
 pub mod connections;
 mod db;
+pub mod mcp;
+pub mod mcp_tools;
 pub(crate) mod mock_db;
+pub mod monitoring;
+pub mod path_env;
 pub mod queries;
 pub mod ssh_tunnel;
 mod state;
+pub mod toolsetup;
+pub mod updater;
 mod vault;
 mod window;
+mod windows;
+mod workspace;
 pub mod biometric;
 pub use db::aggregate::{execute_aggregate_impl, explain_aggregate_query_impl};
 pub use db::ddl::{
     create_collection_impl, create_view_impl, drop_collection_impl, drop_database_impl,
-    rename_collection_impl, rename_database_impl, DatabaseRenameResult,
+    rename_collection_impl, rename_database_impl, DatabaseRenameResult, CollectionValidation,
+    get_collection_options_impl, set_validator_impl,
 };
 pub use db::documents::{
     delete_document_impl, delete_many_impl, import_documents_impl, insert_document_impl,
-    json_to_bson_document, update_document_impl, update_many_impl, ImportResult,
+    json_to_bson_document, parse_json_array_docs, update_document_impl, update_many_impl,
+    ImportResult,
 };
-pub use db::export::start_collection_export_impl;
-pub use db::gridfs::{download_gridfs_file_impl, list_gridfs_files_impl, GridFsFileInfo};
+pub use db::export::{
+    format_current_docs_impl, preview_export_impl, sample_export_fields_impl,
+    start_collection_export_impl, start_filtered_export_impl,
+};
+pub use db::gridfs::{
+    delete_gridfs_file_impl, download_gridfs_file_impl, list_gridfs_files_impl,
+    upload_gridfs_file_impl, GridFsFileInfo, GridFsTransferProgress,
+};
+pub use db::import::{preview_import_impl, start_import_task_impl};
+pub use db::mongotools::{
+    browse_dump_folder_impl, resolve_conn_uri, start_dump_task_impl, start_restore_task_impl,
+    DumpTree, ToolInfo, ToolsStatus,
+};
 pub use db::metadata::{
     create_index_impl, delete_index_impl, list_collections_impl, list_databases_impl,
     list_indexes_impl,
 };
+pub use db::stats::{db_stats_impl, coll_stats_impl, index_stats_impl};
 pub use db::query::{count_documents_impl, execute_mql_query_impl, explain_mql_query_impl};
 pub use db::schema::{analyze_schema_impl, infer_schema, FieldStat, SchemaReport, TypeCount};
+pub use db::users::{
+    create_user_impl, drop_user_impl, list_roles_impl, list_users_impl, update_user_impl,
+    MongoUser, RoleInfo, RoleSpec,
+};
 pub use db::version::get_mongodb_version_impl;
+pub use db::copy::{preflight_copy_impl, start_collection_copy_impl, start_database_copy_impl, CopyTargetRef};
 pub use biometric::{decode_and_verify_key, encode_key, BiometricStatus};
-pub use state::{AppState, LockExt};
+pub use state::{AppState, ConnectionEntry, ConnectionMeta, ConnectionsChangedPayload, LockExt};
 pub use window::target_window_size;
 #[cfg(test)]
 mod tests;
@@ -61,9 +89,12 @@ pub fn apply_main_timeouts(opts: &mut mongodb::options::ClientOptions) {
     }
 }
 
-/// Sample this process's CPU% and resident memory. CPU is a delta since the
-/// previous sample, so the first call after startup typically reports 0.
+/// Sample this app's CPU% and resident memory — the main process plus descendant
+/// processes (WebView/renderer helpers). CPU is a delta since the previous sample.
 pub fn resource_usage_impl(state: &AppState) -> ResourceUsage {
+    use crate::limits::RESOURCE_TREE_REFRESH_SECS;
+    use std::collections::HashSet;
+
     let pid = match sysinfo::get_current_pid() {
         Ok(pid) => pid,
         Err(_) => {
@@ -74,16 +105,65 @@ pub fn resource_usage_impl(state: &AppState) -> ResourceUsage {
         }
     };
     let mut sys = state.sys.lock().unwrap_or_else(|p| p.into_inner());
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    match sys.process(pid) {
-        Some(proc_) => ResourceUsage {
-            cpu_percent: proc_.cpu_usage(),
-            memory_bytes: proc_.memory(),
-        },
-        None => ResourceUsage {
-            cpu_percent: 0.0,
-            memory_bytes: 0,
-        },
+
+    let rebuild_tree = {
+        let pids = state.resource_pids.lock().unwrap_or_else(|p| p.into_inner());
+        let tree_at = state.resource_tree_at.lock().unwrap_or_else(|p| p.into_inner());
+        pids.is_empty() || tree_at.elapsed().as_secs() >= RESOURCE_TREE_REFRESH_SECS
+    };
+
+    // Only memory + CPU are read below. The default refresh kind would also
+    // collect disk usage, exe paths, and (Linux) one entry per THREAD via
+    // with_tasks — and with remove_dead_processes=false the retained System
+    // kept every process/thread that ever existed, growing RSS without bound
+    // on busy hosts (issue #165). Refresh minimally and always purge the dead.
+    let refresh_kind = sysinfo::ProcessRefreshKind::nothing().with_memory().with_cpu();
+
+    if rebuild_tree {
+        sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, refresh_kind);
+        let mut tree: HashSet<sysinfo::Pid> = HashSet::new();
+        tree.insert(pid);
+        loop {
+            let mut added = false;
+            for (cpid, proc_) in sys.processes() {
+                if !tree.contains(cpid) {
+                    if let Some(parent) = proc_.parent() {
+                        if tree.contains(&parent) {
+                            tree.insert(*cpid);
+                            added = true;
+                        }
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        *state.resource_pids.lock().unwrap_or_else(|p| p.into_inner()) =
+            tree.iter().copied().collect();
+        *state
+            .resource_tree_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    } else {
+        let pids = state.resource_pids.lock().unwrap_or_else(|p| p.into_inner());
+        if !pids.is_empty() {
+            sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&pids), true, refresh_kind);
+        }
+    }
+
+    let pids = state.resource_pids.lock().unwrap_or_else(|p| p.into_inner());
+    let mut memory_bytes: u64 = 0;
+    let mut cpu_percent: f32 = 0.0;
+    for p in pids.iter() {
+        if let Some(proc_) = sys.process(*p) {
+            memory_bytes += proc_.memory();
+            cpu_percent += proc_.cpu_usage();
+        }
+    }
+    ResourceUsage {
+        cpu_percent,
+        memory_bytes,
     }
 }
 
@@ -122,7 +202,25 @@ pub struct AgentDetection {
     pub version: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyFailure {
+    pub collection: String,
+    pub error: String,
+}
+
+#[derive(Serialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CopySummary {
+    pub collections_copied: u64,
+    pub documents_copied: u64,
+    pub documents_skipped: u64,
+    pub indexes_created: u64,
+    pub skipped: Vec<String>,
+    pub failed: Vec<CopyFailure>,
+}
+
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskInfo {
     pub id: String,
@@ -136,6 +234,14 @@ pub struct TaskInfo {
     pub error: Option<String>,
     pub created_at_ms: u64,
     pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_processed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<CopySummary>,
 }
 
 /// Probe each local agent's binary with `--version` (short, blocking). NotFound -> not available.
@@ -238,8 +344,8 @@ async fn drain_mongosh_output(session: &MongoshSession) -> MongoshCommandOutput 
     loop {
         match tokio::time::timeout(Duration::from_millis(25), output.recv()).await {
             Ok(Some(line)) => match line.stream {
-                MongoshStream::Stdout => stdout.push(line.text),
-                MongoshStream::Stderr => stderr.push(line.text),
+                MongoshStream::Stdout => push_mongosh_line(&mut stdout, line.text),
+                MongoshStream::Stderr => push_mongosh_line(&mut stderr, line.text),
             },
             _ => break,
         }
@@ -296,8 +402,8 @@ async fn run_mongosh_command_on_session(
                     break;
                 }
                 match line.stream {
-                    MongoshStream::Stdout => stdout.push(line.text),
-                    MongoshStream::Stderr => stderr.push(line.text),
+                    MongoshStream::Stdout => push_mongosh_line(&mut stdout, line.text),
+                    MongoshStream::Stderr => push_mongosh_line(&mut stderr, line.text),
                 }
             }
             Ok(None) => return Err("mongosh session closed".to_string()),
@@ -306,6 +412,19 @@ async fn run_mongosh_command_on_session(
     }
 
     Ok(MongoshCommandOutput { stdout, stderr })
+}
+
+fn push_mongosh_line(lines: &mut Vec<String>, text: String) {
+    use crate::limits::{MAX_MONGOSH_LINE_CHARS, MAX_MONGOSH_LINES, MAX_MONGOSH_TOTAL_CHARS};
+    if lines.len() >= MAX_MONGOSH_LINES {
+        return;
+    }
+    let trimmed: String = text.chars().take(MAX_MONGOSH_LINE_CHARS).collect();
+    let total: usize = lines.iter().map(|l| l.len()).sum::<usize>() + trimmed.len();
+    if total > MAX_MONGOSH_TOTAL_CHARS {
+        return;
+    }
+    lines.push(trimmed);
 }
 
 fn get_mongosh_session(state: &AppState, session_id: &str) -> Result<Arc<MongoshSession>, String> {
@@ -366,6 +485,10 @@ pub async fn connect_db_impl(
         let mut mocks = state.mocks.lock_safe()?;
         mocks.insert(connection_id.clone(), false);
     }
+    {
+        let mut conn_uris = state.conn_uris.lock_safe()?;
+        conn_uris.insert(connection_id.clone(), normalized_uri.clone());
+    }
     if let Some(t) = tunnel {
         let mut tunnels = state.ssh_tunnels.lock_safe()?;
         tunnels.insert(connection_id.clone(), t);
@@ -400,6 +523,10 @@ pub async fn disconnect_db_impl(state: &AppState, id: &str) -> Result<(), String
         let mut mocks = state.mocks.lock_safe()?;
         mocks.remove(id);
     }
+    {
+        let mut conn_uris = state.conn_uris.lock_safe()?;
+        conn_uris.remove(id);
+    }
     // Tear down the SSH tunnel (if any) — dropping SshTunnel aborts its accept loop.
     {
         let mut tunnels = state.ssh_tunnels.lock_safe()?;
@@ -407,8 +534,61 @@ pub async fn disconnect_db_impl(state: &AppState, id: &str) -> Result<(), String
             tunnel.close();
         }
     }
+    {
+        let mut meta = state.connection_meta.lock_safe()?;
+        meta.remove(id);
+    }
+    // A human disconnecting (Sidebar's onDisconnect -> this command) an
+    // agent-opened connection must also drop it from the MCP server's own
+    // `session_connections` bookkeeping (final whole-branch review fix
+    // wave) — otherwise a stale id lingers there forever, and a later MCP
+    // `disconnect` call for that id would pass `mcp_tools::disconnect_impl`'s
+    // session-owned check and try to tear down a connection that's already
+    // gone (`crate::disconnect_db_impl` above is idempotent per-map-removal,
+    // so that itself wouldn't error, but the stale bookkeeping is exactly
+    // the kind of drift Task 4's `session_connections` doc comment says this
+    // set should never carry). `mcp_tools::disconnect_impl`'s own path
+    // already prunes this set itself, so this is only reached for a
+    // human-initiated disconnect of an id that happens to also be
+    // session-owned; harmless (and a no-op `remove`) otherwise.
+    {
+        let mut control = state.mcp.lock_safe()?;
+        control.session_connections.remove(id);
+    }
 
     Ok(())
+}
+
+/// Insert/replace `id`'s connection metadata (the profile it came from plus
+/// a display name) — called by the frontend once a connection succeeds.
+/// `AppHandle`-free like `connect_db_impl`/`disconnect_db_impl`: the
+/// `connections-changed` broadcast is the `set_connection_meta` command
+/// wrapper's job, mirroring `workspace::apply_impl`/`workspace_apply`'s
+/// pure-mutation/emit split.
+pub fn set_connection_meta_impl(
+    state: &AppState,
+    id: &str,
+    profile_id: &str,
+    name: &str,
+    via_mcp: bool,
+) -> Result<(), String> {
+    let mut meta = state.connection_meta.lock_safe()?;
+    meta.insert(id.to_string(), ConnectionMeta { profile_id: profile_id.to_string(), name: name.to_string(), via_mcp });
+    Ok(())
+}
+
+/// The full current connection list for a `connections-changed` broadcast,
+/// sorted by connection id — a `HashMap`'s iteration order is otherwise
+/// unspecified, which would make every emitted payload's element order
+/// nondeterministic between calls.
+pub fn connection_list_impl(state: &AppState) -> Result<Vec<ConnectionEntry>, String> {
+    let meta = state.connection_meta.lock_safe()?;
+    let mut list: Vec<ConnectionEntry> = meta
+        .iter()
+        .map(|(id, m)| ConnectionEntry { id: id.clone(), profile_id: m.profile_id.clone(), name: m.name.clone(), via_mcp: m.via_mcp })
+        .collect();
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(list)
 }
 
 pub async fn start_mongosh_session_impl(
@@ -538,6 +718,128 @@ async fn connect_db(
 }
 
 #[tauri::command]
+async fn detect_mongo_tools(
+    app_handle: tauri::AppHandle,
+    configured_dir: Option<String>,
+) -> Result<ToolsStatus, String> {
+    use tauri::Manager;
+    // app_data_dir() can fail in headless/test environments; treat that as
+    // "no managed dir" rather than failing detection outright.
+    let app_data_dir = app_handle.path().app_data_dir().ok();
+    let managed_dir = app_data_dir
+        .as_deref()
+        .and_then(|dir| toolsetup::find_pinned_tool("database-tools").ok().map(|tool| toolsetup::managed_bin_dir(dir, tool)));
+    Ok(db::mongotools::detect_mongo_tools(configured_dir.as_deref(), managed_dir.as_deref()))
+}
+
+/// Find a working mongosh for the shell's guided-setup card: configured path,
+/// managed install, PATH, then well-known install locations. Probing spawns
+/// several `--version` children, so it runs off the async runtime.
+#[tauri::command]
+async fn detect_mongosh_binary(
+    app_handle: tauri::AppHandle,
+    configured: String,
+) -> Result<Option<toolsetup::MongoshDetection>, String> {
+    use tauri::Manager;
+    let app_data_dir = app_handle.path().app_data_dir().ok();
+    tokio::task::spawn_blocking(move || {
+        toolsetup::detect_mongosh(&configured, app_data_dir.as_deref(), &[])
+    })
+    .await
+    .map_err(|e| format!("mongosh detection failed: {}", e))
+}
+
+#[tauri::command]
+async fn start_dump_task(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    tool_path: String,
+    options: db::mongotools::DumpOptions,
+) -> Result<TaskInfo, String> {
+    start_dump_task_impl(&state, &id, &tool_path, options).await
+}
+
+#[tauri::command]
+async fn start_restore_task(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    tool_path: String,
+    options: db::mongotools::RestoreOptions,
+) -> Result<TaskInfo, String> {
+    start_restore_task_impl(&state, &id, &tool_path, options).await
+}
+
+#[tauri::command]
+async fn start_tool_install_task(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    tools: Vec<String>,
+    force: bool,
+) -> Result<TaskInfo, String> {
+    use tauri::Manager;
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    toolsetup::start_tool_install_task_impl(&state, app_data_dir, tools, force, None).await
+}
+
+#[tauri::command]
+async fn managed_tools_status(app_handle: tauri::AppHandle) -> Result<Vec<toolsetup::ManagedToolStatus>, String> {
+    use tauri::Manager;
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    Ok(toolsetup::managed_tools_status(&app_data_dir))
+}
+
+#[tauri::command]
+async fn browse_dump_folder(path: String) -> Result<DumpTree, String> {
+    browse_dump_folder_impl(&path).await
+}
+
+#[tauri::command]
+async fn preview_dump_command(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    tool_path: String,
+    options: db::mongotools::DumpOptions,
+) -> Result<String, String> {
+    let uri = resolve_conn_uri(&state, &id)?;
+    let tunneled = state.ssh_tunnels.lock_safe()?.contains_key(&id);
+    let mut args = db::mongotools::build_dump_args(&options)?;
+    let prepared_uri = db::mongotools::prepare_tool_uri(&uri, tunneled);
+    let (prepared_uri, tls_flags) = db::mongotools::extract_unsupported_tls_params(&prepared_uri);
+    args.extend(tls_flags);
+    Ok(db::mongotools::preview_tool_command(
+        &tool_path,
+        &db::mongotools::redact_uri_password(&prepared_uri),
+        &args,
+    ))
+}
+
+#[tauri::command]
+async fn preview_restore_command(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    tool_path: String,
+    options: db::mongotools::RestoreOptions,
+) -> Result<String, String> {
+    let uri = resolve_conn_uri(&state, &id)?;
+    let tunneled = state.ssh_tunnels.lock_safe()?.contains_key(&id);
+    let mut args = db::mongotools::build_restore_args(&options)?;
+    let prepared_uri = db::mongotools::prepare_tool_uri(&uri, tunneled);
+    let (prepared_uri, tls_flags) = db::mongotools::extract_unsupported_tls_params(&prepared_uri);
+    args.extend(tls_flags);
+    Ok(db::mongotools::preview_tool_command(
+        &tool_path,
+        &db::mongotools::redact_uri_password(&prepared_uri),
+        &args,
+    ))
+}
+
+#[tauri::command]
 async fn get_resource_usage(state: tauri::State<'_, AppState>) -> Result<ResourceUsage, String> {
     Ok(resource_usage_impl(&state))
 }
@@ -626,13 +928,17 @@ async fn get_mongodb_version(
 
 #[tauri::command]
 async fn start_mongosh_session(
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     connection_id: String,
     uri: String,
     database: String,
     mongosh_path: String,
 ) -> Result<MongoshSessionInfo, String> {
-    start_mongosh_session_impl(&state, &connection_id, &uri, &database, &mongosh_path).await
+    use tauri::Manager;
+    let app_data_dir = app_handle.path().app_data_dir().ok();
+    let resolved_path = toolsetup::resolve_mongosh_executable(&mongosh_path, app_data_dir.as_deref());
+    start_mongosh_session_impl(&state, &connection_id, &uri, &database, &resolved_path).await
 }
 
 #[tauri::command]
@@ -653,8 +959,52 @@ async fn stop_mongosh_session(
 }
 
 #[tauri::command]
-async fn disconnect_db(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    disconnect_db_impl(&state, &id).await
+async fn disconnect_db(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    disconnect_db_impl(&state, &id).await?;
+    let connections = connection_list_impl(&state)?;
+    // Broadcast is best-effort: a window that misses this event picks up
+    // current connection metadata the next time it connects or calls
+    // `set_connection_meta` itself.
+    let _ = app_handle.emit("connections-changed", ConnectionsChangedPayload { connections });
+    Ok(())
+}
+
+/// `connection_list` command: thin wrapper over `connection_list_impl`
+/// (final whole-branch review, Fix 2). Unlike `disconnect_db`/
+/// `set_connection_meta`, this never broadcasts — it's a plain read, called
+/// once by App.tsx's boot effect (after `workspace_get` resolves) so a
+/// freshly spawned window sees every connection already live in the session
+/// immediately, instead of rendering a `ReconnectBanner` for a
+/// restored-but-actually-live profile and inviting a duplicate `connect_db`.
+#[tauri::command]
+async fn connection_list(state: tauri::State<'_, AppState>) -> Result<Vec<ConnectionEntry>, String> {
+    connection_list_impl(&state)
+}
+
+#[tauri::command]
+async fn set_connection_meta(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    profile_id: String,
+    name: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    // Frontend-initiated (sidebar/Connection Manager/quick-connect) -- never
+    // an MCP agent connection, which flows through `mcp_tools::connect_impl`
+    // instead and passes `via_mcp: true` directly.
+    set_connection_meta_impl(&state, &id, &profile_id, &name, false)?;
+    let connections = connection_list_impl(&state)?;
+    // Broadcast is best-effort: a window that misses this event picks up
+    // current connection metadata the next time it connects or calls
+    // `set_connection_meta` itself.
+    let _ = app_handle.emit("connections-changed", ConnectionsChangedPayload { connections });
+    Ok(())
 }
 
 #[tauri::command]
@@ -682,6 +1032,150 @@ async fn list_indexes(
     collection: String,
 ) -> Result<Vec<IndexInfo>, String> {
     list_indexes_impl(&state, &id, &db, &collection).await
+}
+
+#[tauri::command]
+async fn db_stats(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    db: String,
+) -> Result<db::stats::DbStatsUi, String> {
+    db::stats::db_stats_impl(&state, &id, &db).await
+}
+
+#[tauri::command]
+async fn coll_stats(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    db: String,
+    collection: String,
+) -> Result<db::stats::CollStatsUi, String> {
+    db::stats::coll_stats_impl(&state, &id, &db, &collection).await
+}
+
+#[tauri::command]
+async fn index_stats(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    db: String,
+    collection: String,
+) -> Result<Vec<db::stats::IndexStatUi>, String> {
+    db::stats::index_stats_impl(&state, &id, &db, &collection).await
+}
+
+// ── Cluster monitoring ────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn server_status(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<monitoring::ServerStatus, String> {
+    monitoring::server_status_impl(&state, &id).await
+}
+
+#[tauri::command]
+async fn current_ops(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Vec<monitoring::CurrentOp>, String> {
+    monitoring::current_ops_impl(&state, &id).await
+}
+
+#[tauri::command]
+async fn repl_set_status(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<monitoring::ReplSetStatus, String> {
+    monitoring::repl_set_status_impl(&state, &id).await
+}
+
+#[tauri::command]
+async fn kill_op(state: tauri::State<'_, AppState>, id: String, opid: i64) -> Result<(), String> {
+    monitoring::kill_op_impl(&state, &id, opid).await
+}
+
+#[tauri::command]
+async fn get_profiling_status(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+) -> Result<monitoring::ProfilingStatus, String> {
+    monitoring::profiling_status_impl(&state, &id, &database).await
+}
+
+#[tauri::command]
+async fn set_profiling_level(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    level: i32,
+    slow_ms: i32,
+) -> Result<monitoring::ProfilingStatus, String> {
+    monitoring::set_profiling_level_impl(&state, &id, &database, level, slow_ms).await
+}
+
+#[tauri::command]
+async fn read_profile(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    limit: i64,
+) -> Result<Vec<monitoring::ProfileEntry>, String> {
+    monitoring::read_profile_impl(&state, &id, &database, limit).await
+}
+
+// ── User & role management ────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_users(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: Option<String>,
+) -> Result<Vec<MongoUser>, String> {
+    list_users_impl(&state, &id, database.as_deref()).await
+}
+
+#[tauri::command]
+async fn create_user(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    username: String,
+    password: String,
+    roles: Vec<RoleSpec>,
+) -> Result<(), String> {
+    create_user_impl(&state, &id, &database, &username, &password, &roles).await
+}
+
+#[tauri::command]
+async fn update_user(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    username: String,
+    password: Option<String>,
+    roles: Option<Vec<RoleSpec>>,
+) -> Result<(), String> {
+    update_user_impl(&state, &id, &database, &username, password.as_deref(), roles.as_deref()).await
+}
+
+#[tauri::command]
+async fn drop_user(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    username: String,
+) -> Result<(), String> {
+    drop_user_impl(&state, &id, &database, &username).await
+}
+
+#[tauri::command]
+async fn list_roles(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+) -> Result<Vec<RoleInfo>, String> {
+    list_roles_impl(&state, &id, &database).await
 }
 
 #[tauri::command]
@@ -729,8 +1223,96 @@ async fn start_collection_export(
     collection: String,
     format: String,
     path: String,
+    options: Option<crate::db::export::options::ExportOptions>,
 ) -> Result<TaskInfo, String> {
-    start_collection_export_impl(&state, &id, &database, &collection, &format, &path).await
+    start_collection_export_impl(&state, &id, &database, &collection, &format, &path, options)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_filtered_export(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    format: String,
+    path: String,
+    filter: String,
+    sort: String,
+    projection: String,
+    pipeline: String,
+    skip: Option<u64>,
+    limit: Option<i64>,
+    options: Option<crate::db::export::options::ExportOptions>,
+) -> Result<TaskInfo, String> {
+    start_filtered_export_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &format,
+        &path,
+        &filter,
+        &sort,
+        &projection,
+        &pipeline,
+        skip,
+        limit,
+        options,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn sample_export_fields(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    filter: String,
+    pipeline: String,
+) -> Result<Vec<String>, String> {
+    sample_export_fields_impl(&state, &id, &database, &collection, &filter, &pipeline).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn preview_export(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    format: String,
+    filter: String,
+    sort: String,
+    projection: String,
+    pipeline: String,
+    options: Option<crate::db::export::options::ExportOptions>,
+) -> Result<String, String> {
+    preview_export_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &format,
+        &filter,
+        &sort,
+        &projection,
+        &pipeline,
+        options,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn format_current_docs(
+    docs: Vec<serde_json::Value>,
+    format: String,
+    options: Option<crate::db::export::options::ExportOptions>,
+    path: Option<String>,
+) -> Result<Option<String>, String> {
+    format_current_docs_impl(docs, &format, options, path).await
 }
 
 #[tauri::command]
@@ -752,6 +1334,62 @@ async fn clear_finished_export_tasks(
     let mut tasks: Vec<TaskInfo> = state.tasks.lock_safe()?.values().cloned().collect();
     tasks.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
     Ok(tasks)
+}
+
+#[tauri::command]
+async fn cancel_task(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    state.cancel_or_ack(&id)
+}
+
+#[tauri::command]
+async fn preflight_copy(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    source_db: String,
+    source_collections: Vec<String>,
+    targets: Vec<CopyTargetRef>,
+) -> Result<db::copy::PreflightResult, String> {
+    preflight_copy_impl(&state, &source_id, &source_db, source_collections, targets).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_collection_copy(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    source_db: String,
+    source_collection: String,
+    target_id: String,
+    target_db: String,
+    target_collection: String,
+    filter: Option<String>,
+    include_indexes: bool,
+    conflict_mode: String,
+) -> Result<TaskInfo, String> {
+    start_collection_copy_impl(
+        &state, &source_id, &source_db, &source_collection,
+        &target_id, &target_db, &target_collection,
+        filter, include_indexes, conflict_mode,
+    ).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_database_copy(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    source_db: String,
+    target_id: String,
+    target_db: String,
+    collections: Option<Vec<String>>,
+    include_indexes: bool,
+    include_views: bool,
+    conflict_mode: String,
+) -> Result<TaskInfo, String> {
+    start_database_copy_impl(
+        &state, &source_id, &source_db, &target_id, &target_db,
+        collections, include_indexes, include_views, conflict_mode,
+    ).await
 }
 
 #[tauri::command]
@@ -817,6 +1455,38 @@ async fn rename_collection(
 }
 
 #[tauri::command]
+async fn get_collection_options(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+) -> Result<CollectionValidation, String> {
+    get_collection_options_impl(&state, &id, &database, &collection).await
+}
+
+#[tauri::command]
+async fn set_validator(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    validator: String,
+    validation_level: String,
+    validation_action: String,
+) -> Result<(), String> {
+    set_validator_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &validator,
+        &validation_level,
+        &validation_action,
+    )
+    .await
+}
+
+#[tauri::command]
 async fn drop_database(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -867,6 +1537,29 @@ async fn analyze_schema(
     sample_size: i64,
 ) -> Result<String, String> {
     analyze_schema_impl(&state, &id, &database, &collection, sample_size).await
+}
+
+/// No `state` param: preview only exercises the pure template engine
+/// (`parse_template` + `generate_doc`), never a connection.
+#[tauri::command]
+async fn preview_generated_documents(
+    template: String,
+    count: Option<u8>,
+    seed: Option<u64>,
+) -> Result<Vec<String>, String> {
+    db::generate::preview_generated_documents_impl(&template, count, seed)
+}
+
+#[tauri::command]
+async fn infer_generate_template(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    sample_size: Option<i64>,
+) -> Result<String, String> {
+    db::generate::infer_generate_template_impl(&state, &id, &database, &collection, sample_size)
+        .await
 }
 
 #[tauri::command]
@@ -956,8 +1649,63 @@ async fn download_gridfs_file(
     bucket: String,
     file_id: String,
     dest_path: String,
+    total_bytes: Option<u64>,
+    on_progress: tauri::ipc::Channel<GridFsTransferProgress>,
 ) -> Result<u64, String> {
-    download_gridfs_file_impl(&state, &id, &database, &bucket, &file_id, &dest_path).await
+    let emit = |update: GridFsTransferProgress| {
+        let _ = on_progress.send(update);
+    };
+    download_gridfs_file_impl(
+        &state,
+        &id,
+        &database,
+        &bucket,
+        &file_id,
+        &dest_path,
+        total_bytes,
+        Some(&emit),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn upload_gridfs_file(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    bucket: String,
+    source_path: String,
+    filename: Option<String>,
+    metadata_json: Option<String>,
+    content_type: Option<String>,
+    on_progress: tauri::ipc::Channel<GridFsTransferProgress>,
+) -> Result<String, String> {
+    let emit = |update: GridFsTransferProgress| {
+        let _ = on_progress.send(update);
+    };
+    upload_gridfs_file_impl(
+        &state,
+        &id,
+        &database,
+        &bucket,
+        &source_path,
+        filename.as_deref(),
+        metadata_json.as_deref(),
+        content_type.as_deref(),
+        Some(&emit),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn delete_gridfs_file(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    bucket: String,
+    file_id: String,
+) -> Result<(), String> {
+    delete_gridfs_file_impl(&state, &id, &database, &bucket, &file_id).await
 }
 
 #[tauri::command]
@@ -972,15 +1720,60 @@ async fn insert_document(
 }
 
 #[tauri::command]
-async fn import_documents(
+async fn preview_import(
+    source: crate::db::import::ImportSourceArg,
+    format: String,
+    csv_options: Option<crate::db::documents::CsvImportOptions>,
+    limit: Option<usize>,
+) -> Result<crate::db::import::ImportPreview, String> {
+    preview_import_impl(source, &format, csv_options, limit.unwrap_or(20)).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_import_task(
     state: tauri::State<'_, AppState>,
     id: String,
     database: String,
     collection: String,
-    docs: Vec<serde_json::Value>,
+    source: crate::db::import::ImportSourceArg,
+    format: String,
+    csv_options: Option<crate::db::documents::CsvImportOptions>,
     mode: String,
-) -> Result<ImportResult, String> {
-    import_documents_impl(&state, &id, &database, &collection, docs, &mode).await
+) -> Result<TaskInfo, String> {
+    start_import_task_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        source,
+        &format,
+        csv_options,
+        &mode,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn start_generate_task(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    template: String,
+    count: u32,
+    seed: Option<u64>,
+) -> Result<TaskInfo, String> {
+    db::generate::start_generate_task_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &template,
+        count,
+        seed,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1122,6 +1915,10 @@ async fn vault_unlock(
 #[tauri::command]
 async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
     *state.vault_key.lock_safe()? = None;
+    // A locked vault must never leave the embedded MCP server listening —
+    // it reads through `require_key`-gated seams, same precondition as
+    // enabling it in the first place.
+    mcp::stop_if_running(&state).await?;
     Ok(())
 }
 
@@ -1140,6 +1937,8 @@ async fn vault_reset(
         }
     }
     *state.vault_key.lock_safe()? = None;
+    // Same precondition as `vault_lock`: no key means no MCP server.
+    mcp::stop_if_running(&state).await?;
     // A reset invalidates the old key; forget any biometric copy too.
     let _ = biometric::remove_stored_key(&app_handle);
     Ok(())
@@ -1177,14 +1976,45 @@ async fn vault_change_password(
     Ok(())
 }
 
+/// Thin wrappers over `mcp.rs`'s testable impl fns (the established
+/// impl/wrapper split — see `set_connection_meta_impl`'s doc comment above)
+/// so the lifecycle logic itself never touches a `tauri::State` and can be
+/// unit-tested with a plain `AppState`.
+#[tauri::command]
+async fn mcp_get_status(state: tauri::State<'_, AppState>) -> Result<mcp::McpStatusUi, String> {
+    mcp::get_status_impl(&state)
+}
+
+#[tauri::command]
+async fn mcp_set_enabled(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<mcp::McpStatusUi, String> {
+    mcp::set_enabled_impl(&state, enabled, port, Some(app_handle)).await
+}
+
+#[tauri::command]
+async fn mcp_regenerate_token(state: tauri::State<'_, AppState>) -> Result<mcp::McpStatusUi, String> {
+    mcp::regenerate_token_impl(&state)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Resolve the user's real shell PATH before anything spawns child processes,
+    // so the packaged app finds CLI tools (claude, codex, mongosh, …) like the
+    // terminal does. Must run here on the main thread before worker threads start.
+    path_env::ensure_user_path();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_biometry::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             use tauri::Manager;
             if let Some(win) = app.get_webview_window("main") {
@@ -1207,11 +2037,26 @@ pub fn run() {
                     }
                 }
             }
+            // Final whole-branch review, Fix 1 (CRITICAL): closing "main"
+            // must quit the app even with a secondary `win-*` window open —
+            // see `windows::wire_main_window_exit`'s doc comment for why the
+            // runtime's default `ExitRequested`-on-last-window-close
+            // behavior is no longer sufficient once multi-window exists.
+            windows::wire_main_window_exit(app.handle());
             Ok(())
         })
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             connect_db,
+            detect_mongo_tools,
+            detect_mongosh_binary,
+            start_dump_task,
+            start_restore_task,
+            start_tool_install_task,
+            managed_tools_status,
+            browse_dump_folder,
+            preview_dump_command,
+            preview_restore_command,
             get_resource_usage,
             generate_mql_query,
             detect_local_agents,
@@ -1220,9 +2065,14 @@ pub fn run() {
             run_mongosh_command,
             stop_mongosh_session,
             disconnect_db,
+            set_connection_meta,
+            connection_list,
             list_databases,
             list_collections,
             list_indexes,
+            db_stats,
+            coll_stats,
+            index_stats,
             create_index,
             delete_index,
             delete_document,
@@ -1230,30 +2080,49 @@ pub fn run() {
             update_many,
             list_gridfs_files,
             download_gridfs_file,
+            upload_gridfs_file,
+            delete_gridfs_file,
             insert_document,
-            import_documents,
+            preview_import,
+            start_import_task,
             update_document,
             execute_mql_query,
             execute_aggregate,
             count_documents,
             start_collection_export,
+            start_filtered_export,
+            sample_export_fields,
+            preview_export,
+            format_current_docs,
             list_export_tasks,
             clear_finished_export_tasks,
+            cancel_task,
+            preflight_copy,
+            start_collection_copy,
+            start_database_copy,
             create_collection,
             create_view,
             drop_collection,
             rename_collection,
+            get_collection_options,
+            set_validator,
             drop_database,
             rename_database,
             explain_mql_query,
             explain_aggregate_query,
             analyze_schema,
+            preview_generated_documents,
+            infer_generate_template,
+            start_generate_task,
             vault_status,
             vault_initialize,
             vault_unlock,
             vault_lock,
             vault_reset,
             vault_change_password,
+            mcp_get_status,
+            mcp_set_enabled,
+            mcp_regenerate_token,
             biometric::biometric_status,
             biometric::biometric_enable,
             biometric::biometric_unlock,
@@ -1269,7 +2138,28 @@ pub fn run() {
             queries::save_query,
             queries::delete_saved_query,
             queries::record_history,
-            queries::set_default_query
+            queries::set_default_query,
+            queries::list_all_saved_queries,
+            workspace::workspace_get,
+            workspace::workspace_apply,
+            windows::workspace_detach_tab,
+            windows::spawn_saved_windows,
+            windows::focus_window,
+            windows::close_workspace_window,
+            server_status,
+            current_ops,
+            repl_set_status,
+            kill_op,
+            list_users,
+            create_user,
+            update_user,
+            drop_user,
+            list_roles,
+            get_profiling_status,
+            set_profiling_level,
+            read_profile,
+            updater::update_check,
+            updater::update_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

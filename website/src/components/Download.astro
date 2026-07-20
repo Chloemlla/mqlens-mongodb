@@ -1,9 +1,56 @@
 ---
 import { SITE } from '../consts';
 
-// Asset filenames are version-stamped, so direct "latest" links aren't stable;
-// each button points at the latest release page. Sizes are approximate and from
-// the current release. Client-side JS highlights the visitor's detected OS.
+interface Asset { name: string; size: number; browser_download_url: string; download_count: number }
+
+// At build time, pull the latest release: its assets (for direct download links +
+// real sizes) and the total download count across all releases. The total counts
+// every asset across every release so it matches the README's shields.io badge
+// (github/downloads/.../total). Everything degrades gracefully — on any error the
+// buttons fall back to the releases page.
+async function fetchRelease(): Promise<{ totalDownloads: number | null; assets: Asset[] }> {
+  try {
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'mqlens-website',
+    };
+    const token = process.env.GITHUB_TOKEN;
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(
+      'https://api.github.com/repos/mqlens/mqlens-mongodb/releases?per_page=100',
+      { headers },
+    );
+    if (!res.ok) return { totalDownloads: null, assets: [] };
+    const releases: any = await res.json();
+    if (!Array.isArray(releases) || releases.length === 0) return { totalDownloads: null, assets: [] };
+    // Sum every asset across every release — matching the shields.io
+    // github/downloads/.../total badge shown in the README, so the two never disagree.
+    const total = releases
+      .flatMap((r) => (Array.isArray(r.assets) ? r.assets : []))
+      .reduce((sum, a) => sum + (Number(a?.download_count) || 0), 0);
+    const latest = releases.find((r) => !r.draft && !r.prerelease) ?? releases[0];
+    const assets: Asset[] = Array.isArray(latest?.assets) ? latest.assets : [];
+    return { totalDownloads: total > 0 ? total : null, assets };
+  } catch {
+    return { totalDownloads: null, assets: [] };
+  }
+}
+
+const { totalDownloads, assets } = await fetchRelease();
+const downloadsLabel = totalDownloads != null ? totalDownloads.toLocaleString('en-US') : null;
+
+const fmtSize = (bytes: number): string =>
+  bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+
+// Resolve a download button to the matching latest-release asset (direct URL +
+// real size), or fall back to the releases page with an approximate size.
+const dl = (test: (name: string) => boolean, fallbackSize: string) => {
+  const a = assets.find((x) => typeof x.name === 'string' && test(x.name.toLowerCase()));
+  return a
+    ? { href: a.browser_download_url, size: fmtSize(a.size) }
+    : { href: SITE.releasesLatest, size: fallbackSize };
+};
+
 const cards = [
   {
     icon: 'windows',
@@ -11,8 +58,8 @@ const cards = [
     match: 'win',
     requires: 'Windows 10 or later (x64)',
     install: 'Download the installer, run it, and launch MQLens from the Start menu.',
-    primary: { label: '.exe (recommended)', size: '~8 MB' },
-    secondary: { label: '.msi', size: '~12 MB' },
+    primary: { label: '.exe (recommended)', key: 'exe', ...dl((n) => n.endsWith('.exe'), '~8 MB') },
+    secondary: { label: '.msi', key: 'msi', ...dl((n) => n.endsWith('.msi'), '~12 MB') },
   },
   {
     icon: 'apple',
@@ -20,8 +67,8 @@ const cards = [
     match: 'mac',
     requires: 'macOS 11 (Big Sur) or later',
     install: 'Download the .dmg, open it, and drag MQLens to your Applications folder.',
-    primary: { label: '.dmg (Apple Silicon)', size: '~13 MB' },
-    secondary: { label: '.dmg (Intel)', size: '~14 MB' },
+    primary: { label: '.dmg (Apple Silicon)', key: 'dmg-arm', ...dl((n) => n.endsWith('.dmg') && /(aarch64|arm64|aarch)/.test(n), '~13 MB') },
+    secondary: { label: '.dmg (Intel)', key: 'dmg-intel', ...dl((n) => n.endsWith('.dmg') && /(x64|x86_64|intel)/.test(n), '~14 MB') },
   },
   {
     icon: 'linux',
@@ -29,13 +76,19 @@ const cards = [
     match: 'linux',
     requires: 'Ubuntu 20.04+, Fedora 36+, or equivalent (x64)',
     install: 'Debian/Ubuntu: install the .deb. Fedora/RHEL: install the .rpm. An AppImage is also available.',
-    primary: { label: '.deb (Ubuntu/Debian)', size: '~15 MB' },
-    secondary: { label: '.rpm (Fedora/RHEL)', size: '~15 MB' },
+    primary: { label: '.deb (Ubuntu/Debian)', key: 'deb', ...dl((n) => n.endsWith('.deb'), '~15 MB') },
+    secondary: { label: '.rpm (Fedora/RHEL)', key: 'rpm', ...dl((n) => n.endsWith('.rpm'), '~15 MB') },
   },
 ];
 ---
 
 <div class="dl" id="dl-cards">
+  {downloadsLabel && (
+    <p class="dl-stat" aria-label={`${downloadsLabel} total downloads`}>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      <strong>{downloadsLabel}</strong> downloads and counting
+    </p>
+  )}
   <div class="dl-cards">
     {cards.map((c) => (
       <article class="dl-card" data-match={c.match}>
@@ -55,11 +108,11 @@ const cards = [
         </div>
 
         <div class="dl-actions">
-          <a class="dl-btn dl-btn-primary" href={SITE.releasesLatest} target="_blank" rel="noopener">
+          <a class="dl-btn dl-btn-primary" href={c.primary.href} data-dl={c.primary.key} download target="_blank" rel="noopener">
             <span>{c.primary.label}</span>
             <span class="dl-size">{c.primary.size}</span>
           </a>
-          <a class="dl-btn dl-btn-secondary" href={SITE.releasesLatest} target="_blank" rel="noopener">
+          <a class="dl-btn dl-btn-secondary" href={c.secondary.href} data-dl={c.secondary.key} download target="_blank" rel="noopener">
             <span>{c.secondary.label}</span>
             <span class="dl-size">{c.secondary.size}</span>
           </a>
@@ -92,6 +145,40 @@ const cards = [
       }
     });
   }
+
+  // Always point the buttons at the CURRENT latest stable release, resolved at
+  // runtime so they never go stale between site deploys. Build-time hrefs remain
+  // as the fallback if this fetch fails (offline / rate-limited).
+  type Asset = { name: string; size: number; browser_download_url: string };
+  const matchers: Record<string, (n: string) => boolean> = {
+    exe: (n) => n.endsWith('.exe'),
+    msi: (n) => n.endsWith('.msi'),
+    'dmg-arm': (n) => n.endsWith('.dmg') && /(aarch64|arm64|aarch)/.test(n),
+    'dmg-intel': (n) => n.endsWith('.dmg') && /(x64|x86_64|intel)/.test(n),
+    deb: (n) => n.endsWith('.deb'),
+    rpm: (n) => n.endsWith('.rpm'),
+  };
+  const fmtSize = (b: number) =>
+    b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
+
+  fetch('https://api.github.com/repos/mqlens/mqlens-mongodb/releases/latest', {
+    headers: { Accept: 'application/vnd.github+json' },
+  })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((rel: any) => {
+      const assets: Asset[] = Array.isArray(rel?.assets) ? rel.assets : [];
+      if (!assets.length) return;
+      document.querySelectorAll<HTMLAnchorElement>('a.dl-btn[data-dl]').forEach((btn) => {
+        const test = matchers[btn.dataset.dl || ''];
+        if (!test) return;
+        const a = assets.find((x) => typeof x.name === 'string' && test(x.name.toLowerCase()));
+        if (!a) return;
+        btn.href = a.browser_download_url;
+        const sizeEl = btn.querySelector<HTMLElement>('.dl-size');
+        if (sizeEl) sizeEl.textContent = fmtSize(a.size);
+      });
+    })
+    .catch(() => { /* keep build-time fallback hrefs */ });
 </script>
 
 <style>
@@ -168,6 +255,24 @@ const cards = [
   .dl-btn-secondary { background: var(--bg-elevated); color: var(--text); border-color: var(--border); }
   .dl-btn-secondary:hover { border-color: var(--accent); }
   .dl-size { font-size: 0.82rem; font-weight: 500; opacity: 0.8; }
+
+  .dl-stat {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: fit-content;
+    margin: 0 auto;
+    padding: 8px 18px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-card);
+    color: var(--text-dim);
+    font-size: 0.95rem;
+    font-weight: 500;
+  }
+  .dl-stat strong { color: var(--accent-bright); font-weight: 700; }
+  .dl-stat svg { color: var(--accent-bright); }
 
   .dl-all { text-align: center; margin: 34px 0 0; }
   .dl-all a { display: inline-flex; align-items: center; gap: 8px; color: var(--text-dim); font-weight: 600; }
