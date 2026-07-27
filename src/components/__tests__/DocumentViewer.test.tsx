@@ -229,7 +229,7 @@ describe('DocumentViewer Component', () => {
     const clearBtn = screen.getByTitle('Clear Filter');
     fireEvent.click(clearBtn);
 
-    expect(filterInput).toHaveValue('{}');
+    expect(filterInput).toHaveValue('');
     expect(screen.getByText('Cleared filter parameters')).toBeInTheDocument();
   });
 
@@ -518,12 +518,12 @@ describe('DocumentViewer Component', () => {
     // Uncheck projection
     fireEvent.click(projectionCheckbox);
     expect(projectionCheckbox.checked).toBe(false);
-    expect(projectionInput.value).toBe('{}');
+    expect(projectionInput.value).toBe('');
 
     // Uncheck sort
     fireEvent.click(sortCheckbox);
     expect(sortCheckbox.checked).toBe(false);
-    expect(sortInput.value).toBe('{}');
+    expect(sortInput.value).toBe('');
 
     // Check projection back
     fireEvent.click(projectionCheckbox);

@@ -2330,12 +2330,12 @@ describe('App Component', () => {
     fireEvent.change(filterInput, { target: { value: '{"status":"active"}' } });
     expect(filterInput.value).toContain('"status"');
 
-    // Switch to orders — editor must reset to default {}, not carry over the filter.
+    // Switch to orders — editor must reset to the default empty filter, not carry over.
     fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
     await screen.findByText(/"Sample"/);
     fireEvent.click(screen.getByTestId('toggle-query-builder'));
     const ordersFilter = screen.getByTestId('query-filter-input') as HTMLTextAreaElement;
-    expect(ordersFilter.value).toBe('{}');
+    expect(ordersFilter.value).toBe('');
 
     // Type a different filter on orders.
     fireEvent.change(ordersFilter, { target: { value: '{"shipped":true}' } });

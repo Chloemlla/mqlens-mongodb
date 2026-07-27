@@ -110,9 +110,11 @@ export interface BuilderState {
 
 export const DEFAULT_BUILDER_STATE: BuilderState = {
   queryMode: 'find',
-  filterQuery: '{}',
-  sortQuery: '{}',
-  projectionQuery: '{}',
+  // The query/sort/projection fields start empty (not "{}") — an empty field
+  // means "no filter", which handleRun treats as {}. Keeps the bar uncluttered.
+  filterQuery: '',
+  sortQuery: '',
+  projectionQuery: '',
   limit: '50',
   skip: '0',
   stages: [{ id: 'stage-1', operator: '$match', content: '{\n  \n}' }],
@@ -142,12 +144,14 @@ export function builderStateFromQueryTab(
     };
   }
   if (lastQuery) {
+    // A stored "{}" is the canonical empty query; show it as a blank field.
+    const blankIfEmpty = (s: string) => (s.trim() === '{}' ? '' : s);
     return {
       ...DEFAULT_BUILDER_STATE,
       queryMode: 'find',
-      filterQuery: lastQuery.filter,
-      sortQuery: lastQuery.sort,
-      projectionQuery: lastQuery.projection,
+      filterQuery: blankIfEmpty(lastQuery.filter),
+      sortQuery: blankIfEmpty(lastQuery.sort),
+      projectionQuery: blankIfEmpty(lastQuery.projection),
       limit: String(lastQuery.limit),
       skip: String(lastQuery.skip),
     };
@@ -310,7 +314,7 @@ const parseValue = (val: string): any => {
 };
 
 const compileRulesToQuery = (rules: VisualRule[], matchType: 'and' | 'or'): string => {
-  if (rules.length === 0) return '{}';
+  if (rules.length === 0) return '';
   
   const ruleObjects = rules.map(rule => {
     if (!rule.field || rule.field === '__custom__') return null;
@@ -327,7 +331,7 @@ const compileRulesToQuery = (rules: VisualRule[], matchType: 'and' | 'or'): stri
     return ruleObj;
   }).filter(Boolean) as Record<string, any>[];
   
-  if (ruleObjects.length === 0) return '{}';
+  if (ruleObjects.length === 0) return '';
   
   if (matchType === 'or') {
     return JSON.stringify({ $or: ruleObjects }, null, 2);
@@ -353,7 +357,7 @@ const compileRulesToQuery = (rules: VisualRule[], matchType: 'and' | 'or'): stri
 };
 
 const compileProjectionRules = (rules: ProjectionRule[]): string => {
-  if (rules.length === 0) return '{}';
+  if (rules.length === 0) return '';
   const projObj: Record<string, number> = {};
   rules.forEach(r => {
     if (r.field && r.field !== '__custom__') {
@@ -364,7 +368,7 @@ const compileProjectionRules = (rules: ProjectionRule[]): string => {
 };
 
 const compileSortRules = (rules: SortRule[]): string => {
-  if (rules.length === 0) return '{}';
+  if (rules.length === 0) return '';
   const sortObj: Record<string, number> = {};
   rules.forEach(r => {
     if (r.field && r.field !== '__custom__') {
@@ -720,10 +724,15 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       setQueryMode('aggregate');
       toast('Aggregation pipeline applied', 'success');
     } else {
-      setFilterQuery(JSON.stringify(query.filter ?? {}, null, 2));
-      setSortQuery(JSON.stringify(query.sort ?? {}, null, 2));
+      // Empty parts show as a blank field (not "{}"), matching the default.
+      const jsonOrBlank = (v: unknown) => {
+        const s = JSON.stringify(v ?? {}, null, 2);
+        return s === '{}' ? '' : s;
+      };
+      setFilterQuery(jsonOrBlank(query.filter));
+      setSortQuery(jsonOrBlank(query.sort));
       if (query.projection !== undefined) {
-        setProjectionQuery(JSON.stringify(query.projection ?? {}, null, 2));
+        setProjectionQuery(jsonOrBlank(query.projection));
       }
       setQueryMode('find');
       toast('Query applied to editor', 'success');
@@ -782,7 +791,14 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   projectionRulesRef.current = projectionRules;
   sortRulesRef.current = sortRules;
 
-  const fields = availableFields.length > 0 ? availableFields : ['_id'];
+  // Autocomplete field list = top-level keys seen in the results PLUS the
+  // schema analyzer's dotted nested paths (usage.total, usage.featureTypeGroup,
+  // …), so nested keys are suggested too. De-duped, order: results first.
+  const fields = (() => {
+    const set = new Set<string>(availableFields);
+    for (const key of schema.keys()) set.add(key);
+    return set.size > 0 ? [...set] : ['_id'];
+  })();
 
   // Validation states
   const [isFilterValid, setIsFilterValid] = useState(true);
@@ -843,7 +859,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         setRules(synced.rules);
         setQueryMatchType(synced.matchType);
         setIsQueryEnabled(true);
-      } else if (json.trim() === '{}') {
+      } else if ((json.trim() === '{}' || !json.trim())) {
         rulesRef.current = [];
         setRules([]);
         setIsQueryEnabled(false);
@@ -860,7 +876,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         projectionRulesRef.current = synced;
         setProjectionRules(synced);
         setIsProjectionEnabled(true);
-      } else if (json.trim() === '{}') {
+      } else if ((json.trim() === '{}' || !json.trim())) {
         projectionRulesRef.current = [];
         setProjectionRules([]);
         setIsProjectionEnabled(false);
@@ -877,7 +893,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         sortRulesRef.current = synced;
         setSortRules(synced);
         setIsSortEnabled(true);
-      } else if (json.trim() === '{}') {
+      } else if ((json.trim() === '{}' || !json.trim())) {
         sortRulesRef.current = [];
         setSortRules([]);
         setIsSortEnabled(false);
@@ -947,7 +963,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const clearAllRules = () => {
     rulesRef.current = [];
     setRules([]);
-    setFilterQuery('{}');
+    setFilterQuery('');
   };
 
   // Projection CRUD Handlers
@@ -992,7 +1008,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const clearAllProjectionRules = () => {
     projectionRulesRef.current = [];
     setProjectionRules([]);
-    setProjectionQuery('{}');
+    setProjectionQuery('');
   };
 
   // Sort CRUD Handlers
@@ -1037,7 +1053,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const clearAllSortRules = () => {
     sortRulesRef.current = [];
     setSortRules([]);
-    setSortQuery('{}');
+    setSortQuery('');
   };
 
   // Section Toggle Handlers
@@ -1046,7 +1062,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       setIsQueryEnabled(true);
       setFilterQuery(compileRulesToQuery(rulesRef.current, queryMatchTypeRef.current));
     } else {
-      setFilterQuery('{}');
+      setFilterQuery('');
       setIsQueryEnabled(false);
     }
   };
@@ -1056,7 +1072,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       setIsProjectionEnabled(true);
       setProjectionQuery(compileProjectionRules(projectionRulesRef.current));
     } else {
-      setProjectionQuery('{}');
+      setProjectionQuery('');
       setIsProjectionEnabled(false);
     }
   };
@@ -1066,7 +1082,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       setIsSortEnabled(true);
       setSortQuery(compileSortRules(sortRulesRef.current));
     } else {
-      setSortQuery('{}');
+      setSortQuery('');
       setIsSortEnabled(false);
     }
   };
@@ -1151,7 +1167,16 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       .filter(stage => !stage.disabled && stage.content.trim())
       .map(stage => ({ [stage.operator]: parseShellJson(stage.content) }));
 
+  // In find mode, block Run/Enter while any active field is invalid so a
+  // half-typed query never reaches the backend (which would surface a cryptic
+  // BSON error). Aggregate stages are validated inside handleRun's try/catch.
+  const canRun =
+    queryMode === 'aggregate'
+      ? true
+      : isFilterValid && isSortValid && (!isProjectionEnabled || isProjectionValid);
+
   const handleRun = () => {
+    if (!canRun) return;
     setError(null);
     try {
       if (queryMode === 'find') {
@@ -1277,9 +1302,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   };
 
   const handleClearField = (field: 'filter' | 'projection' | 'sort') => {
-    if (field === 'filter') setFilterQuery('{}');
-    if (field === 'projection') setProjectionQuery('{}');
-    if (field === 'sort') setSortQuery('{}');
+    if (field === 'filter') setFilterQuery('');
+    if (field === 'projection') setProjectionQuery('');
+    if (field === 'sort') setSortQuery('');
     notify(`Cleared ${field} parameters`);
   };
 
@@ -1341,10 +1366,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
           <div className="flex overflow-hidden rounded-md shadow-sm">
             <Button
               onClick={handleRun}
-              disabled={loading || explainLoading}
+              disabled={loading || explainLoading || !canRun}
               size="sm"
               className="h-7 rounded-r-none px-2.5 text-[11px]"
-              title={`Execute query (${formatShortcut(shortcutById('run-query')!)})`}
+              title={!canRun ? 'Fix the query syntax to run' : `Execute query (${formatShortcut(shortcutById('run-query')!)})`}
             >
               <Play size={11} fill="currentColor" />
               Run
@@ -1660,6 +1685,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
           {queryMode === 'find' ? (
             <div className="shrink-0">
               <FindQueryBar
+                shellSyntax
                 filter={filterQuery}
                 projection={projectionQuery}
                 sort={sortQuery}
@@ -1801,6 +1827,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         {!stage.collapsed && (
                           <QueryEditor
                             surface="aggStage"
+                            shellSyntax
                             stageOperator={stage.operator}
                             onRun={handleRun}
                             value={stage.content}
@@ -2204,7 +2231,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             </ScrollArea>
 
             <div className="flex shrink-0 justify-end border-t border-border bg-card p-2">
-              <Button onClick={handleRun} disabled={loading} size="sm" className="h-7 text-[11px]">
+              <Button onClick={handleRun} disabled={loading || !canRun} size="sm" className="h-7 text-[11px]">
                 Apply
               </Button>
             </div>
