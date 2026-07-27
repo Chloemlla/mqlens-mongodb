@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ObjectId, Long, Decimal128, Int32 } from 'bson';
-import { docToShell, shellToEjson, parseShellJson } from '../shellDoc';
+import { docToShell, shellToEjson, parseShellJson, parseQueryObject } from '../shellDoc';
 
 describe('docToShell', () => {
   it('renders EJSON-shaped values as shell constructors', () => {
@@ -120,5 +120,28 @@ describe('parseShellJson — relaxed shell-style input (#216)', () => {
     expect(() => parseShellJson('{ _id }')).toThrow();
     expect(() => parseShellJson('type: "DEV", _id')).toThrow();
     expect(() => parseShellJson('{ a: 1, b }')).toThrow();
+  });
+});
+
+describe('parseQueryObject — reject non-object queries (#222 review)', () => {
+  it('accepts a plain object and empty', () => {
+    expect(parseQueryObject('{ a: 1 }')).toEqual({ a: 1 });
+    expect(parseQueryObject('')).toEqual({});
+  });
+  it('rejects bare values, numbers, strings, arrays, expressions', () => {
+    expect(() => parseQueryObject('5')).toThrow();
+    expect(() => parseQueryObject('"active"')).toThrow();
+    expect(() => parseQueryObject('[1,2,3]')).toThrow();
+    expect(() => parseQueryObject('2*3')).toThrow();
+  });
+});
+
+describe('parseShellJson — NumberLong precision (#222 review)', () => {
+  it('preserves a 64-bit NumberLong beyond 2^53 (canonical when a Long is present)', () => {
+    expect(parseShellJson('{ n: NumberLong("9223372036854775807") }'))
+      .toEqual({ n: { $numberLong: '9223372036854775807' } });
+  });
+  it('keeps small numbers in clean relaxed form', () => {
+    expect(parseShellJson('{ a: 1 }')).toEqual({ a: 1 });
   });
 });

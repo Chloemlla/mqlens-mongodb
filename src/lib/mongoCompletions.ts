@@ -182,14 +182,17 @@ function isBareIdentifier(s: string): boolean {
 // surfaces (filter/projection/sort/aggStage); in shell style bare identifiers
 // stay unquoted, but dotted/special keys are still quoted.
 function keyInsert(ctx: CompletionCtx, s: string): string {
-  if (isShellStyle(ctx) && isBareIdentifier(s)) return s;
+  // Bare (unquoted) only in shell style AND when the user hasn't already opened
+  // a quote — otherwise `"cre`+accept would insert a bare key after the quote
+  // and corrupt the text. If a quote is open, fall through and close it.
+  if (isShellStyle(ctx) && isBareIdentifier(s) && !inQuote(ctx.textBeforeCursor)) return s;
   return !inQuote(ctx.textBeforeCursor) ? `"${s}"` : s;
 }
 
 // Snippet-escaped key (`\$op`), quoted per surface; reuses keyInsert's rules.
 function snippetKey(ctx: CompletionCtx, key: string): string {
   const esc = key.startsWith('$') ? `\\${key}` : key;
-  if (isShellStyle(ctx)) return esc;
+  if (isShellStyle(ctx) && !inQuote(ctx.textBeforeCursor)) return esc;
   return inQuote(ctx.textBeforeCursor) ? `${esc}"` : `"${esc}"`;
 }
 
@@ -225,7 +228,7 @@ function fieldItems(ctx: CompletionCtx): CompletionItem[] {
 function choiceFieldItems(ctx: CompletionCtx, choices: string): CompletionItem[] {
   return ctx.fields.map((name) => {
     const fs = ctx.schema?.get(name);
-    const bare = isShellStyle(ctx) && isBareIdentifier(name);
+    const bare = isShellStyle(ctx) && isBareIdentifier(name) && !inQuote(ctx.textBeforeCursor);
     const key = bare ? name : inQuote(ctx.textBeforeCursor) ? `${name}"` : `"${name}"`;
     return { label: name, kind: 'field' as const, insertText: `${key}: \${1|${choices}|}`, detail: fs?.type, isSnippet: true };
   });
@@ -274,7 +277,7 @@ function typedFieldItems(ctx: CompletionCtx): CompletionItem[] {
     // Shell style leaves a bare-identifier key unquoted (but still quotes a
     // dotted path); JSON opens a quote unless the user already typed one, and
     // always closes it before the colon.
-    const bare = shell && isBareIdentifier(name);
+    const bare = shell && isBareIdentifier(name) && !inQuote(ctx.textBeforeCursor);
     const key = bare ? name : inQuote(ctx.textBeforeCursor) ? `${name}"` : `"${name}"`;
     return { label: name, kind: 'field' as const, insertText: `${key}: ${shell ? scaffold.shell : scaffold.json}`, detail: fs?.type, isSnippet: true };
   });
@@ -512,7 +515,9 @@ export function getCompletions(ctx: CompletionCtx): CompletionItem[] {
   // enum values, EJSON wrappers + shell constructors (the query bar parses
   // both; the JS shell gets constructors only), operators with value shapes.
   if (atValuePosition(textBeforeCursor)) {
-    const typed = surface === 'shell'
+    // Shell-style surfaces get constructor suggestions only (ISODate(…)); EJSON
+    // wrappers ({"$oid": …}) would just be noisy duplicates there.
+    const typed = isShellStyle(ctx)
       ? snippetItems(SHELL_VALUE_CTORS, 'method')
       : [...ejsonValueItems(ctx), ...snippetItems(SHELL_VALUE_CTORS, 'method')];
     return byPrefix([...enumItemsForLastField(ctx), ...typed, ...opScaffoldItems(ctx, QUERY_OPERATORS, 'query operator', 'value')], token);

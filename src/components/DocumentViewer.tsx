@@ -4,7 +4,7 @@ import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
 import { useCollectionSchema } from '../lib/useCollectionSchema';
 import { collectionRef, type GeneratedQuery } from '../lib/mongoCommand';
-import { parseShellJson } from '../lib/shellDoc';
+import { parseShellJson, parseQueryObject } from '../lib/shellDoc';
 import {
   loadCollectionQueries,
   saveQuery,
@@ -794,11 +794,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   // Autocomplete field list = top-level keys seen in the results PLUS the
   // schema analyzer's dotted nested paths (usage.total, usage.featureTypeGroup,
   // …), so nested keys are suggested too. De-duped, order: results first.
-  const fields = (() => {
+  const fields = useMemo(() => {
     const set = new Set<string>(availableFields);
     for (const key of schema.keys()) set.add(key);
     return set.size > 0 ? [...set] : ['_id'];
-  })();
+  }, [availableFields, schema]);
 
   // Validation states
   const [isFilterValid, setIsFilterValid] = useState(true);
@@ -808,7 +808,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   useEffect(() => {
     try {
       if (filterQuery.trim()) {
-        parseShellJson(filterQuery);
+        parseQueryObject(filterQuery);
       }
       setIsFilterValid(true);
     } catch {
@@ -819,7 +819,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   useEffect(() => {
     try {
       if (projectionQuery.trim()) {
-        parseShellJson(projectionQuery);
+        parseQueryObject(projectionQuery);
       }
       setIsProjectionValid(true);
     } catch {
@@ -830,7 +830,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   useEffect(() => {
     try {
       if (sortQuery.trim()) {
-        parseShellJson(sortQuery);
+        parseQueryObject(sortQuery);
       }
       setIsSortValid(true);
     } catch {
@@ -1180,12 +1180,12 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     setError(null);
     try {
       if (queryMode === 'find') {
-        const parsedFilter = filterQuery.trim() ? parseShellJson(filterQuery) : {};
-        const parsedSort = sortQuery.trim() ? parseShellJson(sortQuery) : {};
+        const parsedFilter = filterQuery.trim() ? parseQueryObject(filterQuery) : {};
+        const parsedSort = sortQuery.trim() ? parseQueryObject(sortQuery) : {};
         // Only send a projection when the user has enabled one.
         const parsedProjection =
           isProjectionEnabled && projectionQuery.trim() && projectionQuery.trim() !== '{}'
-            ? parseShellJson(projectionQuery)
+            ? parseQueryObject(projectionQuery)
             : {};
 
         onExecute({
@@ -1274,7 +1274,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     setExplainLoading(true);
     try {
       if (queryMode === 'find') {
-        const parsedFilter = filterQuery.trim() ? parseShellJson(filterQuery) : {};
+        const parsedFilter = filterQuery.trim() ? parseQueryObject(filterQuery) : {};
         await onExplain(JSON.stringify(parsedFilter));
       } else if (onExplainAggregate) {
         // Explain the FULL pipeline (M1), not just a collapsed $match.

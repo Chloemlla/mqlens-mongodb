@@ -825,6 +825,16 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               });
               editor.focus();
               registerMongoCompletionProvider(monaco);
+              // mongosh is a REPL, not a linter: like the real shell we don't
+              // statically red-squiggle in-progress JS (errors surface on run).
+              // Explicit here so the behavior is intentional and independent of
+              // whether a query editor (which disables diagnostics globally) has
+              // mounted first.
+              monaco.languages.typescript?.javascriptDefaults?.setDiagnosticsOptions({
+                noSemanticValidation: true,
+                noSyntaxValidation: true,
+                noSuggestionDiagnostics: true,
+              });
               const model = editor.getModel();
               if (model) {
                 const uri = model.uri.toString();

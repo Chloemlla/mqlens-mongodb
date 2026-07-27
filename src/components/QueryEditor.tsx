@@ -58,6 +58,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   const schemaRef = useRef(schema); schemaRef.current = schema;
   const onRunRef = useRef(onRun); onRunRef.current = onRun;
   const stageOperatorRef = useRef(stageOperator); stageOperatorRef.current = stageOperator;
+  const shellSyntaxRef = useRef(shellSyntax); shellSyntaxRef.current = shellSyntax;
   const uriRef = useRef<string | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const theme = useMonacoTheme();
@@ -181,7 +182,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
             getFields: () => fieldsRef.current,
             getSchema: () => schemaRef.current,
             getStageOperator: () => stageOperatorRef.current,
-            shellSyntax,
+            getShellSyntax: () => shellSyntaxRef.current,
           });
           ed.onDidDispose(() => { if (uriRef.current) clearModelMeta(uriRef.current); });
         }
