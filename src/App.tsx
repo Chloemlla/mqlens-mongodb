@@ -124,6 +124,20 @@ interface QueryTab {
 
 const DEFAULT_QUERY = { filter: '{}', sort: '{}', projection: '{}', limit: 50, skip: 0 };
 
+// A cached/restored builder state may carry "{}" in the query/sort/projection
+// fields (from workspaces saved before empties were blanked); normalize it to
+// blank on read so those fields never display "{}". Passthrough for undefined.
+function blankEmptyQueryFields(s: BuilderState | undefined): BuilderState | undefined {
+  if (!s) return s;
+  const blank = (v: string) => (v?.trim() === '{}' ? '' : v);
+  return {
+    ...s,
+    filterQuery: blank(s.filterQuery),
+    sortQuery: blank(s.sortQuery),
+    projectionQuery: blank(s.projectionQuery),
+  };
+}
+
 const isEmptyFilter = (s: string): boolean => {
   const t = (s || '').trim();
   return t === '' || t === '{}';
@@ -3510,7 +3524,7 @@ function Workspace() {
               databaseName={tab.db}
               collectionName={tab.collection}
               initialBuilderState={
-                tabBuilderStateCache.current.get(tab.id)
+                blankEmptyQueryFields(tabBuilderStateCache.current.get(tab.id))
                 ?? builderStateFromQueryTab(tab.lastQuery, tab.lastAggregate)
               }
               onBuilderStateChange={(state) => handleBuilderStateChange(tab.id, state)}

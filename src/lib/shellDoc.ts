@@ -3,7 +3,8 @@
 // to Extended JSON for the backend on save. The display accepts both BSON
 // instances and EJSON-shaped plain objects; the save path is string-tokenized so
 // constructor-looking text inside string values is left untouched.
-import { ObjectId, Long, Decimal128, Int32, Double } from 'bson';
+import { ObjectId, Long, Decimal128, Int32, Double, EJSON } from 'bson';
+import { parseFilter } from 'mongodb-query-parser';
 
 const isPlainObject = (v: any): boolean => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -77,10 +78,49 @@ function ctorToEjson(name: string, arg: string): string {
   }
 }
 
-// Parse user query text that may mix JSON, EJSON wrappers, and shell
-// constructors (ObjectId(…), ISODate(…)) — the query bar accepts all three.
+// Parse query-bar text the way MongoDB Compass does — via mongodb-query-parser
+// (backed by @mongodb-js/shell-bson-parser in Loose mode). That accepts the full
+// mongosh query style: unquoted keys, single quotes, trailing commas, BSON
+// constructors (ObjectId(…), ISODate(…), NumberLong(…), UUID(…), …) and safe
+// expressions (e.g. `2 * 3`, `Math.max(…)`), with AST-validated, sandboxed
+// evaluation (no arbitrary code execution). A braceless field list like
+// `foo: 1` is wrapped into an object first, so double quotes and braces are
+// both optional. Malformed input throws, same as before.
+//
+// The parser returns real BSON values; we re-serialize to an EJSON-shaped plain
+// object (via EJSON.serialize) so every caller can keep JSON.stringify-ing the
+// result to the backend — the output contract is unchanged.
 export function parseShellJson(text: string): any {
-  return JSON.parse(shellToEjson(text));
+  const trimmed = text.trim();
+  if (!trimmed) return {};
+  // parseFilter signals "unparseable / not a valid query" by returning an empty
+  // string rather than throwing (e.g. `{ _id }`, a half-typed field). Surface
+  // that as an error so callers (live validation + Run) reject it instead of
+  // shipping `""` to the backend. A user who literally typed `""`/`''` (a rare
+  // empty-string stage body) is left alone.
+  const attempt = (s: string) => {
+    const result = parseFilter(s);
+    if (result === '' && !/^(['"])\1$/.test(s.trim())) {
+      throw new SyntaxError('Invalid query');
+    }
+    return result;
+  };
+  try {
+    return EJSON.serialize(attempt(trimmed));
+  } catch (err) {
+    // A braceless field list like `foo: 1` isn't a valid standalone expression;
+    // wrap it into an object and retry. Bare values (a `$count` stage body of
+    // `"n"`, a number, an array) parse on the first try, so they never reach
+    // here. Anything still unparseable re-throws the original error.
+    if (!/^[{[]/.test(trimmed)) {
+      try {
+        return EJSON.serialize(attempt(`{${trimmed}}`));
+      } catch {
+        /* fall through to re-throw the original error */
+      }
+    }
+    throw err;
+  }
 }
 
 // shell-style source text -> Extended JSON string. String literals are copied
