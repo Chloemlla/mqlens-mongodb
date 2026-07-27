@@ -1,6 +1,11 @@
 name: Release
 
-# dev  branch  -> rolling pre-release tagged `mqlens-v<version>-dev.<sha>`
+# dev  branch  -> rolling pre-release tagged `mqlens-v<version>-<run>`. NOT built
+#                 on every push: a dev release is cut once a day (see the cron
+#                 below) or on demand via "Run workflow". If nothing has landed
+#                 since the last dev pre-release the run skips the build, so we
+#                 don't burn an Apple notarization request on an identical
+#                 binary. A manual run can override that with `force`.
 # main branch  -> the version is derived AUTOMATICALLY from Conventional Commits
 #                 since the last stable tag (feat -> minor, fix/perf -> patch,
 #                 BREAKING CHANGE or `!` -> major). The version files are bumped +
@@ -9,7 +14,18 @@ name: Release
 #                 there are no releasable commits the release is skipped.
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # End-of-day dev pre-release: 18:00 UTC (20:00 CEST / 19:00 CET). Scheduled
+  # runs always use the default branch (dev). Skipped automatically when there
+  # is nothing new since the last dev pre-release.
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Release even if nothing changed since the last dev pre-release'
+        type: boolean
+        default: false
 
 # Don't cancel an in-flight release run (it could leave partial assets).
 concurrency:
@@ -48,6 +64,23 @@ jobs:
           # use the run number alone (no "dev" word). Not committed; the build job
           # writes it into the version files locally before building.
           if [ "${{ github.ref_name }}" != "main" ]; then
+            # Nothing new since the last dev pre-release? Skip. Rebuilding the
+            # same tree produces an identical app and costs an Apple
+            # notarization request, which is exactly what we're economizing.
+            # `force` (manual runs only) overrides. `inputs.force` is empty on
+            # schedule/push events, so the check applies there.
+            LAST_DEV_TAG=$(git for-each-ref --sort=-creatordate --format='%(refname:short)' 'refs/tags/mqlens-v*' \
+              | grep -vE '^mqlens-v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+            if [ "${{ inputs.force }}" != "true" ] && [ -n "$LAST_DEV_TAG" ]; then
+              LAST_SHA=$(git rev-list -n 1 "$LAST_DEV_TAG" 2>/dev/null || true)
+              if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$(git rev-parse HEAD)" ]; then
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                echo "No new commits since ${LAST_DEV_TAG} — skipping dev release."
+                exit 0
+              fi
+              echo "Changes since ${LAST_DEV_TAG}:"
+              git log --oneline "${LAST_DEV_TAG}..HEAD" || true
+            fi
             CUR=$(node -p "require('./package.json').version")
             BASE=${CUR%%-*}
             NEXT=$(node -e 'const p=process.argv[1].split(".").map(Number);p[2]++;process.stdout.write(p.join("."))' "$BASE")
@@ -119,9 +152,10 @@ jobs:
 
   build:
     needs: version
-    # Always run on dev (prereleases); on main only when the version job
-    # determined there is something to release.
-    if: ${{ always() && (github.ref_name != 'main' || needs.version.outputs.release == 'true') }}
+    # Only when the version job decided there is something to release: on main
+    # that means releasable Conventional Commits; on dev, new commits since the
+    # last dev pre-release (or a forced manual run).
+    if: ${{ always() && needs.version.outputs.release == 'true' }}
     permissions:
       contents: write
     env:
@@ -282,7 +316,7 @@ jobs:
   # latest.json. This fills the dev pre-release body + prunes old dev releases.
   release-notes:
     needs: [version, build]
-    if: github.ref_name != 'main'
+    if: ${{ github.ref_name != 'main' && needs.version.outputs.release == 'true' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -428,7 +462,7 @@ jobs:
   #                    dev channel a stable URL that points at this build's assets.
   updater-manifest:
     needs: [version, build]
-    if: ${{ always() && needs.build.result == 'success' && (github.ref_name != 'main' || needs.version.outputs.release == 'true') }}
+    if: ${{ always() && needs.build.result == 'success' && needs.version.outputs.release == 'true' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
