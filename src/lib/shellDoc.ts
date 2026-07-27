@@ -88,8 +88,22 @@ function ctorToEjson(name: string, arg: string): string {
 // both optional. Malformed input throws, same as before.
 //
 // The parser returns real BSON values; we re-serialize to an EJSON-shaped plain
-// object (via EJSON.serialize) so every caller can keep JSON.stringify-ing the
-// result to the backend — the output contract is unchanged.
+// object so every caller can keep JSON.stringify-ing the result to the backend
+// — the output contract is unchanged.
+//
+// Relaxed EJSON keeps the output clean, but it collapses a 64-bit Long to a JS
+// double, silently corrupting values beyond 2^53 (e.g. a big id/counter). So we
+// serialize canonically ONLY when a Long is actually present, keeping the clean
+// relaxed form for the common case.
+function containsLong(v: any): boolean {
+  if (v == null || typeof v !== 'object') return false;
+  if ((v as { _bsontype?: string })._bsontype === 'Long') return true;
+  if (Array.isArray(v)) return v.some(containsLong);
+  return Object.values(v).some(containsLong);
+}
+function serializeQuery(v: any): any {
+  return EJSON.serialize(v, { relaxed: !containsLong(v) });
+}
 export function parseShellJson(text: string): any {
   const trimmed = text.trim();
   if (!trimmed) return {};
@@ -106,7 +120,7 @@ export function parseShellJson(text: string): any {
     return result;
   };
   try {
-    return EJSON.serialize(attempt(trimmed));
+    return serializeQuery(attempt(trimmed));
   } catch (err) {
     // A braceless field list like `foo: 1` isn't a valid standalone expression;
     // wrap it into an object and retry. Bare values (a `$count` stage body of
@@ -114,13 +128,28 @@ export function parseShellJson(text: string): any {
     // here. Anything still unparseable re-throws the original error.
     if (!/^[{[]/.test(trimmed)) {
       try {
-        return EJSON.serialize(attempt(`{${trimmed}}`));
+        return serializeQuery(attempt(`{${trimmed}}`));
       } catch {
         /* fall through to re-throw the original error */
       }
     }
     throw err;
   }
+}
+
+// A find filter / sort / projection MUST be a document (plain object). The
+// parser otherwise happily accepts a bare value, number, string, array, or
+// expression (e.g. `5`, `"active"`, `[1,2,3]`, `2*3`), which then reaches the
+// backend and fails with a cryptic "got String instead" BSON error. Throwing
+// here lets the live validation flag the field and Run stay disabled. Empty
+// input is a valid empty query ({}). Not for aggregation stage bodies, which
+// can legitimately be non-objects (e.g. a `$count` body of "n").
+export function parseQueryObject(text: string): any {
+  const parsed = parseShellJson(text);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new SyntaxError('Query must be an object');
+  }
+  return parsed;
 }
 
 // shell-style source text -> Extended JSON string. String literals are copied

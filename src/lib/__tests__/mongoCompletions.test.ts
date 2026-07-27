@@ -543,3 +543,16 @@ describe('getCompletions — shell-style projection/sort keys', () => {
     expect(f?.insertText).toBe('"total": ${1|1,0|}');
   });
 });
+
+describe('getCompletions — shell keys respect an already-typed quote (#222 review)', () => {
+  it('filter: closes the quote instead of inserting a bare key when inQuote', () => {
+    const items = getCompletions(base({ surface: 'filter', shellSyntax: true, textBeforeCursor: '{ "', token: '', fields: ['createdTime'], schema: new Map([['createdTime', { type: 'date' }]]) }));
+    const f = items.find((i) => i.label === 'createdTime');
+    expect(f?.insertText).toBe('createdTime": ISODate("${1:2024-01-01T00:00:00Z}")');
+  });
+  it('projection: closes the quote when inQuote', () => {
+    const items = getCompletions(base({ surface: 'projection', shellSyntax: true, textBeforeCursor: '{ "', token: '', fields: ['total'] }));
+    const f = items.find((i) => i.label === 'total');
+    expect(f?.insertText).toBe('total": ${1|1,0|}');
+  });
+});
