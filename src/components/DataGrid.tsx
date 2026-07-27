@@ -10,6 +10,7 @@ import { generateQueryCode, CODE_LANGUAGES, CODE_LANGUAGE_MONACO_IDS, type CodeL
 import { suggestESRIndex, type IndexSuggestion } from '../lib/indexSuggestions';
 import { useMonacoTheme } from '../lib/useMonacoTheme';
 import { EJSON, ObjectId, Long, Decimal128, Int32, Double, Binary, Timestamp } from 'bson';
+import { copyValueToText } from '../lib/copyValue';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useThemeOptional } from '@/hooks/use-theme';
@@ -498,13 +499,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
   const writeClipboard = (text: string) => {
     try { navigator.clipboard?.writeText(text); } catch { /* clipboard unavailable */ }
   };
-  const valueToText = (v: any): string => {
-    if (v === null || v === undefined) return '';
-    if (typeof v === 'object') {
-      try { return EJSON.stringify(v); } catch { return JSON.stringify(v); }
-    }
-    return String(v);
-  };
   const openCtxMenu = (
     e: React.MouseEvent,
     doc: Record<string, any> | undefined,
@@ -552,7 +546,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
       });
     }
     if (m.field) {
-      items.push({ label: 'Copy value', icon: <Copy size={13} />, separatorBefore: true, onClick: () => writeClipboard(valueToText(m.value)) });
+      items.push({ label: 'Copy value', icon: <Copy size={13} />, separatorBefore: true, onClick: () => writeClipboard(copyValueToText(m.value)) });
       items.push({ label: 'Copy field name', icon: <Copy size={13} />, onClick: () => writeClipboard(m.field!) });
     }
     if (onDeleteDocument) items.push({ label: 'Delete document', icon: <Trash2 size={13} />, danger: true, separatorBefore: true, onClick: () => onDeleteDocument(m.doc), disabled: isReadOnly, title: isReadOnly ? READ_ONLY_TOOLTIP : undefined });
