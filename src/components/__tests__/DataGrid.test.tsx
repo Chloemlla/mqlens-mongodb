@@ -354,6 +354,17 @@ describe('DataGrid Component', () => {
     expect(writeText).toHaveBeenCalledWith('Alice Smith');
   });
 
+  it('copies an ObjectId cell as the raw hex, not the EJSON wrapper (#220)', () => {
+    const writeText = vi.fn();
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    // The _id cell renders as the bare hex string; right-click it and copy.
+    fireEvent.contextMenu(screen.getByText('603d779f4f102e3a185c3220'));
+    fireEvent.click(screen.getByText('Copy value'));
+    expect(writeText).toHaveBeenCalledWith('603d779f4f102e3a185c3220');
+  });
+
   it('shows the same context menu in the JSON view', () => {
     render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} onDeleteDocument={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: /json/i }));
