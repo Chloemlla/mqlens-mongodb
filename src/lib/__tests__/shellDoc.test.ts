@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ObjectId, Long, Decimal128, Int32 } from 'bson';
-import { docToShell, shellToEjson, parseShellJson } from '../shellDoc';
+import { docToShell, shellToEjson, parseShellJson, parseQueryObject } from '../shellDoc';
 
 describe('docToShell', () => {
   it('renders EJSON-shaped values as shell constructors', () => {
@@ -66,8 +66,9 @@ describe('parseShellJson', () => {
   it('parses shell constructors into EJSON shapes', () => {
     expect(parseShellJson('{"_id": ObjectId("507f1f77bcf86cd799439011")}'))
       .toEqual({ _id: { $oid: '507f1f77bcf86cd799439011' } });
+    // EJSON.serialize normalizes the date string (same instant); .000 is dropped.
     expect(parseShellJson('{"when": {"$gte": ISODate("2025-01-04T00:00:00.000Z")}}'))
-      .toEqual({ when: { $gte: { $date: '2025-01-04T00:00:00.000Z' } } });
+      .toEqual({ when: { $gte: { $date: '2025-01-04T00:00:00Z' } } });
   });
   it('leaves EJSON wrappers untouched', () => {
     expect(parseShellJson('{"_id": {"$oid": "507f1f77bcf86cd799439011"}}'))
@@ -78,5 +79,69 @@ describe('parseShellJson', () => {
   });
   it('throws on invalid input', () => {
     expect(() => parseShellJson('{nope')).toThrow();
+  });
+});
+
+describe('parseShellJson — relaxed shell-style input (#216)', () => {
+  it('accepts unquoted keys', () => {
+    expect(parseShellJson('{ createdAt: 1 }')).toEqual({ createdAt: 1 });
+  });
+  it('accepts single-quoted keys and string values', () => {
+    expect(parseShellJson("{ 'name': 'Ada' }")).toEqual({ name: 'Ada' });
+  });
+  it('accepts a trailing comma', () => {
+    expect(parseShellJson('{ status: "active", }')).toEqual({ status: 'active' });
+  });
+  it('accepts unquoted operator keys', () => {
+    expect(parseShellJson('{ age: { $gte: 18 } }')).toEqual({ age: { $gte: 18 } });
+  });
+  it('combines unquoted keys with shell constructors', () => {
+    expect(parseShellJson('{ _id: ObjectId("507f1f77bcf86cd799439011") }'))
+      .toEqual({ _id: { $oid: '507f1f77bcf86cd799439011' } });
+  });
+  it('still supports quoted keys for dotted paths', () => {
+    expect(parseShellJson('{ "user.age": { $gt: 21 } }')).toEqual({ 'user.age': { $gt: 21 } });
+  });
+  it('still throws on genuinely malformed input', () => {
+    expect(() => parseShellJson('{ oops ')).toThrow();
+  });
+  it('accepts braceless field:value input (auto-wrapped)', () => {
+    expect(parseShellJson('datacenterId: "METROPOLITAN_DC"')).toEqual({ datacenterId: 'METROPOLITAN_DC' });
+  });
+  it('accepts a braceless multi-field filter', () => {
+    expect(parseShellJson('a: 1, b: 2')).toEqual({ a: 1, b: 2 });
+  });
+  it('evaluates safe arithmetic expressions (Compass loose mode)', () => {
+    expect(parseShellJson('{ limit: 2 * 3 }')).toEqual({ limit: 6 });
+  });
+  it('throws on an incomplete query (parser returns its empty-string sentinel)', () => {
+    // mongodb-query-parser returns '' for unparseable input instead of throwing;
+    // parseShellJson must surface that as an error so validation/Run reject it.
+    expect(() => parseShellJson('{ _id }')).toThrow();
+    expect(() => parseShellJson('type: "DEV", _id')).toThrow();
+    expect(() => parseShellJson('{ a: 1, b }')).toThrow();
+  });
+});
+
+describe('parseQueryObject — reject non-object queries (#222 review)', () => {
+  it('accepts a plain object and empty', () => {
+    expect(parseQueryObject('{ a: 1 }')).toEqual({ a: 1 });
+    expect(parseQueryObject('')).toEqual({});
+  });
+  it('rejects bare values, numbers, strings, arrays, expressions', () => {
+    expect(() => parseQueryObject('5')).toThrow();
+    expect(() => parseQueryObject('"active"')).toThrow();
+    expect(() => parseQueryObject('[1,2,3]')).toThrow();
+    expect(() => parseQueryObject('2*3')).toThrow();
+  });
+});
+
+describe('parseShellJson — NumberLong precision (#222 review)', () => {
+  it('preserves a 64-bit NumberLong beyond 2^53 (canonical when a Long is present)', () => {
+    expect(parseShellJson('{ n: NumberLong("9223372036854775807") }'))
+      .toEqual({ n: { $numberLong: '9223372036854775807' } });
+  });
+  it('keeps small numbers in clean relaxed form', () => {
+    expect(parseShellJson('{ a: 1 }')).toEqual({ a: 1 });
   });
 });

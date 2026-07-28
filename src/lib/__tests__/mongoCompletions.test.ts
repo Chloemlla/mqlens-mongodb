@@ -477,3 +477,82 @@ describe('getCompletions — per-stage body editor (stageOperator)', () => {
     expect(items.find((i) => i.label === '$region')!.insertText).toBe('"$region"');
   });
 });
+
+describe('getCompletions — shell-style suggestions (shellSyntax)', () => {
+  const dateSchema = new Map([['createdTime', { type: 'date' }]]);
+  const oidSchema = new Map([['_id', { type: 'objectId' }]]);
+
+  it('inserts a date field as an unquoted key with ISODate() when shellSyntax is on', () => {
+    const items = getCompletions(base({ surface: 'filter', shellSyntax: true, textBeforeCursor: '{ ', token: '', fields: ['createdTime'], schema: dateSchema }));
+    const f = items.find((i) => i.label === 'createdTime');
+    expect(f?.insertText).toBe('createdTime: ISODate("${1:2024-01-01T00:00:00Z}")');
+  });
+
+  it('inserts an objectId field with ObjectId() when shellSyntax is on', () => {
+    const items = getCompletions(base({ surface: 'filter', shellSyntax: true, textBeforeCursor: '{ ', token: '', fields: ['_id'], schema: oidSchema }));
+    const f = items.find((i) => i.label === '_id');
+    expect(f?.insertText).toBe('_id: ObjectId("${1:objectId}")');
+  });
+
+  it('quotes a dotted field key even in shell style', () => {
+    const schema = new Map([['mongo.ssl', { type: 'bool' }]]);
+    const items = getCompletions(base({ surface: 'filter', shellSyntax: true, textBeforeCursor: '{ ', token: '', fields: ['mongo.ssl'], schema }));
+    const f = items.find((i) => i.label === 'mongo.ssl');
+    expect(f?.insertText).toBe('"mongo.ssl": ${1:true}');
+  });
+
+  it('keeps EJSON/quoted style when shellSyntax is off (default)', () => {
+    const items = getCompletions(base({ surface: 'filter', textBeforeCursor: '{ ', token: '', fields: ['createdTime'], schema: dateSchema }));
+    const f = items.find((i) => i.label === 'createdTime');
+    expect(f?.insertText).toBe('"createdTime": {"\\$date": "${1:2024-01-01T00:00:00Z}"}');
+  });
+});
+
+describe('getCompletions — nested field paths', () => {
+  it('suggests a nested dotted path matching the typed dotted token', () => {
+    const items = getCompletions(base({
+      surface: 'filter',
+      textBeforeCursor: '{ "usage.to',
+      token: 'usage.to',
+      fields: ['_id', 'usage', 'usage.total', 'usage.featureTypeGroup'],
+    }));
+    expect(labels(items)).toContain('usage.total');
+    expect(labels(items)).not.toContain('usage.featureTypeGroup');
+  });
+});
+
+describe('getCompletions — shell-style projection/sort keys', () => {
+  it('projection field key is unquoted in shell style', () => {
+    const items = getCompletions(base({ surface: 'projection', shellSyntax: true, textBeforeCursor: '{ ', token: '', fields: ['total'] }));
+    const f = items.find((i) => i.label === 'total');
+    expect(f?.insertText).toBe('total: ${1|1,0|}');
+  });
+  it('sort field key is unquoted in shell style', () => {
+    const items = getCompletions(base({ surface: 'sort', shellSyntax: true, textBeforeCursor: '{ ', token: '', fields: ['createdAt'] }));
+    const f = items.find((i) => i.label === 'createdAt');
+    expect(f?.insertText).toBe('createdAt: ${1|1,-1|}');
+  });
+  it('projection dotted key stays quoted in shell style', () => {
+    const items = getCompletions(base({ surface: 'projection', shellSyntax: true, textBeforeCursor: '{ ', token: '', fields: ['usage.total'] }));
+    const f = items.find((i) => i.label === 'usage.total');
+    expect(f?.insertText).toBe('"usage.total": ${1|1,0|}');
+  });
+  it('projection field key stays quoted when shellSyntax is off', () => {
+    const items = getCompletions(base({ surface: 'projection', textBeforeCursor: '{ ', token: '', fields: ['total'] }));
+    const f = items.find((i) => i.label === 'total');
+    expect(f?.insertText).toBe('"total": ${1|1,0|}');
+  });
+});
+
+describe('getCompletions — shell keys respect an already-typed quote (#222 review)', () => {
+  it('filter: closes the quote instead of inserting a bare key when inQuote', () => {
+    const items = getCompletions(base({ surface: 'filter', shellSyntax: true, textBeforeCursor: '{ "', token: '', fields: ['createdTime'], schema: new Map([['createdTime', { type: 'date' }]]) }));
+    const f = items.find((i) => i.label === 'createdTime');
+    expect(f?.insertText).toBe('createdTime": ISODate("${1:2024-01-01T00:00:00Z}")');
+  });
+  it('projection: closes the quote when inQuote', () => {
+    const items = getCompletions(base({ surface: 'projection', shellSyntax: true, textBeforeCursor: '{ "', token: '', fields: ['total'] }));
+    const f = items.find((i) => i.label === 'total');
+    expect(f?.insertText).toBe('total": ${1|1,0|}');
+  });
+});

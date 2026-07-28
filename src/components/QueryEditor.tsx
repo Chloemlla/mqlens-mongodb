@@ -34,6 +34,9 @@ interface QueryEditorProps {
   className?: string;
   onRun?: () => void;
   stageOperator?: string;
+  /** Emit mongosh-style completions (bare keys + ISODate()/ObjectId()) instead
+   *  of EJSON. Set by the main query bar, which parses shell syntax. */
+  shellSyntax?: boolean;
   'data-testid'?: string;
 }
 
@@ -48,12 +51,14 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   className,
   onRun,
   stageOperator,
+  shellSyntax,
   'data-testid': testid,
 }) => {
   const fieldsRef = useRef(fields); fieldsRef.current = fields;
   const schemaRef = useRef(schema); schemaRef.current = schema;
   const onRunRef = useRef(onRun); onRunRef.current = onRun;
   const stageOperatorRef = useRef(stageOperator); stageOperatorRef.current = stageOperator;
+  const shellSyntaxRef = useRef(shellSyntax); shellSyntaxRef.current = shellSyntax;
   const uriRef = useRef<string | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const theme = useMonacoTheme();
@@ -115,11 +120,28 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   const editor = (
     <Editor
       height={editorHeight}
-      defaultLanguage="json"
+      defaultLanguage="javascript"
+      language="javascript"
       theme={theme}
       value={value}
       onChange={(v) => onChange(v ?? '')}
       wrapperProps={testid ? { 'data-testid': testid } : undefined}
+      beforeMount={(monaco: Monaco) => {
+        // Query text is mongosh-style, not strict JSON: unquoted keys, single
+        // quotes, ObjectId(…)/ISODate(…), and braceless field lists are all
+        // valid input (see parseShellJson). Turn off Monaco's built-in language
+        // diagnostics so it stops red-squiggling that valid input — the app's
+        // own parseShellJson validation drives the real error state. This MUST
+        // run in beforeMount (not onMount): by the time onMount fires the JS
+        // worker has already validated the model, and updating the options then
+        // doesn't clear the markers.
+        monaco.languages?.typescript?.javascriptDefaults?.setDiagnosticsOptions({
+          noSemanticValidation: true,
+          noSyntaxValidation: true,
+          noSuggestionDiagnostics: true,
+        });
+        monaco.languages?.json?.jsonDefaults?.setDiagnosticsOptions({ validate: false });
+      }}
       onMount={(ed, monaco: Monaco) => {
         monacoRef.current = monaco;
         registerMqlensMonacoThemes(monaco);
@@ -160,6 +182,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
             getFields: () => fieldsRef.current,
             getSchema: () => schemaRef.current,
             getStageOperator: () => stageOperatorRef.current,
+            getShellSyntax: () => shellSyntaxRef.current,
           });
           ed.onDidDispose(() => { if (uriRef.current) clearModelMeta(uriRef.current); });
         }
@@ -172,7 +195,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
     return (
       <div
         className={cn(
-          'flex h-7 min-w-0 flex-1 items-center bg-input',
+          'flex h-7 min-w-0 flex-1 items-center bg-input pl-2',
           '[&_.monaco-editor]:bg-transparent [&_.monaco-editor-background]:bg-transparent',
           '[&_.margin]:bg-transparent [&_.monaco-scrollable-element]:bg-transparent',
           className

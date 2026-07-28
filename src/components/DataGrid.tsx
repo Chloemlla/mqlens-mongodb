@@ -10,6 +10,7 @@ import { generateQueryCode, CODE_LANGUAGES, CODE_LANGUAGE_MONACO_IDS, type CodeL
 import { suggestESRIndex, type IndexSuggestion } from '../lib/indexSuggestions';
 import { useMonacoTheme } from '../lib/useMonacoTheme';
 import { EJSON, ObjectId, Long, Decimal128, Int32, Double, Binary, Timestamp } from 'bson';
+import { copyValueToText } from '../lib/copyValue';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useThemeOptional } from '@/hooks/use-theme';
@@ -498,13 +499,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
   const writeClipboard = (text: string) => {
     try { navigator.clipboard?.writeText(text); } catch { /* clipboard unavailable */ }
   };
-  const valueToText = (v: any): string => {
-    if (v === null || v === undefined) return '';
-    if (typeof v === 'object') {
-      try { return EJSON.stringify(v); } catch { return JSON.stringify(v); }
-    }
-    return String(v);
-  };
   const openCtxMenu = (
     e: React.MouseEvent,
     doc: Record<string, any> | undefined,
@@ -552,7 +546,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
       });
     }
     if (m.field) {
-      items.push({ label: 'Copy value', icon: <Copy size={13} />, separatorBefore: true, onClick: () => writeClipboard(valueToText(m.value)) });
+      items.push({ label: 'Copy value', icon: <Copy size={13} />, separatorBefore: true, onClick: () => writeClipboard(copyValueToText(m.value)) });
       items.push({ label: 'Copy field name', icon: <Copy size={13} />, onClick: () => writeClipboard(m.field!) });
     }
     if (onDeleteDocument) items.push({ label: 'Delete document', icon: <Trash2 size={13} />, danger: true, separatorBefore: true, onClick: () => onDeleteDocument(m.doc), disabled: isReadOnly, title: isReadOnly ? READ_ONLY_TOOLTIP : undefined });
@@ -566,6 +560,30 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // column set changes per collection); the tree view's key column persists.
   const [colWidths, setColWidths] = useState<Record<string, number>>({});
   const colWidth = (col: string) => colWidths[col] ?? 180;
+  // The table header and the virtualized body are separate boxes: only the body
+  // scrolls. Once resized columns overflow the viewport the header would stay
+  // put and its cells would sit at a different x-offset than the rows, so mirror
+  // the body's horizontal scroll onto the header.
+  const tableHeaderRef = React.useRef<HTMLDivElement>(null);
+  const tableBodyRef = React.useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const body = tableBodyRef.current;
+    if (!body) return;
+    // Scroll events don't bubble, but they DO propagate during the capture
+    // phase — and the virtualized List renders its own overflow:auto scroller,
+    // so the element that actually scrolls sideways may be this wrapper or that
+    // inner div. Listening in capture catches either. Only the box that can
+    // actually scroll horizontally drives the header, so the vertical scroller
+    // doesn't reset it to 0.
+    const onScroll = (e: Event) => {
+      const target = e.target as HTMLElement | null;
+      const header = tableHeaderRef.current;
+      if (!header || !target || !(target instanceof HTMLElement)) return;
+      if (target.scrollWidth > target.clientWidth) header.scrollLeft = target.scrollLeft;
+    };
+    body.addEventListener('scroll', onScroll, true);
+    return () => body.removeEventListener('scroll', onScroll, true);
+  }, [viewMode]);
   const [treeKeyWidth, setTreeKeyWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem('mqlens-treekey-width'));
     return saved >= 140 && saved <= 800 ? saved : 320;
@@ -1477,7 +1495,16 @@ export const DataGrid: React.FC<DataGridProps> = ({
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             {viewMode === 'table' && (
               /* Table Headers */
-              <div className="flex h-6 shrink-0 select-none items-center border-b border-border bg-sidebar text-ui-2xs font-bold uppercase tracking-wider text-muted-foreground">
+              <div
+                ref={tableHeaderRef}
+                data-testid="table-header"
+                // overflow-hidden makes this a scroll container so its scrollLeft
+                // can be driven by the body; scrollbar-gutter keeps its usable
+                // width equal to the body's, so the two stay aligned at the far
+                // right too (where the body's vertical scrollbar eats space).
+                className="flex h-6 shrink-0 select-none items-center overflow-hidden border-b border-border bg-sidebar text-ui-2xs font-bold uppercase tracking-wider text-muted-foreground"
+                style={{ scrollbarGutter: 'stable' }}
+              >
                 <div className="flex items-center justify-center border-r border-border w-12 flex-shrink-0">
                   #
                 </div>
@@ -1500,7 +1527,12 @@ export const DataGrid: React.FC<DataGridProps> = ({
             )}
 
             {/* Virtualized list */}
-            <div className="min-h-0 flex-1 min-w-0 overflow-auto">
+            <div
+              ref={tableBodyRef}
+              data-testid="table-body-scroll"
+              className="min-h-0 flex-1 min-w-0 overflow-auto"
+              style={{ scrollbarGutter: 'stable' }}
+            >
               <List<{}>
                 rowCount={documents.length}
                 rowHeight={getRowHeight()}

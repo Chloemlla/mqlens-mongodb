@@ -19,6 +19,9 @@ export interface FindQueryBarProps {
   sortInvalid?: boolean;
   fields: string[];
   schema?: SchemaMap;
+  /** Emit mongosh-style completions (bare keys + ISODate()/ObjectId()) instead
+   *  of EJSON — set by editors that parse shell syntax (the main query bar). */
+  shellSyntax?: boolean;
   /** Run handler (⌘/Ctrl+Enter in the editors, Enter in skip/limit). */
   onRun?: () => void;
   /** Clear handlers — default to resetting the field to '{}' when omitted. */
@@ -67,6 +70,7 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
   sortInvalid = false,
   fields,
   schema,
+  shellSyntax,
   onRun,
   onClearFilter,
   onClearProjection,
@@ -86,14 +90,14 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
     }
   };
 
-  const clearFilter = onClearFilter ?? (() => onFilterChange('{}'));
-  const clearProjection = onClearProjection ?? (() => onProjectionChange('{}'));
-  const clearSort = onClearSort ?? (() => onSortChange('{}'));
+  const clearFilter = onClearFilter ?? (() => onFilterChange(''));
+  const clearProjection = onClearProjection ?? (() => onProjectionChange(''));
+  const clearSort = onClearSort ?? (() => onSortChange(''));
 
   const cycleSort = () => {
-    if (sort === '{}') onSortChange('{"_id": -1}');
+    if (sort === '{}' || sort.trim() === '') onSortChange('{"_id": -1}');
     else if (sort === '{"_id": -1}') onSortChange('{"_id": 1}');
-    else onSortChange('{}');
+    else onSortChange('');
   };
 
   return (
@@ -104,6 +108,7 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
           <QueryEditor
             singleLine
             surface="filter"
+            shellSyntax={shellSyntax}
             onRun={onRun}
             value={filter}
             onChange={onFilterChange}
@@ -130,6 +135,7 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
           <QueryEditor
             singleLine
             surface="projection"
+            shellSyntax={shellSyntax}
             onRun={onRun}
             value={projection}
             onChange={onProjectionChange}
@@ -154,6 +160,7 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
           <QueryEditor
             singleLine
             surface="sort"
+            shellSyntax={shellSyntax}
             onRun={onRun}
             value={sort}
             onChange={onSortChange}

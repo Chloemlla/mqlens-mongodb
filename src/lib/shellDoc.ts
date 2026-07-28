@@ -3,7 +3,8 @@
 // to Extended JSON for the backend on save. The display accepts both BSON
 // instances and EJSON-shaped plain objects; the save path is string-tokenized so
 // constructor-looking text inside string values is left untouched.
-import { ObjectId, Long, Decimal128, Int32, Double } from 'bson';
+import { ObjectId, Long, Decimal128, Int32, Double, EJSON } from 'bson';
+import { parseFilter } from 'mongodb-query-parser';
 
 const isPlainObject = (v: any): boolean => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -77,10 +78,78 @@ function ctorToEjson(name: string, arg: string): string {
   }
 }
 
-// Parse user query text that may mix JSON, EJSON wrappers, and shell
-// constructors (ObjectId(…), ISODate(…)) — the query bar accepts all three.
+// Parse query-bar text the way MongoDB Compass does — via mongodb-query-parser
+// (backed by @mongodb-js/shell-bson-parser in Loose mode). That accepts the full
+// mongosh query style: unquoted keys, single quotes, trailing commas, BSON
+// constructors (ObjectId(…), ISODate(…), NumberLong(…), UUID(…), …) and safe
+// expressions (e.g. `2 * 3`, `Math.max(…)`), with AST-validated, sandboxed
+// evaluation (no arbitrary code execution). A braceless field list like
+// `foo: 1` is wrapped into an object first, so double quotes and braces are
+// both optional. Malformed input throws, same as before.
+//
+// The parser returns real BSON values; we re-serialize to an EJSON-shaped plain
+// object so every caller can keep JSON.stringify-ing the result to the backend
+// — the output contract is unchanged.
+//
+// Relaxed EJSON keeps the output clean, but it collapses a 64-bit Long to a JS
+// double, silently corrupting values beyond 2^53 (e.g. a big id/counter). So we
+// serialize canonically ONLY when a Long is actually present, keeping the clean
+// relaxed form for the common case.
+function containsLong(v: any): boolean {
+  if (v == null || typeof v !== 'object') return false;
+  if ((v as { _bsontype?: string })._bsontype === 'Long') return true;
+  if (Array.isArray(v)) return v.some(containsLong);
+  return Object.values(v).some(containsLong);
+}
+function serializeQuery(v: any): any {
+  return EJSON.serialize(v, { relaxed: !containsLong(v) });
+}
 export function parseShellJson(text: string): any {
-  return JSON.parse(shellToEjson(text));
+  const trimmed = text.trim();
+  if (!trimmed) return {};
+  // parseFilter signals "unparseable / not a valid query" by returning an empty
+  // string rather than throwing (e.g. `{ _id }`, a half-typed field). Surface
+  // that as an error so callers (live validation + Run) reject it instead of
+  // shipping `""` to the backend. A user who literally typed `""`/`''` (a rare
+  // empty-string stage body) is left alone.
+  const attempt = (s: string) => {
+    const result = parseFilter(s);
+    if (result === '' && !/^(['"])\1$/.test(s.trim())) {
+      throw new SyntaxError('Invalid query');
+    }
+    return result;
+  };
+  try {
+    return serializeQuery(attempt(trimmed));
+  } catch (err) {
+    // A braceless field list like `foo: 1` isn't a valid standalone expression;
+    // wrap it into an object and retry. Bare values (a `$count` stage body of
+    // `"n"`, a number, an array) parse on the first try, so they never reach
+    // here. Anything still unparseable re-throws the original error.
+    if (!/^[{[]/.test(trimmed)) {
+      try {
+        return serializeQuery(attempt(`{${trimmed}}`));
+      } catch {
+        /* fall through to re-throw the original error */
+      }
+    }
+    throw err;
+  }
+}
+
+// A find filter / sort / projection MUST be a document (plain object). The
+// parser otherwise happily accepts a bare value, number, string, array, or
+// expression (e.g. `5`, `"active"`, `[1,2,3]`, `2*3`), which then reaches the
+// backend and fails with a cryptic "got String instead" BSON error. Throwing
+// here lets the live validation flag the field and Run stay disabled. Empty
+// input is a valid empty query ({}). Not for aggregation stage bodies, which
+// can legitimately be non-objects (e.g. a `$count` body of "n").
+export function parseQueryObject(text: string): any {
+  const parsed = parseShellJson(text);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new SyntaxError('Query must be an object');
+  }
+  return parsed;
 }
 
 // shell-style source text -> Extended JSON string. String literals are copied

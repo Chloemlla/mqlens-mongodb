@@ -15,6 +15,12 @@ export interface CompletionCtx {
   // OPERATOR'S BODY (e.g. the object after "$group":), so completions are
   // driven by the operator instead of guessing from the text.
   stageOperator?: string;
+  // When true, emit mongosh-style suggestions (bare keys + shell constructors
+  // like ISODate(…)) instead of EJSON (quoted keys + {"$date": …}). The main
+  // query bar sets this now that it parses shell syntax; JSON-only surfaces
+  // (mongodump --query, $jsonSchema validation) leave it off. Independent of
+  // `surface`, which still selects WHICH completions appear.
+  shellSyntax?: boolean;
 }
 
 export interface CompletionItem {
@@ -159,17 +165,34 @@ function inQuote(text: string): boolean {
   return /"[\w$.]*$/.test(text);
 }
 
-// Object keys (field names and $operators/$stages) must be quoted in the JSON
-// surfaces (filter/projection/sort/aggStage); the mongosh surface is JS, where
-// bare keys/identifiers are fine.
+// Whether to emit mongosh-style output (bare keys + shell constructors): the
+// dedicated shell surface, or any surface the caller marked shellSyntax (the
+// main query bar). `surface` still decides WHICH completions appear.
+function isShellStyle(ctx: CompletionCtx): boolean {
+  return ctx.surface === 'shell' || !!ctx.shellSyntax;
+}
+
+// A key safe to leave unquoted in shell style. Dotted paths ("mongo.ssl") and
+// other non-identifier keys still need quotes even in mongosh.
+function isBareIdentifier(s: string): boolean {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(s);
+}
+
+// Object keys (field names and $operators/$stages) are quoted in the JSON
+// surfaces (filter/projection/sort/aggStage); in shell style bare identifiers
+// stay unquoted, but dotted/special keys are still quoted.
 function keyInsert(ctx: CompletionCtx, s: string): string {
-  return ctx.surface !== 'shell' && !inQuote(ctx.textBeforeCursor) ? `"${s}"` : s;
+  // Bare (unquoted) only in shell style AND when the user hasn't already opened
+  // a quote — otherwise `"cre`+accept would insert a bare key after the quote
+  // and corrupt the text. If a quote is open, fall through and close it.
+  if (isShellStyle(ctx) && isBareIdentifier(s) && !inQuote(ctx.textBeforeCursor)) return s;
+  return !inQuote(ctx.textBeforeCursor) ? `"${s}"` : s;
 }
 
 // Snippet-escaped key (`\$op`), quoted per surface; reuses keyInsert's rules.
 function snippetKey(ctx: CompletionCtx, key: string): string {
   const esc = key.startsWith('$') ? `\\${key}` : key;
-  if (ctx.surface === 'shell') return esc;
+  if (isShellStyle(ctx) && !inQuote(ctx.textBeforeCursor)) return esc;
   return inQuote(ctx.textBeforeCursor) ? `${esc}"` : `"${esc}"`;
 }
 
@@ -182,7 +205,7 @@ function opScaffoldItems(
   ctx: CompletionCtx, ops: string[], detail: string, mode: 'key' | 'value',
   table: Record<string, string> = OPERATOR_VALUE_SCAFFOLDS, kind: CompletionKind = 'operator',
 ): CompletionItem[] {
-  const shell = ctx.surface === 'shell';
+  const shell = isShellStyle(ctx);
   const fieldKey = mode === 'value' ? lastFieldKey(ctx.textBeforeCursor) : parentKeyOfOpenObject(ctx.textBeforeCursor);
   const ftype = fieldKey && !fieldKey.startsWith('$') ? ctx.schema?.get(fieldKey)?.type : undefined;
   const typed = ftype ? TYPE_VALUE_SCAFFOLDS[ftype] : undefined;
@@ -205,7 +228,8 @@ function fieldItems(ctx: CompletionCtx): CompletionItem[] {
 function choiceFieldItems(ctx: CompletionCtx, choices: string): CompletionItem[] {
   return ctx.fields.map((name) => {
     const fs = ctx.schema?.get(name);
-    const key = inQuote(ctx.textBeforeCursor) ? `${name}"` : `"${name}"`;
+    const bare = isShellStyle(ctx) && isBareIdentifier(name) && !inQuote(ctx.textBeforeCursor);
+    const key = bare ? name : inQuote(ctx.textBeforeCursor) ? `${name}"` : `"${name}"`;
     return { label: name, kind: 'field' as const, insertText: `${key}: \${1|${choices}|}`, detail: fs?.type, isSnippet: true };
   });
 }
@@ -245,14 +269,16 @@ export const TYPE_VALUE_SCAFFOLDS: Record<string, { json: string; shell: string 
 function typedFieldItems(ctx: CompletionCtx): CompletionItem[] {
   return ctx.fields.map((name) => {
     const fs = ctx.schema?.get(name);
-    const shell = ctx.surface === 'shell';
+    const shell = isShellStyle(ctx);
     const scaffold = fs?.type ? TYPE_VALUE_SCAFFOLDS[fs.type] : undefined;
     if (!scaffold) {
       return { label: name, kind: 'field' as const, insertText: keyInsert(ctx, name), detail: fs?.type };
     }
-    // keyInsert semantics inline: shell keys are bare; in JSON we open a quote
-    // unless the user already typed one, and always close it before the colon.
-    const key = shell ? name : inQuote(ctx.textBeforeCursor) ? `${name}"` : `"${name}"`;
+    // Shell style leaves a bare-identifier key unquoted (but still quotes a
+    // dotted path); JSON opens a quote unless the user already typed one, and
+    // always closes it before the colon.
+    const bare = shell && isBareIdentifier(name) && !inQuote(ctx.textBeforeCursor);
+    const key = bare ? name : inQuote(ctx.textBeforeCursor) ? `${name}"` : `"${name}"`;
     return { label: name, kind: 'field' as const, insertText: `${key}: ${shell ? scaffold.shell : scaffold.json}`, detail: fs?.type, isSnippet: true };
   });
 }
@@ -489,7 +515,9 @@ export function getCompletions(ctx: CompletionCtx): CompletionItem[] {
   // enum values, EJSON wrappers + shell constructors (the query bar parses
   // both; the JS shell gets constructors only), operators with value shapes.
   if (atValuePosition(textBeforeCursor)) {
-    const typed = surface === 'shell'
+    // Shell-style surfaces get constructor suggestions only (ISODate(…)); EJSON
+    // wrappers ({"$oid": …}) would just be noisy duplicates there.
+    const typed = isShellStyle(ctx)
       ? snippetItems(SHELL_VALUE_CTORS, 'method')
       : [...ejsonValueItems(ctx), ...snippetItems(SHELL_VALUE_CTORS, 'method')];
     return byPrefix([...enumItemsForLastField(ctx), ...typed, ...opScaffoldItems(ctx, QUERY_OPERATORS, 'query operator', 'value')], token);
