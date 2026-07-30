@@ -85,6 +85,19 @@ describe('summarizeConnectionError', () => {
 
   it('summarizes a bare server-selection timeout when no deeper cause is present', () => {
     expect(summarizeConnectionError('Server selection timeout: No available servers').summary).toMatch(/selection timed out/i);
+    // #230: a pre-3.6 server drops the connection instead of reporting its
+    // version, so the raw error is an I/O EOF nested in a selection timeout.
+    // That must be named, not swallowed by the generic timeout message.
+    const legacy = summarizeConnectionError(
+      'Kind: Server selection timeout: No available servers. Topology: { Type: Single, Servers: [ { Address: localhost:12220, Type: Unknown, Error: Kind: I/O error: unexpected end of file, Labels: {"SystemOverloadedError"} } ] }',
+    );
+    expect(legacy.summary).toMatch(/closed the connection during handshake/i);
+    expect(legacy.hint).toMatch(/4\.2/);
+    expect(legacy.hint).toMatch(/TLS/i);
+    // A plain selection timeout with no EOF still gets the generic message.
+    expect(
+      summarizeConnectionError('Server selection timeout: No available servers').summary,
+    ).toMatch(/selection timed out/i);
   });
 });
 
