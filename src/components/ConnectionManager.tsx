@@ -217,6 +217,18 @@ export const summarizeConnectionError = (raw: string): { summary: string; hint?:
     return { summary: 'Connection refused.', hint: 'Is the server running and the host/port reachable from this machine?' };
   if (/failed to lookup|name or service not known|no such host|nodename nor servname|dns error/.test(e))
     return { summary: 'Host not found (DNS lookup failed).', hint: 'Check the hostname; for private hosts you may need an SSH tunnel.' };
+  // The server accepted the socket then hung up mid-handshake. Two causes look
+  // identical here, so name both rather than guess: a server older than the
+  // driver supports (pre-3.6 servers don't speak OP_MSG, so they drop the
+  // connection before reporting a version — see #230), or a server that requires
+  // TLS while TLS is off. Must precede the generic server-selection check, since
+  // the driver nests this I/O error inside that timeout.
+  if (/unexpected end of file|end of stream/.test(e))
+    return {
+      summary: 'Server closed the connection during handshake.',
+      hint:
+        'Most often the server predates MongoDB 4.2, the oldest MQLens currently supports — servers before 3.6 don’t speak the wire protocol the driver uses. Otherwise the server may require TLS while TLS is off here.',
+    };
   if (/server selection timeout|no available servers|no suitable servers/.test(e))
     return {
       summary: 'Couldn’t reach any server (selection timed out).',

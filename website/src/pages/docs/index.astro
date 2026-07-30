@@ -87,6 +87,12 @@ sudo dpkg -i MQLens_*.deb</code></pre>
         <p>To use the embedded shell you'll also need <a href="https://www.mongodb.com/docs/mongodb-shell/" target="_blank" rel="noopener"><code>mongosh</code></a> on your <code>PATH</code>.</p>
 
         <h2 id="first-connection">Your first connection</h2>
+        <p>
+          <strong>Supported servers:</strong> MongoDB <strong>4.2 or newer</strong>, including Atlas.
+          That's the floor of the official MongoDB Rust driver {SITE.name} is built on. Older servers
+          aren't supported yet — a pre-3.6 server predates the wire protocol the driver speaks, so it
+          closes the connection during the handshake rather than reporting its version.
+        </p>
         <ol>
           <li>Launch {SITE.name} and set a <strong>master password</strong> — this encrypts your saved connection profiles at rest.</li>
           <li>Create a connection: enter a host (standalone or replica set) or paste a full connection string.</li>
