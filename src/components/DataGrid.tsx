@@ -8,7 +8,7 @@ import { DocumentDiffModal } from './DocumentDiffModal';
 import Editor from '@monaco-editor/react';
 import { generateQueryCode, CODE_LANGUAGES, CODE_LANGUAGE_MONACO_IDS, type CodeLanguage, type QueryCodeSpec } from '../lib/queryCodeGen';
 import { suggestESRIndex, type IndexSuggestion } from '../lib/indexSuggestions';
-import { useMonacoTheme } from '../lib/useMonacoTheme';
+import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { EJSON, ObjectId, Long, Decimal128, Int32, Double, Binary, Timestamp } from 'bson';
 import { copyValueToText } from '../lib/copyValue';
 import { Button } from '@/components/ui/button';
@@ -625,6 +625,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
   // Query Code tab: generate runnable driver code in the selected language.
   const monacoTheme = useMonacoTheme();
+  const monacoFontSize = useMonacoFontSize(12);
   const [codeLang, setCodeLang] = useState<CodeLanguage>(() => {
     const saved = localStorage.getItem('mqlens-codegen-lang') as CodeLanguage | null;
     return saved && (CODE_LANGUAGES as readonly string[]).includes(saved) ? saved : 'mongosh';
@@ -1660,7 +1661,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
                   lineNumbersMinChars: 3,
                   scrollBeyondLastLine: false,
                   wordWrap: 'on',
-                  fontSize: 12,
+                  fontSize: monacoFontSize,
                   fontFamily: 'JetBrains Mono, SF Mono, Consolas, monospace',
                   renderLineHighlight: 'none',
                   automaticLayout: true,

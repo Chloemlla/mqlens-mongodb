@@ -12,6 +12,8 @@ type KeyDownHandler = (e: {
 }) => void;
 
 const KeyCode = { Enter: 3 };
+let lastOptions: Record<string, unknown> | undefined;
+let lastHeight: number | string | undefined;
 let keyDownHandler: KeyDownHandler | undefined;
 let enterRunCommand: (() => void) | undefined;
 let enterRunWhen: string | undefined;
@@ -35,10 +37,16 @@ vi.mock('@monaco-editor/react', () => ({
   default: ({
     value,
     onMount,
+    options,
+    height,
   }: {
     value: string;
+    options?: Record<string, unknown>;
+    height?: number | string;
     onMount?: (ed: unknown, monaco: { KeyCode: typeof KeyCode; editor: { defineTheme: () => void; setTheme: () => void } }) => void;
   }) => {
+    lastOptions = options;
+    lastHeight = height;
     if (onMount) {
       onMount(
         {
@@ -68,6 +76,12 @@ vi.mock('@monaco-editor/react', () => ({
     }
     return <div data-testid="monaco" data-value={value} />;
   },
+}));
+
+const themeConfig: Record<string, unknown> = { presetId: 'mqlens-dark', mode: 'dark', fontSize: 13, uiZoom: 1, queryBarHeight: 29 };
+vi.mock('@/hooks/use-theme', () => ({
+  useTheme: () => ({ config: themeConfig, resolvedMode: 'dark' as const }),
+  useThemeOptional: () => ({ config: themeConfig, resolvedMode: 'dark' as const }),
 }));
 
 import { QueryEditor } from '../QueryEditor';
@@ -131,5 +145,39 @@ describe('QueryEditor', () => {
     expect(enterRunWhen).toContain('!suggestWidgetVisible');
     enterRunCommand?.();
     expect(onRun).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('QueryEditor — size follows the query bar height setting', () => {
+  it('uses the stock font size and height at the default setting', () => {
+    themeConfig.queryBarHeight = 29;
+    render(<QueryEditor singleLine large surface="filter" value="" onChange={() => {}} fields={[]} />);
+    expect(lastOptions?.fontSize).toBe(13);
+    expect(lastHeight).toBe(29);
+  });
+
+  it('grows the text with the row so a taller bar is not a small line in a big box', () => {
+    themeConfig.queryBarHeight = 29;
+    render(<QueryEditor singleLine large surface="filter" value="" onChange={() => {}} fields={[]} />);
+    const smallFont = lastOptions?.fontSize as number;
+
+    themeConfig.queryBarHeight = 58;
+    render(<QueryEditor singleLine large surface="filter" value="" onChange={() => {}} fields={[]} />);
+    const bigFont = lastOptions?.fontSize as number;
+
+    expect(bigFont).toBeGreaterThan(smallFont);
+    expect(bigFont).toBeCloseTo(smallFont * 2, 0);
+    expect(lastHeight).toBe(58);
+    themeConfig.queryBarHeight = 29;
+  });
+
+  it('keeps the single line vertically centred as the row grows', () => {
+    themeConfig.queryBarHeight = 58;
+    render(<QueryEditor singleLine large surface="filter" value="" onChange={() => {}} fields={[]} />);
+    const padTop = lastOptions?.padding as { top: number };
+    const lineHeight = lastOptions?.lineHeight as number;
+    // Equal space above and below the line within the 58px row.
+    expect(padTop.top).toBe(Math.max(0, Math.round((58 - lineHeight) / 2)));
+    themeConfig.queryBarHeight = 29;
   });
 });

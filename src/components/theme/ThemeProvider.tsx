@@ -210,6 +210,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
       },
       setMode: (mode) => updateConfig({ mode }),
       setFontSize: (fontSize) => updateConfig({ fontSize }),
+      setQueryBarHeight: (queryBarHeight: number) => updateConfig({ queryBarHeight }),
       setUiZoom: (uiZoom) => updateConfig({ uiZoom }),
       zoomIn,
       zoomOut,

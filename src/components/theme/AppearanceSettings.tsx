@@ -17,6 +17,9 @@ import { FONT_OPTIONS } from "@/lib/themes/presets";
 import type { SpacingDensity, ThemeMode } from "@/lib/themes/schema";
 import {
   clampUiZoom,
+  clampQueryBarHeight,
+  QUERY_BAR_HEIGHT_MIN,
+  QUERY_BAR_HEIGHT_MAX,
   UI_ZOOM_MAX,
   UI_ZOOM_MIN,
   UI_ZOOM_STEP,
@@ -31,6 +34,7 @@ export function AppearanceSettings() {
     setPreset,
     setMode,
     setFontSize,
+    setQueryBarHeight,
     setUiZoom,
     setSpacingDensity,
     setFontSans,
@@ -176,6 +180,26 @@ export function AppearanceSettings() {
               value={[config.fontSize]}
               onValueChange={([v]) => setFontSize(v)}
             />
+          </div>
+
+          <div className="space-y-2 md:col-span-2 xl:col-span-1">
+            <div className="flex items-center justify-between">
+              <Label>Query bar height</Label>
+              <span className="font-mono text-xs text-muted-foreground">
+                {config.queryBarHeight}px
+              </span>
+            </div>
+            <Slider
+              min={QUERY_BAR_HEIGHT_MIN}
+              max={QUERY_BAR_HEIGHT_MAX}
+              step={1}
+              value={[config.queryBarHeight]}
+              onValueChange={([v]) => setQueryBarHeight(clampQueryBarHeight(v))}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              Sizes the Query field and its text. Projection, sort, skip and
+              limit stay compact.
+            </p>
           </div>
         </section>
 
