@@ -7,7 +7,7 @@ import { buildRunnableCommand, type GeneratedQuery } from '../lib/mongoCommand';
 
 export type { GeneratedQuery };
 
-interface ChatMessage {
+export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
@@ -27,7 +27,20 @@ interface AIChatPanelProps {
   onInsertAndRunQuery: (query: GeneratedQuery) => void;
   /** When true, render inside a parent ResizablePanel (no own width/resizer). */
   embedded?: boolean;
+  /** Restored when remounting this tab's chat (see App tabChatCache). */
+  initialMessages?: ChatMessage[];
+  onMessagesChange?: (messages: ChatMessage[]) => void;
 }
+
+/** Highest numeric suffix among `mN` message ids, or -1 if none. */
+const maxChatIdNum = (messages: ChatMessage[]): number => {
+  let max = -1;
+  for (const m of messages) {
+    const match = /^m(\d+)$/.exec(m.id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
+};
 
 const composerClassName = cn(
   'min-h-[52px] w-full resize-y rounded-md border border-input bg-background px-2 py-1.5 text-xs shadow-sm transition-colors',
@@ -43,15 +56,21 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   onInsertQuery,
   onInsertAndRunQuery,
   embedded = false,
+  initialMessages = [],
+  onMessagesChange,
 }) => {
   const [chatInput, setChatInput] = useState('');
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialMessages);
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [aiHelperWidth, setAIHelperWidth] = useState(340);
   const [isResizingAIHelper, setIsResizingAIHelper] = useState(false);
   const chatScrollRef = React.useRef<HTMLDivElement>(null);
-  const chatIdRef = React.useRef(0);
+  const chatIdRef = React.useRef(maxChatIdNum(initialMessages) + 1);
   const nextChatId = () => `m${chatIdRef.current++}`;
+
+  useEffect(() => {
+    onMessagesChange?.(chatMessages);
+  }, [chatMessages, onMessagesChange]);
 
   const startResizingAIHelper = (e: React.MouseEvent) => {
     e.preventDefault();

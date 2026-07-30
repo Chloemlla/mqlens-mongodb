@@ -6,6 +6,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { Sidebar } from './components/Sidebar';
 import { CommandPalette, type PaletteAction } from './components/CommandPalette';
 import { DocumentViewer, builderStateFromQueryTab, type BuilderState } from './components/DocumentViewer';
+import type { ChatMessage } from './components/AIChatPanel';
 import { DataGrid } from './components/DataGrid';
 import { ConnectionManager } from './components/ConnectionManager';
 import { SettingsView, type SettingsTabId, MONGO_TOOLS_DIR_KEY } from './components/SettingsModal';
@@ -423,6 +424,12 @@ function Workspace() {
     }
   }
   const tabBuilderStateCache = useRef(new Map<string, BuilderState>());
+  // Per-tab AI helper state (#221): transcript + whether the panel is open.
+  // Inactive collection tabs unmount DocumentViewer (and with it AIChatPanel),
+  // so both must live here — same pattern as `tabBuilderStateCache` (#120).
+  // Open state survives tab switches; only the panel close control (or opening
+  // the query builder) turns it off.
+  const tabChatCache = useRef(new Map<string, { messages: ChatMessage[]; isOpen: boolean }>());
   // Workspace-store mirroring plumbing (Phase 2 Task 5). Mirroring starts
   // DISABLED — the restore effect below is the only thing allowed to turn it
   // on, once workspace_get has resolved (snapshot applied or none found).
@@ -522,6 +529,14 @@ function Workspace() {
     mirrorUpdateTabState(tabId, activeConnectionsRef.current, { builderState: state });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const handleChatMessagesChange = useCallback((tabId: string, messages: ChatMessage[]) => {
+    const prev = tabChatCache.current.get(tabId);
+    tabChatCache.current.set(tabId, { messages, isOpen: prev?.isOpen ?? false });
+  }, []);
+  const handleAIHelperOpenChange = useCallback((tabId: string, isOpen: boolean) => {
+    const prev = tabChatCache.current.get(tabId);
+    tabChatCache.current.set(tabId, { messages: prev?.messages ?? [], isOpen });
+  }, []);
   const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
   const [isConnectionModalOpen, setIsConnectionModalOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabId | undefined>();
@@ -610,6 +625,11 @@ function Workspace() {
       if (bs) {
         tabBuilderStateCache.current.set(newId, bs);
         tabBuilderStateCache.current.delete(oldId);
+      }
+      const chat = tabChatCache.current.get(oldId);
+      if (chat) {
+        tabChatCache.current.set(newId, chat);
+        tabChatCache.current.delete(oldId);
       }
     }
 
@@ -750,6 +770,10 @@ function Workspace() {
             for (const [tabId, state] of snapshot.builderStates) {
               tabBuilderStateCache.current.set(tabId, state as BuilderState);
             }
+            // Chat is session-local (not in the workspace snapshot) — drop any
+            // pre-restore entries so a Quick Start tab id can't inherit a
+            // stale transcript after hydrate reuses ids.
+            tabChatCache.current.clear();
             const windowTabIds = new Set(snapshot.tabs.map((t) => t.id));
             const profileNames = new Map<string, string>();
             for (const t of ws.tabs) {
@@ -2132,6 +2156,7 @@ function Workspace() {
     }
     if (action.type === 'close_tab') {
       tabBuilderStateCache.current.delete(action.tabId);
+      tabChatCache.current.delete(action.tabId);
       // #91: forget this tab's generate-task tracking on close (running or
       // finished) — otherwise reopening "Generate Data…" on the same
       // namespace reuses the same deterministic tab id and the fresh view
@@ -2154,7 +2179,10 @@ function Workspace() {
       // connect, so any stale entries either of those leaves behind
       // permanently fall outside the tab-id space any future tab could
       // ever resolve — harmless, not reachable again. No fix needed there.
-      action.tabIds.forEach((id) => generateTaskIdsRef.current.delete(id));
+      action.tabIds.forEach((id) => {
+        generateTaskIdsRef.current.delete(id);
+        tabChatCache.current.delete(id);
+      });
     }
     dispatchLayout(action);
 
@@ -2727,6 +2755,7 @@ function Workspace() {
           closeWorkspaceWindow();
           setTabs([]);
           tabBuilderStateCache.current.clear();
+          tabChatCache.current.clear();
           dispatchLayout({ type: 'hydrate', layout: createInitialLayout([], null) });
           return;
         }
@@ -2792,6 +2821,7 @@ function Workspace() {
           const leavingIds = new Set(leaving.map((t) => t.id));
           leavingIds.forEach((id) => {
             tabBuilderStateCache.current.delete(id);
+            tabChatCache.current.delete(id);
             unmirroredTabIdsRef.current.delete(id);
           });
           setTabs((prev) => prev.filter((t) => !leavingIds.has(t.id)));
@@ -2932,6 +2962,7 @@ function Workspace() {
           const removedIds = new Set(removed);
           removedIds.forEach((id) => {
             tabBuilderStateCache.current.delete(id);
+            tabChatCache.current.delete(id);
             unmirroredTabIdsRef.current.delete(id);
           });
           setTabs((prev) => prev.filter((t) => !removedIds.has(t.id)));
@@ -3528,6 +3559,10 @@ function Workspace() {
                 ?? builderStateFromQueryTab(tab.lastQuery, tab.lastAggregate)
               }
               onBuilderStateChange={(state) => handleBuilderStateChange(tab.id, state)}
+              initialChatMessages={tabChatCache.current.get(tab.id)?.messages ?? []}
+              onChatMessagesChange={(messages) => handleChatMessagesChange(tab.id, messages)}
+              initialAIHelperOpen={tabChatCache.current.get(tab.id)?.isOpen ?? false}
+              onAIHelperOpenChange={(isOpen) => handleAIHelperOpenChange(tab.id, isOpen)}
               onExecute={q => handleExecuteQuery(tab, q)}
               onExecuteAggregate={pipeline => handleExecuteAggregate(tab, pipeline)}
               onExplain={filter => handleExplainQuery(tab, filter)}

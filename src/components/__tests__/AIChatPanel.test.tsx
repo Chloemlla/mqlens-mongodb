@@ -156,4 +156,46 @@ describe('AIChatPanel', () => {
     );
     expect(container.querySelector('[data-testid="ai-helper-panel"]')).toBeNull();
   });
+
+  it('seeds from initialMessages and reports changes via onMessagesChange', async () => {
+    const onMessagesChange = vi.fn();
+    const initial = [
+      { id: 'm0', role: 'user' as const, text: 'list adults' },
+      { id: 'm1', role: 'assistant' as const, text: 'Here you go.' },
+    ];
+    invokeMock.mockResolvedValue(
+      JSON.stringify({ explanation: 'Again.', queryType: 'find', filter: {}, sort: {} })
+    );
+
+    render(
+      <AIChatPanel
+        connectionId="c1"
+        databaseName="test-db"
+        collectionName="users"
+        fields={['name']}
+        variant="editor"
+        isOpen
+        onClose={onClose}
+        onInsertQuery={onInsertQuery}
+        onInsertAndRunQuery={onInsertAndRunQuery}
+        initialMessages={initial}
+        onMessagesChange={onMessagesChange}
+      />
+    );
+
+    expect(screen.getByText('list adults')).toBeInTheDocument();
+    expect(screen.getByText('Here you go.')).toBeInTheDocument();
+    expect(onMessagesChange).toHaveBeenCalledWith(initial);
+
+    fireEvent.change(screen.getByTestId('chat-input'), { target: { value: 'again' } });
+    fireEvent.click(screen.getByTestId('chat-send-btn'));
+
+    await waitFor(() => expect(screen.getByText('Again.')).toBeInTheDocument());
+    const calls = onMessagesChange.mock.calls;
+    const lastCall = calls[calls.length - 1][0] as Array<{ id: string; text: string }>;
+    expect(lastCall.map((m) => m.text)).toEqual(['list adults', 'Here you go.', 'again', 'Again.']);
+    // Ids continue past the restored m0/m1 range.
+    expect(lastCall[2].id).toBe('m2');
+    expect(lastCall[3].id).toBe('m3');
+  });
 });

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { AIChatPanel } from './AIChatPanel';
+import { AIChatPanel, type ChatMessage } from './AIChatPanel';
 import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
 import { useCollectionSchema } from '../lib/useCollectionSchema';
@@ -209,6 +209,12 @@ interface DocumentViewerProps {
   /** Restored when remounting this tab's viewer (see App tab cache). */
   initialBuilderState?: BuilderState;
   onBuilderStateChange?: (state: BuilderState) => void;
+  /** Restored when remounting this tab's AI helper (see App tabChatCache). */
+  initialChatMessages?: ChatMessage[];
+  onChatMessagesChange?: (messages: ChatMessage[]) => void;
+  /** Whether the AI helper panel was open when this tab was last shown. */
+  initialAIHelperOpen?: boolean;
+  onAIHelperOpenChange?: (isOpen: boolean) => void;
   children?: React.ReactNode;
 }
 
@@ -519,6 +525,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   availableFields = [],
   initialBuilderState = DEFAULT_BUILDER_STATE,
   onBuilderStateChange,
+  initialChatMessages = [],
+  onChatMessagesChange,
+  initialAIHelperOpen = false,
+  onAIHelperOpenChange,
   children
 }) => {
   const { prompt, toast } = useDialogs();
@@ -585,7 +595,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen, onBuilderStateChange]);
 
   // AI chat assistant — open/close only; the panel owns its own chat state.
-  const [isAIHelperOpen, setIsAIHelperOpen] = useState(false);
+  const [isAIHelperOpen, setIsAIHelperOpenState] = useState(initialAIHelperOpen);
+  const setIsAIHelperOpen = (open: boolean) => {
+    setIsAIHelperOpenState(open);
+    onAIHelperOpenChange?.(open);
+  };
 
   // Pipeline undo/redo: every stage mutation goes through commitStages, which
   // snapshots the previous list. Keystroke-level content edits coalesce via a
@@ -2262,6 +2276,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 onClose={() => setIsAIHelperOpen(false)}
                 onInsertQuery={handleInsertQuery}
                 onInsertAndRunQuery={handleInsertAndRunQuery}
+                initialMessages={initialChatMessages}
+                onMessagesChange={onChatMessagesChange}
               />
             </ResizablePanel>
           </>
