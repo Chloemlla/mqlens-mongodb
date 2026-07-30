@@ -18,7 +18,7 @@ import { AIChatPanel } from './AIChatPanel';
 import { buildRunnableCommand, guardScriptRun, type GeneratedQuery } from '../lib/mongoCommand';
 import { DataGrid } from './DataGrid';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
-import { useMonacoTheme } from '../lib/useMonacoTheme';
+import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { registerMqlensMonacoThemes } from '../lib/monacoAppTheme';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 
@@ -224,6 +224,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   );
   const [command, setCommand] = useState(defaultCommand);
   const monacoTheme = useMonacoTheme();
+  const monacoFontSize = useMonacoFontSize(13);
   const [isAIOpen, setIsAIOpen] = useState(false);
   const [pendingDestructive, setPendingDestructive] =
     useState<{ command: string; operation: string } | null>(null);
@@ -797,8 +798,10 @@ export const MongoShell: React.FC<MongoShellProps> = ({
             theme={monacoTheme}
             options={{
               fontFamily: 'JetBrains Mono, SF Mono, Consolas, monospace',
-              fontSize: 13,
-              lineHeight: 21,
+              fontSize: monacoFontSize,
+              // Must follow the font: Monaco treats lineHeight >= 8 as absolute px, so
+              // a fixed 21 clips descenders once the font scales past it.
+              lineHeight: Math.round(monacoFontSize * 1.6),
               minimap: { enabled: false },
               scrollBeyondLastLine: false,
               lineNumbersMinChars: 3,

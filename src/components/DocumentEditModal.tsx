@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { FileJson } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import { shellToEjson } from '../lib/shellDoc';
-import { useMonacoTheme } from '../lib/useMonacoTheme';
+import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { useEscapeClose } from '../lib/useEscapeClose';
 import {
   Dialog,
@@ -49,6 +49,7 @@ export const DocumentEditModal: React.FC<DocumentEditModalProps> = ({
   const [saving, setSaving] = useState(false);
   const validationError = useMemo(() => validateDocument(json), [json]);
   const theme = useMonacoTheme();
+  const monacoFontSize = useMonacoFontSize(12.5);
   useEscapeClose(isOpen, onClose);
 
   useEffect(() => {
@@ -126,7 +127,7 @@ export const DocumentEditModal: React.FC<DocumentEditModalProps> = ({
                 folding: true,
                 scrollBeyondLastLine: false,
                 wordWrap: 'on',
-                fontSize: 12.5,
+                fontSize: monacoFontSize,
                 tabSize: 2,
                 automaticLayout: true,
                 overviewRulerLanes: 0,

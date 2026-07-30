@@ -83,6 +83,12 @@ fn default_spacing_density() -> String {
     "cozy".to_string()
 }
 
+/// Query-bar row height in design px (at the default 13px root font); the UI
+/// scales it like everything else.
+fn default_query_bar_height() -> u8 {
+    29
+}
+
 fn default_ui_zoom() -> f32 {
     1.0
 }
@@ -105,6 +111,8 @@ pub struct AppearanceSettings {
     pub spacing_density: String,
     #[serde(default = "default_ui_zoom")]
     pub ui_zoom: f32,
+    #[serde(default = "default_query_bar_height")]
+    pub query_bar_height: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

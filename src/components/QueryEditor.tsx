@@ -3,10 +3,16 @@ import Editor, { type Monaco } from '@monaco-editor/react';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
 import type { Surface } from '../lib/mongoCompletions';
 import type { SchemaMap } from '../lib/useCollectionSchema';
-import { useMonacoTheme } from '../lib/useMonacoTheme';
+import { useMonacoTheme, useMonacoFontSize, useMonacoScale } from '../lib/useMonacoTheme';
 import { useThemeOptional } from '@/hooks/use-theme';
 import { registerMqlensMonacoThemes, refreshMqlensMonacoTheme } from '../lib/monacoAppTheme';
 import { cn } from '@/lib/utils';
+import {
+  clampQueryBarHeight,
+  EDITOR_FONT_BASELINE_PX,
+  QUERY_BAR_HEIGHT_DEFAULT,
+  QUERY_BAR_OPTION_HEIGHT,
+} from '@/lib/themes/ui-scale';
 
 let overflowNode: HTMLElement | null = null;
 function getOverflowNode(): HTMLElement | undefined {
@@ -37,6 +43,9 @@ interface QueryEditorProps {
   /** Emit mongosh-style completions (bare keys + ISODate()/ObjectId()) instead
    *  of EJSON. Set by the main query bar, which parses shell syntax. */
   shellSyntax?: boolean;
+  /** Roomier single-line field (taller row, larger font) for the primary query
+   *  input, which carries almost all of the typing. */
+  large?: boolean;
   'data-testid'?: string;
 }
 
@@ -52,6 +61,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   onRun,
   stageOperator,
   shellSyntax,
+  large = false,
   'data-testid': testid,
 }) => {
   const fieldsRef = useRef(fields); fieldsRef.current = fields;
@@ -62,6 +72,10 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   const uriRef = useRef<string | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const theme = useMonacoTheme();
+  // Monaco can't read the CSS vars the UI scales with — derive its size so the
+  // editor grows/shrinks with the interface font-size setting and zoom.
+  const uiScale = useMonacoScale();
+  const multiLineFontSize = useMonacoFontSize(12);
   const themeCtx = useThemeOptional();
   const presetId = themeCtx?.config.presetId;
 
@@ -72,7 +86,31 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
     monaco.editor.setTheme(theme);
   }, [theme, presetId]);
 
-  const editorHeight = height ?? (singleLine ? 22 : 120);
+  // Row height is user-configurable (Settings → Appearance) and shared by the
+  // query, projection and sort rows so the bar stays symmetric. It's stored as
+  // design px against the 13px baseline; the wrapper uses rem so it tracks the
+  // interface scale, and Monaco's px height is scaled to match — otherwise the
+  // editor becomes a short band inside a taller row (off-centre text + a seam).
+  // Only the primary query field is user-sizable. The small option fields keep a
+  // compact fixed height, so raising the setting doesn't inflate the whole bar —
+  // Compass likewise grows only its document editor, never the small inputs.
+  const configuredHeight = clampQueryBarHeight(
+    themeCtx?.config.queryBarHeight ?? QUERY_BAR_HEIGHT_DEFAULT
+  );
+  const rowDesignPx = large ? configuredHeight : QUERY_BAR_OPTION_HEIGHT;
+  const singleLineRowRem = rowDesignPx / EDITOR_FONT_BASELINE_PX;
+  const singleLineRowPx = Math.round(rowDesignPx * uiScale);
+  // The text scales with the row: a taller bar should read bigger, not leave a
+  // small line floating in a large box. The ratio is whatever it is at the
+  // default height, so the stock bar looks exactly as before.
+  const singleLineFontDesignPx = large
+    ? (13 * configuredHeight) / QUERY_BAR_HEIGHT_DEFAULT
+    : 11.5;
+  const singleLineFontSize = useMonacoFontSize(singleLineFontDesignPx);
+  const singleLineLineHeight = Math.round(singleLineFontSize * 1.4);
+  // Centre the single line within the full-height box.
+  const singleLinePadTop = Math.max(0, Math.round((singleLineRowPx - singleLineLineHeight) / 2));
+  const editorHeight = height ?? (singleLine ? singleLineRowPx : 120);
 
   const overflowWidgetsDomNode = getOverflowNode();
 
@@ -80,7 +118,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
 
   const multiLineOptions = {
     minimap: { enabled: false }, lineNumbers: 'off' as const, folding: false,
-    scrollBeyondLastLine: false, wordWrap: 'on' as const, fontSize: 12,
+    scrollBeyondLastLine: false, wordWrap: 'on' as const, fontSize: multiLineFontSize,
     scrollbar: { vertical: 'auto' as const, horizontal: 'auto' as const }, overviewRulerLanes: 0,
     renderLineHighlight: 'none' as const, tabSize: 2,
     fixedOverflowWidgets: true, overflowWidgetsDomNode,
@@ -106,8 +144,9 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
     overviewRulerLanes: 0,
     renderLineHighlight: 'none' as const,
     scrollBeyondLastLine: false,
-    fontSize: 11.5,
-    padding: { top: 4, bottom: 0 },
+    fontSize: singleLineFontSize,
+    lineHeight: singleLineLineHeight,
+    padding: { top: singleLinePadTop, bottom: 0 },
     contextmenu: false,
     automaticLayout: true,
     fixedOverflowWidgets: true,
@@ -195,11 +234,15 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
     return (
       <div
         className={cn(
-          'flex h-7 min-w-0 flex-1 items-center bg-input pl-2',
+          'flex min-w-0 flex-1 items-center bg-input pl-2',
           '[&_.monaco-editor]:bg-transparent [&_.monaco-editor-background]:bg-transparent',
           '[&_.margin]:bg-transparent [&_.monaco-scrollable-element]:bg-transparent',
+          // Monaco paints a shadow over the top edge once the line scrolls
+          // sideways; in a one-line field that reads as a stray gradient band.
+          '[&_.scroll-decoration]:shadow-none [&_.overflow-guard]:bg-transparent',
           className
         )}
+        style={{ height: `${singleLineRowRem}rem` }}
       >
         {editor}
       </div>

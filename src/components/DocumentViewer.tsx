@@ -106,6 +106,9 @@ export interface BuilderState {
   limit: string;
   skip: string;
   stages: PipelineStage[];
+  /** Query-bar Options disclosure. Undefined until the user toggles it, so a
+   *  fresh tab still auto-reveals when a query arrives with options set. */
+  optionsOpen?: boolean;
 }
 
 export const DEFAULT_BUILDER_STATE: BuilderState = {
@@ -566,6 +569,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   // Query mode: traditional find vs aggregate pipeline
   const [queryMode, setQueryMode] = useState<'find' | 'aggregate'>(initialBuilderState.queryMode);
   const [stages, setStages] = useState<PipelineStage[]>(initialBuilderState.stages);
+  const [optionsOpen, setOptionsOpen] = useState<boolean | undefined>(initialBuilderState.optionsOpen);
 
   useEffect(() => {
     onBuilderStateChange?.({
@@ -576,8 +580,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       limit,
       skip,
       stages,
+      optionsOpen,
     });
-  }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, onBuilderStateChange]);
+  }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen, onBuilderStateChange]);
 
   // AI chat assistant — open/close only; the panel owns its own chat state.
   const [isAIHelperOpen, setIsAIHelperOpen] = useState(false);
@@ -1686,6 +1691,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <div className="shrink-0">
               <FindQueryBar
                 shellSyntax
+                collapsibleOptions
+                optionsOpen={optionsOpen}
+                onOptionsOpenChange={setOptionsOpen}
                 filter={filterQuery}
                 projection={projectionQuery}
                 sort={sortQuery}
