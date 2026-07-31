@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { AIChatPanel } from './AIChatPanel';
 import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
@@ -106,6 +107,9 @@ export interface BuilderState {
   limit: string;
   skip: string;
   stages: PipelineStage[];
+  /** Query-bar Options disclosure. Undefined until the user toggles it, so a
+   *  fresh tab still auto-reveals when a query arrives with options set. */
+  optionsOpen?: boolean;
 }
 
 export const DEFAULT_BUILDER_STATE: BuilderState = {
@@ -519,6 +523,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   children
 }) => {
   const { prompt, toast } = useDialogs();
+  const { t } = useTranslation('common');
   const { schema } = useCollectionSchema(connectionId, databaseName, collectionName);
   const [filterQuery, setFilterQuery] = useState(initialBuilderState.filterQuery);
   const [projectionQuery, setProjectionQuery] = useState(initialBuilderState.projectionQuery);
@@ -566,6 +571,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   // Query mode: traditional find vs aggregate pipeline
   const [queryMode, setQueryMode] = useState<'find' | 'aggregate'>(initialBuilderState.queryMode);
   const [stages, setStages] = useState<PipelineStage[]>(initialBuilderState.stages);
+  const [optionsOpen, setOptionsOpen] = useState<boolean | undefined>(initialBuilderState.optionsOpen);
 
   useEffect(() => {
     onBuilderStateChange?.({
@@ -576,8 +582,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       limit,
       skip,
       stages,
+      optionsOpen,
     });
-  }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, onBuilderStateChange]);
+  }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen, onBuilderStateChange]);
 
   // AI chat assistant — open/close only; the panel owns its own chat state.
   const [isAIHelperOpen, setIsAIHelperOpen] = useState(false);
@@ -722,7 +729,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       const pipeline = query.pipeline && query.pipeline.length > 0 ? query.pipeline : [{ $match: {} }];
       commitStages(stagesFromPipeline(pipeline));
       setQueryMode('aggregate');
-      toast('Aggregation pipeline applied', 'success');
+      toast(t('toast.aggregationPipelineApplied'), 'success');
     } else {
       // Empty parts show as a blank field (not "{}"), matching the default.
       const jsonOrBlank = (v: unknown) => {
@@ -735,7 +742,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         setProjectionQuery(jsonOrBlank(query.projection));
       }
       setQueryMode('find');
-      toast('Query applied to editor', 'success');
+      toast(t('toast.queryAppliedToEditor'), 'success');
     }
   };
 
@@ -1087,9 +1094,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     }
   };
 
-  // Flash a notification via the global toast stack
-  const notify = (message: string, kind: 'success' | 'error' | 'info' = 'success') => {
-    toast(message, kind);
+  // Flash a notification via the global toast stack. `key` is a common:toast.*
+  // translation key (interpolated with `options`), not pre-formatted text.
+  const notify = (key: string, kind: 'success' | 'error' | 'info' = 'success', options?: Record<string, unknown>) => {
+    toast(t(key, options), kind);
   };
 
   const currentBuilderQuery = (): GeneratedQuery =>
@@ -1114,9 +1122,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
           setFavoriteItems(loadFavoriteItems());
         }
       }
-      notify(alsoFavorite ? `Saved and favorited "${name.trim()}"` : `Saved "${name.trim()}"`);
+      notify(alsoFavorite ? 'toast.querySavedAndFavorited' : 'toast.querySaved', 'success', { name: name.trim() });
     } catch (e: any) {
-      notify(`Couldn't save query: ${e?.message || e}`, 'error');
+      notify('toast.couldNotSaveQuery', 'error', { detail: e?.message || e });
     }
   };
 
@@ -1132,27 +1140,27 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     try {
       await deleteSavedQuery(connectionName, databaseName, collectionName, id);
       await refreshStoredQueries();
-      notify('Saved query deleted', 'success');
+      notify('toast.savedQueryDeleted', 'success');
     } catch (e: any) {
-      notify(`Couldn't delete query: ${e?.message || e}`, 'error');
+      notify('toast.couldNotDeleteQuery', 'error', { detail: e?.message || e });
     }
   };
 
   const handleSetDefault = async () => {
     try {
       await setDefaultQuery(connectionName, databaseName, collectionName, currentBuilderQuery());
-      notify('Default query set');
+      notify('toast.defaultQuerySet');
     } catch (e: any) {
-      notify(`Couldn't set default: ${e?.message || e}`, 'error');
+      notify('toast.couldNotSetDefault', 'error', { detail: e?.message || e });
     }
   };
 
   const handleClearDefault = async () => {
     try {
       await setDefaultQuery(connectionName, databaseName, collectionName, null);
-      notify('Default query cleared');
+      notify('toast.defaultQueryCleared');
     } catch (e: any) {
-      notify(`Couldn't clear default: ${e?.message || e}`, 'error');
+      notify('toast.couldNotClearDefault', 'error', { detail: e?.message || e });
     }
   };
 
@@ -1305,7 +1313,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     if (field === 'filter') setFilterQuery('');
     if (field === 'projection') setProjectionQuery('');
     if (field === 'sort') setSortQuery('');
-    notify(`Cleared ${field} parameters`);
+    const key = field === 'filter' ? 'toast.filterCleared' : field === 'projection' ? 'toast.projectionCleared' : 'toast.sortCleared';
+    notify(key);
   };
 
   const workspaceRightPanel = isQueryBuilderOpen
@@ -1548,10 +1557,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                   const shellCommand = buildShellCommand();
                   if (onOpenShell) {
                     onOpenShell(shellCommand);
-                    notify('Opened query in mongosh', 'info');
+                    notify('toast.openedInMongosh', 'info');
                   } else {
                     navigator.clipboard?.writeText(shellCommand);
-                    notify('Copied mongosh command', 'success');
+                    notify('toast.copiedMongoshCommand', 'success');
                   }
                 }}
               >
@@ -1686,6 +1695,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <div className="shrink-0">
               <FindQueryBar
                 shellSyntax
+                collapsibleOptions
+                optionsOpen={optionsOpen}
+                onOptionsOpenChange={setOptionsOpen}
                 filter={filterQuery}
                 projection={projectionQuery}
                 sort={sortQuery}

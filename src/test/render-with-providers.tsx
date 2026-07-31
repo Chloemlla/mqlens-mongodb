@@ -31,6 +31,8 @@ function TestThemeProvider({
       setMode: (mode) => setThemeConfig((prev) => ({ ...prev, mode })),
       setFontSize: (fontSize) =>
         setThemeConfig((prev) => ({ ...prev, fontSize })),
+      setQueryBarHeight: (queryBarHeight: number) =>
+        setThemeConfig((prev) => ({ ...prev, queryBarHeight })),
       setUiZoom: (uiZoom) =>
         setThemeConfig((prev) => ({ ...prev, uiZoom })),
       zoomIn: () => {},

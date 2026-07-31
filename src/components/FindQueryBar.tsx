@@ -1,9 +1,16 @@
-import React from 'react';
-import { AlertCircle, ArrowUpDown, Eraser } from 'lucide-react';
+import React, { useEffect, useId, useRef, useState } from 'react';
+import { AlertCircle, ArrowUpDown, ChevronDown, ChevronRight, Eraser } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 import { QueryEditor } from './QueryEditor';
+import { useThemeOptional } from '@/hooks/use-theme';
+import {
+  clampQueryBarHeight,
+  EDITOR_FONT_BASELINE_PX,
+  QUERY_BAR_HEIGHT_DEFAULT,
+  QUERY_BAR_OPTION_HEIGHT,
+} from '@/lib/themes/ui-scale';
 import type { SchemaMap } from '../lib/useCollectionSchema';
 
 export interface FindQueryBarProps {
@@ -22,6 +29,14 @@ export interface FindQueryBarProps {
   /** Emit mongosh-style completions (bare keys + ISODate()/ObjectId()) instead
    *  of EJSON — set by editors that parse shell syntax (the main query bar). */
   shellSyntax?: boolean;
+  /** Show only the Query field, with projection / sort / skip / limit tucked
+   *  behind an "Options" disclosure. Query is ~95% of the usage, so it gets the
+   *  room; the rest auto-reveal when they hold a non-default value. */
+  collapsibleOptions?: boolean;
+  /** Controlled disclosure state, so a host can persist it across remounts.
+   *  Leave undefined to let the bar manage (and auto-reveal) it internally. */
+  optionsOpen?: boolean;
+  onOptionsOpenChange?: (open: boolean) => void;
   /** Run handler (⌘/Ctrl+Enter in the editors, Enter in skip/limit). */
   onRun?: () => void;
   /** Clear handlers — default to resetting the field to '{}' when omitted. */
@@ -44,7 +59,7 @@ const queryColClass = (invalid: boolean) =>
 
 const fieldBadgeClass = (invalid: boolean) =>
   cn(
-    'flex h-7 min-w-[90px] shrink-0 select-none items-center justify-end border-r border-border px-2.5 text-[9.5px] font-bold uppercase tracking-wider',
+    'flex min-w-[90px] shrink-0 select-none items-center justify-end border-r border-border px-2.5 text-[9.5px] font-bold uppercase tracking-wider',
     invalid ? 'bg-destructive/5 text-destructive' : 'bg-muted/40 text-muted-foreground'
   );
 
@@ -71,6 +86,9 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
   fields,
   schema,
   shellSyntax,
+  collapsibleOptions = false,
+  optionsOpen: optionsOpenProp,
+  onOptionsOpenChange,
   onRun,
   onClearFilter,
   onClearProjection,
@@ -80,8 +98,53 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
   onSkipChange,
   onLimitChange,
 }) => {
+  // One configurable height (Settings → Appearance) for every row, so the
+  // query, projection and sort fields stay symmetric. rem keeps it tracking the
+  // interface scale.
+  const themeCtx = useThemeOptional();
+  // Two panes can show collection tabs at once, so the region id must be unique
+  // or both toggles' aria-controls resolve to the first one.
+  const optionsRegionId = `additional-query-options-container-${useId()}`;
+  // Option rows keep the compact height regardless of the setting.
+  const optionRowStyle = { height: `${QUERY_BAR_OPTION_HEIGHT / EDITOR_FONT_BASELINE_PX}rem` };
+  // The configured height applies only where the field itself is sized by it —
+  // QueryEditor keys that off `large`, which is `collapsibleOptions`. Without
+  // this gate the export view (no collapsibleOptions) would grow the QUERY label
+  // to the configured height while its input stayed compact.
+  const queryRowStyle = collapsibleOptions
+    ? {
+        height: `${
+          clampQueryBarHeight(themeCtx?.config.queryBarHeight ?? QUERY_BAR_HEIGHT_DEFAULT) /
+          EDITOR_FONT_BASELINE_PX
+        }rem`,
+      }
+    : optionRowStyle;
+
   const showPagination =
     skip !== undefined && limit !== undefined && !!onSkipChange && !!onLimitChange;
+
+  // An option holding a non-default value reveals the section, so a saved or
+  // restored query never hides part of itself behind a collapsed disclosure.
+  const hasOptionValues =
+    (projection.trim() !== '' && projection.trim() !== '{}') ||
+    (sort.trim() !== '' && sort.trim() !== '{}') ||
+    (showPagination && ((skip !== '0' && skip !== '') || (limit !== '50' && limit !== '')));
+  const [internalOptionsOpen, setInternalOptionsOpen] = useState(hasOptionValues);
+  const optionsOpen = optionsOpenProp ?? internalOptionsOpen;
+  const setOptionsOpen = (open: boolean) => {
+    setInternalOptionsOpen(open);
+    onOptionsOpenChange?.(open);
+  };
+  // Reveal only on the transition into having values — not on every mount, or a
+  // remount would undo a deliberate collapse that the host persisted.
+  const hadOptionValues = useRef(hasOptionValues);
+  useEffect(() => {
+    if (hasOptionValues && !hadOptionValues.current) setOptionsOpen(true);
+    hadOptionValues.current = hasOptionValues;
+  }, [hasOptionValues]);
+  // Rows are CSS-hidden rather than unmounted: Monaco keeps its model (and the
+  // fields stay queryable) instead of being torn down on every toggle.
+  const optionsVisible = !collapsibleOptions || optionsOpen;
 
   const runOnEnter = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
@@ -104,9 +167,10 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
     <div className="flex flex-col border-b border-border bg-muted/20">
       <div className="flex w-full border-b border-border">
         <div className={queryColClass(filterInvalid)}>
-          <span className={fieldBadgeClass(filterInvalid)}>Query</span>
+          <span className={fieldBadgeClass(filterInvalid)} style={queryRowStyle}>Query</span>
           <QueryEditor
             singleLine
+            large={collapsibleOptions}
             surface="filter"
             shellSyntax={shellSyntax}
             onRun={onRun}
@@ -126,12 +190,40 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
           >
             <Eraser size={11} />
           </Button>
+          {collapsibleOptions && (
+            <button
+              type="button"
+              data-testid="query-options-toggle"
+              aria-expanded={optionsOpen}
+              aria-controls={optionsRegionId}
+              aria-label={optionsOpen ? 'Fewer Options' : 'More Options'}
+              onClick={() => setOptionsOpen(!optionsOpen)}
+              title={optionsOpen ? 'Hide projection, sort, skip and limit' : 'Show projection, sort, skip and limit'}
+              className="mr-1 flex h-6 shrink-0 items-center gap-1 rounded px-1.5 text-[10px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              {optionsOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+              Options
+              {!optionsOpen && hasOptionValues && (
+                <span
+                  data-testid="query-options-dot"
+                  title="Projection, sort, skip or limit is set"
+                  className="ml-0.5 h-1.5 w-1.5 rounded-full bg-primary"
+                />
+              )}
+            </button>
+          )}
         </div>
       </div>
 
+      <div
+        id={optionsRegionId}
+        data-testid="query-options-section"
+        className={cn(!optionsVisible && 'hidden')}
+      >
+
       <div className="flex w-full border-b border-border">
         <div className={queryColClass(projectionInvalid)}>
-          <span className={fieldBadgeClass(projectionInvalid)}>Projection</span>
+          <span className={fieldBadgeClass(projectionInvalid)} style={optionRowStyle}>Projection</span>
           <QueryEditor
             singleLine
             surface="projection"
@@ -154,9 +246,13 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
             <Eraser size={11} />
           </Button>
         </div>
+      </div>
 
+      {/* Sort shares a row with skip/limit, the way Compass groups its
+          smaller options after giving `project` a row of its own. */}
+      <div className="flex w-full">
         <div className={queryColClass(sortInvalid)}>
-          <span className={fieldBadgeClass(sortInvalid)}>Sort</span>
+          <span className={fieldBadgeClass(sortInvalid)} style={optionRowStyle}>Sort</span>
           <QueryEditor
             singleLine
             surface="sort"
@@ -188,12 +284,11 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
             <Eraser size={11} />
           </Button>
         </div>
-      </div>
 
-      {showPagination && (
-        <div className="flex w-full">
+        {showPagination && (
+          <>
           <div className={queryColClass(false)}>
-            <span className={fieldBadgeClass(false)}>Skip</span>
+            <span className={fieldBadgeClass(false)} style={optionRowStyle}>Skip</span>
             <Input
               type="number"
               value={skip}
@@ -201,7 +296,8 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
               onKeyDown={runOnEnter}
               placeholder="0"
               min="0"
-              className="h-7 flex-1 min-w-0 border-0 bg-transparent px-2.5 font-mono text-[11.5px] shadow-none focus-visible:ring-0"
+              style={optionRowStyle}
+              className="flex-1 min-w-0 border-0 bg-transparent px-2.5 font-mono text-[11.5px] shadow-none focus-visible:ring-0"
             />
             {skip !== '0' && skip !== '' && (
               <Button
@@ -217,7 +313,7 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
           </div>
 
           <div className={queryColClass(false)}>
-            <span className={fieldBadgeClass(false)}>Limit</span>
+            <span className={fieldBadgeClass(false)} style={optionRowStyle}>Limit</span>
             <Input
               type="number"
               value={limit}
@@ -225,7 +321,8 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
               onKeyDown={runOnEnter}
               placeholder="50"
               min="1"
-              className="h-7 flex-1 min-w-0 border-0 bg-transparent px-2.5 font-mono text-[11.5px] shadow-none focus-visible:ring-0"
+              style={optionRowStyle}
+              className="flex-1 min-w-0 border-0 bg-transparent px-2.5 font-mono text-[11.5px] shadow-none focus-visible:ring-0"
             />
             {limit !== '50' && limit !== '' && (
               <Button
@@ -239,8 +336,10 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
               </Button>
             )}
           </div>
-        </div>
-      )}
+          </>
+        )}
+      </div>
+      </div>
     </div>
   );
 };

@@ -119,6 +119,7 @@ export function importThemeJson(json: string): ThemeConfig {
     fontSize: parsed.fontSize || 13,
     spacingDensity: parsed.spacingDensity || "cozy",
     uiZoom: parsed.uiZoom ?? 1,
+    queryBarHeight: parsed.queryBarHeight ?? 29,
   };
 }
 

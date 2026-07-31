@@ -57,6 +57,10 @@ export interface ThemeConfig {
   spacingDensity: SpacingDensity;
   /** User zoom multiplier (Cmd+/Cmd-), applied on top of auto DPI scale. */
   uiZoom: number;
+  /** Query-bar row height in design px at the default 13px root font. Applies
+   *  to the query, projection and sort rows alike so they stay symmetric; the
+   *  UI scale is applied on top. */
+  queryBarHeight: number;
 }
 
 export interface ThemePreset {
@@ -78,6 +82,7 @@ export const DEFAULT_THEME_CONFIG: ThemeConfig = {
   fontSize: 13,
   spacingDensity: "cozy",
   uiZoom: 1,
+  queryBarHeight: 29,
 };
 
 export interface AppearanceSettings {
@@ -89,6 +94,7 @@ export interface AppearanceSettings {
   font_size: number;
   spacing_density: string;
   ui_zoom?: number;
+  query_bar_height?: number;
 }
 
 export function themeConfigToAppearance(config: ThemeConfig): AppearanceSettings {
@@ -101,6 +107,7 @@ export function themeConfigToAppearance(config: ThemeConfig): AppearanceSettings
     font_size: config.fontSize,
     spacing_density: config.spacingDensity,
     ui_zoom: config.uiZoom,
+    query_bar_height: config.queryBarHeight,
   };
 }
 
@@ -124,6 +131,11 @@ export function appearanceToThemeConfig(
       typeof appearance.ui_zoom === "number" && !Number.isNaN(appearance.ui_zoom)
         ? appearance.ui_zoom
         : 1,
+    queryBarHeight:
+      typeof appearance.query_bar_height === "number" &&
+      !Number.isNaN(appearance.query_bar_height)
+        ? appearance.query_bar_height
+        : 29,
   };
 }
 
