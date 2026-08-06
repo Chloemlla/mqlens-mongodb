@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AIChatPanel } from './AIChatPanel';
+import { AIChatPanel, type ChatMessage } from './AIChatPanel';
 import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
 import { useCollectionSchema } from '../lib/useCollectionSchema';
@@ -37,7 +37,7 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from '@/components/ui/resizable';
-import type { Layout } from 'react-resizable-panels';
+import { useDefaultLayout, type Layout } from 'react-resizable-panels';
 import { cn } from '@/lib/utils';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 import {
@@ -210,6 +210,15 @@ interface DocumentViewerProps {
   /** Restored when remounting this tab's viewer (see App tab cache). */
   initialBuilderState?: BuilderState;
   onBuilderStateChange?: (state: BuilderState) => void;
+  /** Identifies this tab's chat so an in-flight AI request survives the
+   *  unmount that happens when the user switches tabs. */
+  chatSessionKey?: string;
+  /** Restored when remounting this tab's AI helper (see App tabChatCache). */
+  initialChatMessages?: ChatMessage[];
+  onChatMessagesChange?: (messages: ChatMessage[]) => void;
+  /** Whether the AI helper panel was open when this tab was last shown. */
+  initialAIHelperOpen?: boolean;
+  onAIHelperOpenChange?: (isOpen: boolean) => void;
   children?: React.ReactNode;
 }
 
@@ -535,6 +544,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   availableFields = [],
   initialBuilderState = DEFAULT_BUILDER_STATE,
   onBuilderStateChange,
+  chatSessionKey,
+  initialChatMessages = [],
+  onChatMessagesChange,
+  initialAIHelperOpen = false,
+  onAIHelperOpenChange,
   children
 }) => {
   const { prompt, toast } = useDialogs();
@@ -603,7 +617,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen, onBuilderStateChange]);
 
   // AI chat assistant — open/close only; the panel owns its own chat state.
-  const [isAIHelperOpen, setIsAIHelperOpen] = useState(false);
+  const [isAIHelperOpen, setIsAIHelperOpenState] = useState(initialAIHelperOpen);
+  const setIsAIHelperOpen = (open: boolean) => {
+    setIsAIHelperOpenState(open);
+    onAIHelperOpenChange?.(open);
+  };
 
   // Pipeline undo/redo: every stage mutation goes through commitStages, which
   // snapshots the previous list. Keystroke-level content edits coalesce via a
@@ -1365,6 +1383,24 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     return { 'document-main': 100 };
   }, [workspaceRightPanel]);
 
+  // Switching tabs unmounts this view, so without persistence the group fell
+  // back to the fixed 70/30 above every time and the user's drag was lost.
+  // `panelIds` keys the saved layout by which right-hand panel is open, so the
+  // query builder and the AI helper remember their own widths instead of
+  // fighting over one entry.
+  const workspacePanelIds = useMemo(() => {
+    if (workspaceRightPanel === 'query-builder') return ['document-main', 'query-builder'];
+    if (workspaceRightPanel === 'ai-helper') return ['document-main', 'ai-helper'];
+    return ['document-main'];
+  }, [workspaceRightPanel]);
+
+  const { defaultLayout: savedWorkspaceLayout, onLayoutChanged: saveWorkspaceLayout } =
+    useDefaultLayout({
+      id: 'document-viewer-workspace',
+      panelIds: workspacePanelIds,
+      storage: typeof localStorage === 'undefined' ? undefined : localStorage,
+    });
+
   return (
     <div className="relative flex h-full min-h-0 flex-col min-w-0">
       
@@ -1693,7 +1729,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       <ResizablePanelGroup
         id="document-viewer-workspace"
         orientation="horizontal"
-        defaultLayout={workspaceDefaultLayout}
+        defaultLayout={savedWorkspaceLayout ?? workspaceDefaultLayout}
+        onLayoutChanged={saveWorkspaceLayout}
         className="min-h-0 min-w-0 flex-1"
       >
         <ResizablePanel id="document-main" minSize="30%" className="flex min-h-0 flex-col">
@@ -2289,6 +2326,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <ResizableHandle withHandle data-testid="ai-helper-resizer" />
             <ResizablePanel id="ai-helper" minSize="18%" maxSize="50%" className="flex min-h-0 flex-col">
               <AIChatPanel
+                sessionKey={chatSessionKey}
                 variant="editor"
                 embedded
                 databaseName={databaseName}
@@ -2298,6 +2336,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 onClose={() => setIsAIHelperOpen(false)}
                 onInsertQuery={handleInsertQuery}
                 onInsertAndRunQuery={handleInsertAndRunQuery}
+                initialMessages={initialChatMessages}
+                onMessagesChange={onChatMessagesChange}
               />
             </ResizablePanel>
           </>
