@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useReducer } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { AppShell } from '@/components/layout/AppShell';
 import { StatusBar } from '@/components/layout/StatusBar';
 import { Toaster } from '@/components/ui/sonner';
@@ -101,7 +103,7 @@ import { cn } from '@/lib/utils';
 import { FolderCode, KeyRound, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
 import logoMark from './assets/logo-mark.svg';
 
-interface QueryTab {
+export interface QueryTab {
   id: string;
   type: 'collection' | 'index' | 'shell' | 'settings' | 'quickstart' | 'export' | 'import' | 'tasks' | 'schema' | 'create-view' | 'gridfs' | 'monitoring' | 'users' | 'dump' | 'restore' | 'validation' | 'generate';
   connectionId: string;
@@ -286,9 +288,10 @@ const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
   }
 };
 
-const tabLabelFor = (
+export const tabLabelFor = (
   tab: QueryTab,
-  connectionName: (connectionId: string) => string
+  connectionName: (connectionId: string) => string,
+  t: TFunction
 ): string => {
   switch (tab.type) {
     case 'index':
@@ -296,33 +299,33 @@ const tabLabelFor = (
     case 'shell':
       return `mongosh: ${tab.collection || tab.db}`;
     case 'settings':
-      return 'Settings';
+      return t('tabs.settings');
     case 'quickstart':
-      return 'Quick Start';
+      return t('tabs.quickStart');
     case 'export':
-      return `Export: ${tab.collection}`;
+      return t('tabs.export', { collection: tab.collection });
     case 'import':
-      return `Import: ${tab.collection}`;
+      return t('tabs.import', { collection: tab.collection });
     case 'tasks':
-      return 'Tasks';
+      return t('tabs.tasks');
     case 'schema':
-      return `Schema: ${tab.collection}`;
+      return t('tabs.schema', { collection: tab.collection });
     case 'create-view':
-      return `New View: ${tab.db}`;
+      return t('tabs.createView', { db: tab.db });
     case 'gridfs':
-      return `GridFS: ${tab.collection}`;
+      return t('tabs.gridfs', { collection: tab.collection });
     case 'monitoring':
-      return `Monitor: ${connectionName(tab.connectionId)}`;
+      return t('tabs.monitor', { name: connectionName(tab.connectionId) });
     case 'users':
-      return `Users: ${connectionName(tab.connectionId)}`;
+      return t('tabs.users', { name: connectionName(tab.connectionId) });
     case 'dump':
-      return `Dump: ${tab.db || connectionName(tab.connectionId)}`;
+      return t('tabs.dump', { name: tab.db || connectionName(tab.connectionId) });
     case 'restore':
-      return `Restore: ${connectionName(tab.connectionId)}`;
+      return t('tabs.restore', { name: connectionName(tab.connectionId) });
     case 'validation':
-      return `Validation: ${tab.collection}`;
+      return t('tabs.validation', { collection: tab.collection });
     case 'generate':
-      return `Generate: ${tab.collection || tab.db}`;
+      return t('tabs.generate', { name: tab.collection || tab.db });
     default:
       return tab.collection;
   }
@@ -361,18 +364,23 @@ const CONNECTION_TAB_TYPES = new Set<QueryTab['type']>([
  * isn't in the flat `tabs[]` list — e.g. a not-yet-mirrored write race);
  * callers fall back to the bare window id in that case.
  */
-function activeTabHintFor(win: PersistedWindow, allTabs: PersistedTab[]): string | null {
+function activeTabHintFor(win: PersistedWindow, allTabs: PersistedTab[], t: TFunction): string | null {
   const pane = findPane(win.splitTree, win.focusedPaneId);
   const activeId = pane?.activeTabId;
   if (!activeId) return null;
   const tab = allTabs.find((t) => t.id === activeId);
   if (!tab) return null;
-  if (tab.type === 'quickstart') return 'Quick Start';
+  if (tab.type === 'quickstart') return t('tabs.quickStart');
   return tab.collection || tab.type;
 }
 
 function Workspace() {
   const { toast, confirm, prompt } = useDialogs();
+  const { t } = useTranslation('common');
+  // Command palette action titles/keywords live in `shell` alongside the
+  // rest of the palette's copy (see src/locales/{en,de}/shell.json), not
+  // `common` — a second hook since `t` above is bound to `common`.
+  const { t: tShell, i18n: shellI18n } = useTranslation('shell');
   const { config, resolvedMode, setMode, setSpacingDensity, resetZoom } = useTheme();
   const density = config.spacingDensity;
   // Phase 3 Task 4: every window runs this same component — `isMainWindow`
@@ -875,7 +883,7 @@ function Workspace() {
       rebindProfileTabs(profile.id, id);
       return id;
     } catch (e) {
-      toast(`Could not connect to ${profile.name}: ${(e as any)?.message || String(e)}`, 'error');
+      toast(t('toast.couldNotConnectToProfile', { name: profile.name, detail: (e as any)?.message || String(e) }), 'error');
       return null;
     }
   };
@@ -887,7 +895,7 @@ function Workspace() {
       const id = await invoke<string>('connect_db', { uri: 'mongodb://mock', ssh: null });
       addActiveConnection(id, 'Sample (mqlens_demo)', 'mongodb://mock', SAMPLE_ID);
     } catch (e) {
-      toast(`Could not load sample data: ${(e as any)?.message || String(e)}`, 'error');
+      toast(t('toast.couldNotLoadSampleData', { detail: (e as any)?.message || String(e) }), 'error');
     }
   };
   const [isIndexModalOpen, setIsIndexModalOpen] = useState(false);
@@ -1067,8 +1075,10 @@ function Workspace() {
   // Copy → clipboard (no dialog); Paste-here opens the dialog pre-filled with that target.
   const handleCopyToClipboard = (connectionId: string, db: string, collections: string[]) => {
     setCopyClipboard({ connectionId, db, collections });
-    const what = collections.length === 0 ? `database ${db}` : `${collections.length} collection(s)`;
-    toast(`Copied ${what} — right-click a target and choose “Paste here”.`, 'success');
+    const what = collections.length === 0
+      ? t('toast.copyWhatDatabase', { db })
+      : t('toast.copyWhatCollections', { count: collections.length });
+    toast(t('toast.copiedToClipboard', { what }), 'success');
   };
   const handlePasteInto = (connectionId: string, db?: string) => {
     if (!copyClipboard) return;
@@ -1081,7 +1091,7 @@ function Workspace() {
       await loadExportTasks();
       return true;
     } catch (err: any) {
-      toast(`Could not cancel: ${err?.message || err}`, 'error');
+      toast(t('toast.couldNotCancelTask', { detail: err?.message || err }), 'error');
       return false;
     }
   };
@@ -1539,10 +1549,10 @@ function Workspace() {
         insertExportTasks([task]);
         await loadExportTasks();
       } catch (err: any) {
-        toast(`Could not start tool install: ${err?.message || err}`, 'error');
+        toast(t('toast.couldNotStartToolInstall', { detail: err?.message || err }), 'error');
       }
     },
-    [loadExportTasks, toast]
+    [loadExportTasks, toast, t]
   );
 
   const handleCancelToolInstall = React.useCallback(() => {
@@ -1698,7 +1708,7 @@ function Workspace() {
       handleOpenTasksTab();
       await loadExportTasks();
     } catch (err: any) {
-      toast(`Dump failed to start: ${err?.message || err}`, 'error');
+      toast(t('toast.dumpFailedToStart', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -1715,7 +1725,7 @@ function Workspace() {
       handleOpenTasksTab();
       await loadExportTasks();
     } catch (err: any) {
-      toast(`Restore failed to start: ${err?.message || err}`, 'error');
+      toast(t('toast.restoreFailedToStart', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -1757,7 +1767,7 @@ function Workspace() {
       // `handleOpenTasksTab()`.
       await loadExportTasks();
     } catch (err: any) {
-      toast(`Generate failed to start: ${err?.message || err}`, 'error');
+      toast(t('toast.generateFailedToStart', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -2066,7 +2076,7 @@ function Workspace() {
       // Automatically open/focus the new index tab!
       handleSelectIndex(connectionId, db, collection, indexName);
     } catch (err: any) {
-      toast(`Failed to save index: ${err}`, 'error');
+      toast(t('toast.failedToSaveIndex', { detail: err }), 'error');
     }
   };
 
@@ -2086,7 +2096,7 @@ function Workspace() {
       // Trigger sidebar refresh
       setIndexMutationTrigger(prev => prev + 1);
     } catch (err: any) {
-      toast(`Failed to delete index: ${err}`, 'error');
+      toast(t('toast.failedToDeleteIndex', { detail: err }), 'error');
     }
   };
 
@@ -2335,7 +2345,7 @@ function Workspace() {
   // by a single disabled, explanatory entry.
   const buildTabContextMenuItems = (tabId: string): ContextMenuItem[] => {
     if (unmirroredTabIdsRef.current.has(tabId)) {
-      const explanation = 'Export/import tabs stay in their window';
+      const explanation = tShell('workspaceTabBar.contextMenu.unmirroredExplanation');
       return [{ label: explanation, onClick: () => {}, disabled: true, title: explanation }];
     }
 
@@ -2344,7 +2354,7 @@ function Workspace() {
     const dupSource = tabs.find((t) => t.id === tabId && t.type === 'collection');
     if (dupSource) {
       items.push({
-        label: 'Duplicate Tab',
+        label: tShell('workspaceTabBar.contextMenu.duplicateTab'),
         icon: <Copy />,
         onClick: () => handleDuplicateTab(tabId),
       });
@@ -2352,7 +2362,7 @@ function Workspace() {
 
     if (allTabIds(layout).length > 1) {
       items.push({
-        label: 'Detach to New Window',
+        label: tShell('workspaceTabBar.contextMenu.detachToNewWindow'),
         icon: <ExternalLink />,
         separatorBefore: items.length > 0,
         onClick: () => handleDetachTab(tabId),
@@ -2366,9 +2376,10 @@ function Workspace() {
     // first "Move to" entry would render an orphan divider line at the very
     // top of the menu.
     otherWindows.forEach((w, i) => {
-      const hint = activeTabHintFor(w, allTabs);
+      const hint = activeTabHintFor(w, allTabs, t);
+      const target = hint ? `${w.id} (${hint})` : w.id;
       items.push({
-        label: `Move to ${hint ? `${w.id} (${hint})` : w.id}`,
+        label: tShell('workspaceTabBar.contextMenu.moveToWindow', { target }),
         icon: <MoveRight />,
         separatorBefore: i === 0 && items.length > 0,
         onClick: () => handleMoveTab(tabId, w.id),
@@ -2437,6 +2448,7 @@ function Workspace() {
       activeConnections.map(c => `${c.id}:${c.name}`).join('|'),
       collTabs.map(t => `${t.id}:${t.connectionId}:${t.db}:${t.collection}`).join('|'),
       paletteNamespaceScope,
+      shellI18n.language,
     ].join('::');
     if (paletteDynamicLoadKey.current === loadKey) return;
     paletteDynamicLoadKey.current = loadKey;
@@ -2453,7 +2465,7 @@ function Workspace() {
             id: `coll:${ns.connectionId}:${ns.db}:${coll}`,
             title: coll,
             hint: `${ns.connectionName} · ${ns.db}`,
-            keywords: `collection ${ns.db} ${ns.connectionName}`,
+            keywords: tShell('commandPalette.dynamic.collectionKeywords', { db: ns.db, connectionName: ns.connectionName }),
             run: () => { void handleSelectCollection(ns.connectionId, ns.db, coll); },
           });
         }
@@ -2468,9 +2480,9 @@ function Workspace() {
           for (const s of cq.saved) {
             items.push({
               id: `saved:${t.id}:${s.id}`,
-              title: `Saved query: ${s.name}`,
+              title: tShell('commandPalette.dynamic.savedQueryTitle', { name: s.name }),
               hint: `${t.db}.${t.collection}`,
-              keywords: `saved query ${t.collection} ${t.db}`,
+              keywords: tShell('commandPalette.dynamic.savedQueryKeywords', { collection: t.collection, db: t.db }),
               run: () => { void handleSelectCollection(t.connectionId, t.db, t.collection, s.query); },
             });
           }
@@ -2480,33 +2492,33 @@ function Workspace() {
     })();
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shouldLoadPaletteDynamic, activeConnections, tabs, paletteNamespaceScope]);
+  }, [shouldLoadPaletteDynamic, activeConnections, tabs, paletteNamespaceScope, shellI18n.language]);
 
   const paletteActions: PaletteAction[] = [
-    { id: 'new-connection', title: 'New Connection…', keywords: 'connect database add server', run: () => setIsConnectionModalOpen(true) },
-    { id: 'toggle-theme', title: 'Toggle Light/Dark Theme', keywords: 'appearance color mode', run: toggleTheme },
-    { id: 'open-settings', title: 'Open Settings', keywords: 'preferences config density', run: handleOpenSettingsTab },
-    { id: 'open-quickstart', title: 'Open Quick Start', keywords: 'welcome home help', run: openQuickStartTab },
-    { id: 'refresh-palette-index', title: 'Refresh Command Palette Index', keywords: 'reload databases collections namespaces cache stale', run: () => invalidatePaletteNamespaceIndex() },
-    { id: 'density-roomy', title: 'Density: Roomy', keywords: 'layout spacing', run: () => setSpacingDensity('roomy') },
-    { id: 'density-cozy', title: 'Density: Cozy', keywords: 'layout spacing', run: () => setSpacingDensity('cozy') },
-    { id: 'density-compact', title: 'Density: Compact', keywords: 'layout spacing dense', run: () => setSpacingDensity('compact') },
+    { id: 'new-connection', title: tShell('commandPalette.paletteActions.newConnection.title'), keywords: tShell('commandPalette.paletteActions.newConnection.keywords'), run: () => setIsConnectionModalOpen(true) },
+    { id: 'toggle-theme', title: tShell('commandPalette.paletteActions.toggleTheme.title'), keywords: tShell('commandPalette.paletteActions.toggleTheme.keywords'), run: toggleTheme },
+    { id: 'open-settings', title: tShell('commandPalette.paletteActions.openSettings.title'), keywords: tShell('commandPalette.paletteActions.openSettings.keywords'), run: handleOpenSettingsTab },
+    { id: 'open-quickstart', title: tShell('commandPalette.paletteActions.openQuickstart.title'), keywords: tShell('commandPalette.paletteActions.openQuickstart.keywords'), run: openQuickStartTab },
+    { id: 'refresh-palette-index', title: tShell('commandPalette.paletteActions.refreshPaletteIndex.title'), keywords: tShell('commandPalette.paletteActions.refreshPaletteIndex.keywords'), run: () => invalidatePaletteNamespaceIndex() },
+    { id: 'density-roomy', title: tShell('commandPalette.paletteActions.densityRoomy.title'), keywords: tShell('commandPalette.paletteActions.densityRoomy.keywords'), run: () => setSpacingDensity('roomy') },
+    { id: 'density-cozy', title: tShell('commandPalette.paletteActions.densityCozy.title'), keywords: tShell('commandPalette.paletteActions.densityCozy.keywords'), run: () => setSpacingDensity('cozy') },
+    { id: 'density-compact', title: tShell('commandPalette.paletteActions.densityCompact.title'), keywords: tShell('commandPalette.paletteActions.densityCompact.keywords'), run: () => setSpacingDensity('compact') },
     ...(activeTab && activeTab.type === 'collection' ? [
-      { id: 'open-shell', title: 'Open mongosh Shell', hint: `${activeTab.db}.${activeTab.collection}`, keywords: 'terminal mongosh script', run: () => handleOpenShell(activeTab.connectionId, activeTab.db, activeTab.collection) },
-      { id: 'export-collection', title: 'Export Collection…', hint: `${activeTab.db}.${activeTab.collection}`, keywords: 'download json csv import', run: () => handleOpenExportTab(activeTab) },
-      { id: 'analyze-schema', title: 'Analyze Schema', hint: `${activeTab.db}.${activeTab.collection}`, keywords: 'fields types', run: () => handleOpenSchemaTab(activeTab.connectionId, activeTab.db, activeTab.collection) },
+      { id: 'open-shell', title: tShell('commandPalette.paletteActions.openShell.title'), hint: `${activeTab.db}.${activeTab.collection}`, keywords: tShell('commandPalette.paletteActions.openShell.keywords'), run: () => handleOpenShell(activeTab.connectionId, activeTab.db, activeTab.collection) },
+      { id: 'export-collection', title: tShell('commandPalette.paletteActions.exportCollection.title'), hint: `${activeTab.db}.${activeTab.collection}`, keywords: tShell('commandPalette.paletteActions.exportCollection.keywords'), run: () => handleOpenExportTab(activeTab) },
+      { id: 'analyze-schema', title: tShell('commandPalette.paletteActions.analyzeSchema.title'), hint: `${activeTab.db}.${activeTab.collection}`, keywords: tShell('commandPalette.paletteActions.analyzeSchema.keywords'), run: () => handleOpenSchemaTab(activeTab.connectionId, activeTab.db, activeTab.collection) },
     ] : []),
-    ...(activeTabId ? [{ id: 'close-tab', title: 'Close Tab', keywords: 'tab', run: () => closeTabById(activeTabId) }] : []),
+    ...(activeTabId ? [{ id: 'close-tab', title: tShell('commandPalette.paletteActions.closeTab.title'), keywords: tShell('commandPalette.paletteActions.closeTab.keywords'), run: () => closeTabById(activeTabId) }] : []),
     ...(focusedPane && focusedPane.tabIds.length > 1 ? [
-      { id: 'next-tab', title: 'Next Tab', keywords: 'tab switch', run: () => cycleTab(1) },
-      { id: 'prev-tab', title: 'Previous Tab', keywords: 'tab switch', run: () => cycleTab(-1) },
+      { id: 'next-tab', title: tShell('commandPalette.paletteActions.nextTab.title'), keywords: tShell('commandPalette.paletteActions.nextTab.keywords'), run: () => cycleTab(1) },
+      { id: 'prev-tab', title: tShell('commandPalette.paletteActions.prevTab.title'), keywords: tShell('commandPalette.paletteActions.prevTab.keywords'), run: () => cycleTab(-1) },
     ] : []),
     ...(activeTabId && focusedPane && focusedPane.tabIds.length > 1 ? [
-      { id: 'workspace.split-right', title: 'Split Right', keywords: 'workspace pane layout', run: () => dispatchWorkspace({ type: 'split_pane', paneId: focusedPane.id, dir: 'row', side: 'end', moveTabId: activeTabId }) },
-      { id: 'workspace.split-down', title: 'Split Down', keywords: 'workspace pane layout', run: () => dispatchWorkspace({ type: 'split_pane', paneId: focusedPane.id, dir: 'col', side: 'end', moveTabId: activeTabId }) },
+      { id: 'workspace.split-right', title: tShell('commandPalette.paletteActions.splitRight.title'), keywords: tShell('commandPalette.paletteActions.splitRight.keywords'), run: () => dispatchWorkspace({ type: 'split_pane', paneId: focusedPane.id, dir: 'row', side: 'end', moveTabId: activeTabId }) },
+      { id: 'workspace.split-down', title: tShell('commandPalette.paletteActions.splitDown.title'), keywords: tShell('commandPalette.paletteActions.splitDown.keywords'), run: () => dispatchWorkspace({ type: 'split_pane', paneId: focusedPane.id, dir: 'col', side: 'end', moveTabId: activeTabId }) },
     ] : []),
     ...(allPanes(layout.root).length > 1 ? [
-      { id: 'workspace.focus-next-pane', title: 'Focus Next Pane', keywords: 'workspace pane layout switch', run: () => {
+      { id: 'workspace.focus-next-pane', title: tShell('commandPalette.paletteActions.focusNextPane.title'), keywords: tShell('commandPalette.paletteActions.focusNextPane.keywords'), run: () => {
         const panes = allPanes(layout.root);
         const i = panes.findIndex(p => p.id === layout.focusedPaneId);
         dispatchWorkspace({ type: 'focus_pane', paneId: panes[(i + 1) % panes.length].id });
@@ -2514,17 +2526,17 @@ function Workspace() {
     ] : []),
     ...activeConnections.map(c => ({
       id: `monitoring:${c.id}`,
-      title: `Open Monitoring: ${c.name}`,
-      keywords: 'monitoring metrics server status profiler',
+      title: tShell('commandPalette.paletteActions.openMonitoring.title', { name: c.name }),
+      keywords: tShell('commandPalette.paletteActions.openMonitoring.keywords'),
       run: () => handleOpenMonitoringTab(c.id),
     })),
     ...activeConnections.map(c => ({
       id: `users:${c.id}`,
-      title: `Manage Users: ${c.name}`,
-      keywords: 'users roles access permissions authentication admin',
+      title: tShell('commandPalette.paletteActions.manageUsers.title', { name: c.name }),
+      keywords: tShell('commandPalette.paletteActions.manageUsers.keywords'),
       run: () => handleOpenUsersTab(c.id),
     })),
-    { id: 'check-updates', title: 'Check for Updates', keywords: 'version upgrade release', run: () => window.dispatchEvent(new Event(CHECK_UPDATE_EVENT)) },
+    { id: 'check-updates', title: tShell('commandPalette.paletteActions.checkUpdates.title'), keywords: tShell('commandPalette.paletteActions.checkUpdates.keywords'), run: () => window.dispatchEvent(new Event(CHECK_UPDATE_EVENT)) },
     ...paletteDynamicItems,
   ];
 
@@ -2603,16 +2615,19 @@ function Workspace() {
       const writeStage = detectAggregateWriteStage(pipeline);
       if (writeStage.hasWriteStage) {
         const ok = await confirmByTypedName(prompt, {
-          title: 'Run aggregation',
+          title: t('documents:documentViewer.dialogs.runAggregate.title'),
           kind: 'collection',
           // Fall back to a "type CONFIRM" prompt when the $out/$merge
           // target couldn't be extracted cleanly (e.g. an unrecognized
-          // shape) rather than silently under-matching a name.
+          // shape) rather than silently under-matching a name. `expectedName`
+          // is compared verbatim against what the user types (see
+          // `confirmByTypedName`'s doc comment) — it must stay the raw
+          // collection name/`'CONFIRM'`, never a translated string.
           expectedName: writeStage.target ?? 'CONFIRM',
           message: writeStage.target
-            ? `This pipeline writes into "${writeStage.target}" ($out/$merge) on a safeguarded connection.\n\nType the target collection name to confirm.`
-            : 'This pipeline writes to a collection via $out/$merge on a safeguarded connection, but the target could not be determined automatically.\n\nType CONFIRM to proceed.',
-        });
+            ? t('documents:documentViewer.dialogs.runAggregate.messageWithTarget', { target: writeStage.target })
+            : t('documents:documentViewer.dialogs.runAggregate.messageUnknownTarget'),
+        }, t);
         if (!ok) return;
         confirmed = true;
       }
@@ -3019,7 +3034,7 @@ function Workspace() {
         const profiles = await invoke<ConnectionProfile[]>('load_connection_profiles');
         const profile = profiles.find((p) => p.id === profileId);
         if (!profile) {
-          patchReconnectState(profileId, { busy: false, error: 'Connection profile no longer exists' });
+          patchReconnectState(profileId, { busy: false, error: t('shell:reconnectBanner.profileMissing') });
           return;
         }
 
@@ -3107,7 +3122,7 @@ function Workspace() {
     const docs = targetTab.type === 'collection' ? targetTab.results || [] : [];
     if (scope === 'current' && docs.length === 0) return;
     if (scope === 'filtered' && !query) {
-      toast('No query to export — edit the filter first.', 'error');
+      toast(t('toast.noQueryToExport'), 'error');
       return;
     }
     try {
@@ -3159,9 +3174,9 @@ function Workspace() {
       // format (including bson/xlsx binary output) so the frontend just forwards
       // the in-memory docs and lets it write the file.
       await invoke('format_current_docs', { docs, format, options, path });
-      toast(`Exported ${docs.length} document(s) to ${path}`, 'success');
+      toast(t('toast.exportedDocuments', { count: docs.length, path }), 'success');
     } catch (err: any) {
-      toast(`Export failed: ${err?.message || err}`, 'error');
+      toast(t('toast.exportFailed', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -3183,9 +3198,9 @@ function Workspace() {
         path: null,
       });
       if (text) await navigator.clipboard.writeText(text);
-      toast(`Copied ${sourceTab.results.length} document(s) as ${format.toUpperCase()}`, 'success');
+      toast(t('toast.copiedDocumentsAs', { count: sourceTab.results.length, format: format.toUpperCase() }), 'success');
     } catch (err: any) {
-      toast(`Copy failed: ${err?.message || err}`, 'error');
+      toast(t('toast.copyFailed', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -3272,14 +3287,14 @@ function Workspace() {
 
   const handleDeleteDocument = async (tab: QueryTab, doc: Record<string, any>) => {
     if (doc._id === undefined) {
-      toast('Cannot delete: this document has no _id.', 'error');
+      toast(t('toast.cannotDeleteNoId'), 'error');
       return;
     }
     if (
       !(await confirm({
-        title: 'Delete document',
-        message: 'Delete this document? This cannot be undone.',
-        confirmLabel: 'Delete',
+        title: t('documents:dataGrid.actions.deleteDocument'),
+        message: t('documents:dataGrid.dialogs.deleteDocument.body'),
+        confirmLabel: t('documents:dataGrid.dialogs.deleteDocument.confirmLabel'),
         destructive: true,
       }))
     )
@@ -3292,9 +3307,9 @@ function Workspace() {
         filter: JSON.stringify({ _id: doc._id }),
       });
       await refreshTabResults(tab);
-      toast(`Document deleted from ${tab.collection}`, 'success', { title: 'Deleted' });
+      toast(t('toast.documentDeletedFrom', { collection: tab.collection }), 'success', { title: t('toast.deletedTitle') });
     } catch (err: any) {
-      toast(`Failed to delete document: ${err}`, 'error');
+      toast(t('toast.failedToDeleteDocument', { detail: err }), 'error');
     }
   };
 
@@ -3303,10 +3318,20 @@ function Workspace() {
   const isEmptyFilterStr = (f: string) => {
     try { return Object.keys(JSON.parse(f)).length === 0; } catch { return false; }
   };
-  const bulkConfirmMessage = (verb: string, count: number, filter: string) => {
-    const base = `${verb} ${count} document(s) matching:\n${filter}`;
+  // Each action gets its own complete-sentence catalog key
+  // (documents:dataGrid.dialogs.<action>.body), interpolated with count/filter,
+  // rather than splicing an English verb phrase (e.g. 'Delete', 'Apply this
+  // update to') into a shared template: German verb placement differs from
+  // English, so a fragment-concatenation approach can't produce correct
+  // German no matter how the fragments are translated. The "affects ALL"
+  // warning is a separate, independent sentence appended after a blank line
+  // (not glued mid-sentence), so it's safe to keep as its own shared key.
+  const bulkConfirmMessage = (action: 'delete' | 'update', count: number, filter: string) => {
+    const base = action === 'delete'
+      ? t('documents:dataGrid.dialogs.deleteMany.body', { count, filter })
+      : t('documents:dataGrid.dialogs.updateMany.body', { count, filter });
     return isEmptyFilterStr(filter)
-      ? `${base}\n\n⚠ This affects ALL ${count} documents in the collection.`
+      ? `${base}${t('documents:dataGrid.dialogs.bulkAllWarning', { count })}`
       : base;
   };
 
@@ -3332,18 +3357,20 @@ function Workspace() {
       let confirmed = false;
       if (mode === 'confirm_destructive') {
         const ok = await confirmByTypedName(prompt, {
-          title: 'Delete many',
+          title: t('documents:dataGrid.dialogs.deleteMany.title'),
           kind: 'collection',
+          // Raw collection name — compared verbatim against the user's
+          // typed input by confirmByTypedName, never a translated string.
           expectedName: tab.collection,
-          message: `${bulkConfirmMessage('Delete', count, filter)}\n\nType the collection name to confirm.`,
-        });
+          message: `${bulkConfirmMessage('delete', count, filter)}${t('documents:dataGrid.dialogs.typeCollectionNameSuffix')}`,
+        }, t);
         if (!ok) return;
         confirmed = true;
       } else if (
         !(await confirm({
-          title: 'Delete many',
-          message: bulkConfirmMessage('Delete', count, filter),
-          confirmLabel: 'Delete',
+          title: t('documents:dataGrid.dialogs.deleteMany.title'),
+          message: bulkConfirmMessage('delete', count, filter),
+          confirmLabel: t('documents:dataGrid.dialogs.deleteMany.confirmLabel'),
           destructive: true,
         }))
       ) {
@@ -3357,9 +3384,9 @@ function Workspace() {
         confirmed,
       });
       await refreshTabResults(tab);
-      toast(`Deleted ${deleted} document(s)`, 'success', { title: 'Deleted' });
+      toast(t('toast.deletedDocuments', { count: deleted }), 'success', { title: t('toast.deletedTitle') });
     } catch (err: any) {
-      toast(`Delete failed: ${err?.message || err}`, 'error');
+      toast(t('toast.deleteFailed', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -3367,21 +3394,21 @@ function Workspace() {
     if (tab.type !== 'collection') return;
     const filter = bulkFilter(tab);
     const update = await prompt({
-      title: 'Update many',
-      message: 'Update document (operators, e.g. {"$set": {...}}):',
+      title: t('documents:dataGrid.dialogs.updateMany.title'),
+      message: t('documents:dataGrid.dialogs.updateMany.promptMessage'),
       defaultValue: '{ "$set": {} }',
       validate: (v) => {
         let parsed: any;
         try {
           parsed = JSON.parse(v);
         } catch {
-          return 'Invalid JSON';
+          return t('documents:dataGrid.dialogs.updateMany.validation.invalidJson');
         }
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          return 'Update must be a JSON object';
+          return t('documents:dataGrid.dialogs.updateMany.validation.mustBeObject');
         }
         if (Object.keys(parsed).length === 0 || !Object.keys(parsed).every((k) => k.startsWith('$'))) {
-          return 'Update must use operators like $set';
+          return t('documents:dataGrid.dialogs.updateMany.validation.mustUseOperators');
         }
         return null;
       },
@@ -3399,18 +3426,20 @@ function Workspace() {
       let confirmed = false;
       if (mode === 'confirm_destructive') {
         const ok = await confirmByTypedName(prompt, {
-          title: 'Update many',
+          title: t('documents:dataGrid.dialogs.updateMany.title'),
           kind: 'collection',
+          // Raw collection name — compared verbatim against the user's
+          // typed input by confirmByTypedName, never a translated string.
           expectedName: tab.collection,
-          message: `${bulkConfirmMessage('Apply this update to', count, filter)}\n\nType the collection name to confirm.`,
-        });
+          message: `${bulkConfirmMessage('update', count, filter)}${t('documents:dataGrid.dialogs.typeCollectionNameSuffix')}`,
+        }, t);
         if (!ok) return;
         confirmed = true;
       } else if (
         !(await confirm({
-          title: 'Update many',
-          message: bulkConfirmMessage('Apply this update to', count, filter),
-          confirmLabel: 'Update',
+          title: t('documents:dataGrid.dialogs.updateMany.title'),
+          message: bulkConfirmMessage('update', count, filter),
+          confirmLabel: t('documents:dataGrid.dialogs.updateMany.confirmLabel'),
           destructive: true,
         }))
       ) {
@@ -3425,9 +3454,9 @@ function Workspace() {
         confirmed,
       });
       await refreshTabResults(tab);
-      toast(`Modified ${modified} document(s)`, 'success', { title: 'Updated' });
+      toast(t('toast.modifiedDocuments', { count: modified }), 'success', { title: t('toast.updatedTitle') });
     } catch (err: any) {
-      toast(`Update failed: ${err?.message || err}`, 'error');
+      toast(t('toast.updateFailed', { detail: err?.message || err }), 'error');
     }
   };
 
@@ -3445,13 +3474,15 @@ function Workspace() {
       });
       setDocumentModal(null);
       await refreshTabResults(tab);
-      toast(`Document inserted into ${collection}`, 'success', { title: 'Inserted' });
+      toast(t('toast.documentInsertedInto', { collection }), 'success', { title: t('toast.insertedTitle') });
       return;
     }
 
     const target = documentModal.targetDoc;
     if (!target || target._id === undefined) {
-      throw new Error('Cannot update: this document has no _id.');
+      // DocumentEditModal catches this and renders `err.message` straight into
+      // its error banner, so the text is user-facing copy, not a dev invariant.
+      throw new Error(t('documents:editModal.errors.noId'));
     }
     await invoke('update_document', {
       id: tab.connectionId,
@@ -3462,7 +3493,7 @@ function Workspace() {
     });
     setDocumentModal(null);
     await refreshTabResults(tab);
-    toast(`Document saved in ${collection}`, 'success', { title: 'Saved' });
+    toast(t('toast.documentSavedIn', { collection }), 'success', { title: t('toast.savedTitle') });
   };
 
   const handleExplainQuery = async (tab: QueryTab, filter: string): Promise<string> => {
@@ -3587,12 +3618,12 @@ function Workspace() {
               <div className="flex min-h-0 flex-1 flex-col min-w-0 overflow-hidden">
                 {tab.error && (
                   <div className="p-3 bg-destructive/10 border-b border-border text-destructive font-mono text-xs select-text flex items-start gap-2">
-                    <span className="flex-grow">Error loading dataset: {tab.error}</span>
+                    <span className="flex-grow">{t('documents:errors.loadingDataset', { detail: tab.error })}</span>
                     <Button
                       variant="outline"
                       size="sm"
                       className="shrink-0"
-                      title="Copy error message"
+                      title={t('documents:dataGrid.dialogs.copyErrorMessage')}
                       onClick={() => { try { navigator.clipboard?.writeText(String(tab.error)); } catch { /* clipboard unavailable */ } }}
                     >
                       <Copy size={11} />
@@ -3604,7 +3635,7 @@ function Workspace() {
                   <div className="flex-grow flex items-center justify-center text-muted-foreground bg-background">
                     <div className="flex flex-col items-center gap-2 select-none">
                       <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary"></div>
-                      <span className="text-xs">Streaming documents asynchronously...</span>
+                      <span className="text-xs">{t('documents:dataGrid.labels.streamingDocuments')}</span>
                     </div>
                   </div>
                 ) : (
@@ -3736,7 +3767,10 @@ function Workspace() {
               onPickFile={async () => {
                 const p = await open({
                   multiple: false,
-                  filters: [{ name: 'Data', extensions: ['json', 'jsonl', 'ndjson', 'csv', 'bson'] }],
+                  // Display label for the native OS file-type filter dropdown
+                  // only (Tauri's dialog plugin) — not an identifier compared
+                  // or dispatched anywhere, so safe to translate.
+                  filters: [{ name: t('transfer:importView.source.fileFilterName'), extensions: ['json', 'jsonl', 'ndjson', 'csv', 'bson'] }],
                 });
                 return typeof p === 'string' ? p : null;
               }}
@@ -3763,7 +3797,7 @@ function Workspace() {
                   handleOpenTasksTab();
                   await loadExportTasks();
                 } catch (err: any) {
-                  toast(`Import failed to start: ${err?.message || err}`, 'error');
+                  toast(t('toast.importFailedToStart', { detail: err?.message || err }), 'error');
                 }
               }}
             />
@@ -3840,9 +3874,9 @@ function Workspace() {
         {tab.type === 'tasks' && (
           <div className="flex h-full flex-col overflow-auto p-4" data-testid="tasks-view">
             <header className="mb-3">
-              <h2 className="text-sm font-semibold text-foreground">Tasks</h2>
+              <h2 className="text-sm font-semibold text-foreground">{tShell('taskManager.header.title')}</h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                Background copy and export jobs.
+                {tShell('taskManager.header.subtitle')}
               </p>
             </header>
             <TaskManager
@@ -3914,8 +3948,8 @@ function Workspace() {
           {bannerIsReadOnly ? <Lock size={12} className="shrink-0" /> : <ShieldAlert size={12} className="shrink-0" />}
           <span>
             {bannerIsReadOnly
-              ? 'Read-only connection — writes are blocked'
-              : 'Production safeguard — destructive operations require confirmation'}
+              ? tShell('connectionModeBanner.readOnly')
+              : tShell('connectionModeBanner.guarded')}
           </span>
         </div>
         <div className="min-h-0 flex-1">{body}</div>
@@ -3931,12 +3965,12 @@ function Workspace() {
       </div>
       <h1 className="text-2xl font-semibold text-foreground">MQLens</h1>
       <p className="max-w-md text-sm text-muted-foreground">
-        No active connection. Connect to a MongoDB cluster to browse collections and run queries.
+        {tShell('emptyWorkspace.noConnection')}
       </p>
 
       <Button onClick={() => setIsConnectionModalOpen(true)}>
         <Play size={14} className="mr-1.5" fill="currentColor" />
-        Connect to Database...
+        {tShell('emptyWorkspace.connectButton')}
       </Button>
     </div>
   );
@@ -4140,7 +4174,7 @@ function Workspace() {
           pane.tabIds
             .map(id => tabs.find(t => t.id === id))
             .filter((t): t is QueryTab => !!t)
-            .map(t => ({ id: t.id, label: tabLabelFor(t, connectionNameFor), icon: tabIconFor(t, t.id === pane.activeTabId) }))
+            .map(tab => ({ id: tab.id, label: tabLabelFor(tab, connectionNameFor, t), icon: tabIconFor(tab, tab.id === pane.activeTabId) }))
         }
         renderTabContent={renderTabContent}
         renderEmptyPane={renderEmptyPane}

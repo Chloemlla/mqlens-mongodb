@@ -93,6 +93,13 @@ fn default_ui_zoom() -> f32 {
     1.0
 }
 
+/// UI language setting. "system" follows the device language; "en"/"de" pin it.
+/// Defaults to "system" so a non-English device is localized without the user
+/// having to find the setting.
+fn default_locale() -> String {
+    "system".to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct AppearanceSettings {
     #[serde(default = "default_preset_id")]
@@ -119,6 +126,8 @@ pub struct AppearanceSettings {
 pub struct AppSettings {
     #[serde(default)]
     pub mongosh_path: String,
+    #[serde(default = "default_locale")]
+    pub locale: String,
     // Which AI provider the query assistant uses:
     // anthropic | openai | gemini | claude-code | codex | cursor | antigravity
     #[serde(default = "default_ai_provider")]
@@ -153,6 +162,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             mongosh_path: String::new(),
+            locale: default_locale(),
             ai_provider: default_ai_provider(),
             anthropic_api_key: String::new(),
             anthropic_model: default_anthropic_model(),

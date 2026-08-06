@@ -233,6 +233,35 @@ describe('DocumentViewer Component', () => {
     expect(screen.getByText('Cleared filter parameters')).toBeInTheDocument();
   });
 
+  it('shows toasts in the active locale (#123)', async () => {
+    const { i18next } = await import('@/lib/i18n');
+    await i18next.changeLanguage('de');
+    try {
+      render(
+        <DocumentViewer
+          connectionName="test-conn"
+          databaseName="test-db"
+          collectionName="test-coll"
+          onExecute={mockOnExecute}
+          onExplain={mockOnExplain}
+          loading={false}
+        />
+      );
+      fireEvent.change(screen.getByTestId('query-filter-input'), { target: { value: '{"a": 1}' } });
+      // FindQueryBar's own "Clear Filter" tooltip is now localized (documents
+      // namespace, Task 1 of the i18n plan) — select on the stable
+      // data-testid rather than the (now German) tooltip text.
+      fireEvent.click(screen.getByTestId('query-clear-filter'));
+      // "geleert", not "zurückgesetzt": the toast has to use the same verb as
+      // the button that fires it (findQueryBar.tooltips.clearFilter = "Filter
+      // leeren"), and German needs the Clear/Reset distinction English keeps —
+      // the toolbar has separate resetSkip/resetLimit actions.
+      expect(await screen.findByText('Filterparameter geleert')).toBeInTheDocument();
+    } finally {
+      await i18next.changeLanguage('en');
+    }
+  });
+
   it('toggles visual query builder panel', () => {
     render(
       <DocumentViewer

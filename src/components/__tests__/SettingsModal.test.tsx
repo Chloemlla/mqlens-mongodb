@@ -13,6 +13,17 @@ vi.mock('../theme/AppearanceSettings', () => ({
   AppearanceSettings: () => <div data-testid="appearance-settings">Theme preset</div>,
 }));
 
+// SettingsView reads/writes the active locale through useLocale(), whose real
+// implementation is I18nProvider's context — a provider this suite doesn't
+// mount (see the file-level note on why: the async "ready" gate would break
+// every synchronous openTab() call already written below). Mock it the same
+// way AppearanceSettings and lib/vault are mocked above, rather than
+// wrapping renderSettings() in a real I18nProvider.
+const mockSetLocale = vi.fn();
+vi.mock('@/components/i18n/I18nProvider', () => ({
+  useLocale: () => ({ locale: 'en', setLocale: mockSetLocale }),
+}));
+
 const mockChangeVaultPassword = vi.fn();
 const mockResetVault = vi.fn();
 const mockBiometricStatus = vi.fn();
@@ -269,5 +280,30 @@ describe('SettingsView Component', () => {
   it('opens the shortcuts tab when initialTab is shortcuts', async () => {
     render(<SettingsView initialTab="shortcuts" />);
     expect(await screen.findByTestId('shortcuts-group-zoom')).toBeInTheDocument();
+  });
+
+  // Nested (not a sibling top-level describe) so these inherit this file's
+  // beforeEach above — the mockInvoke/mockBiometricStatus implementations
+  // installed there are what let SettingsView render at all. A separate
+  // top-level describe here previously only passed in a whole-file run
+  // because those implementations leaked in from this block; run in
+  // isolation (`-t 'language section'`) it threw on the missing invoke mock.
+  describe('SettingsModal — language section (#123)', () => {
+    it('offers a Language section listing every shipped locale', async () => {
+      renderSettings();
+      await openTab('settings-tab-language');
+      // SelectContent (Radix) only mounts once the Select is opened; open it
+      // the way a keyboard user would instead of forcing it open in prod code.
+      const trigger = await screen.findByRole('combobox');
+      fireEvent.keyDown(trigger, { key: 'Enter' });
+      expect(screen.getByRole('option', { name: 'English' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Deutsch' })).toBeInTheDocument();
+    });
+
+    it('explains that untranslated text falls back to English', async () => {
+      renderSettings();
+      await openTab('settings-tab-language');
+      expect(await screen.findByText(/falls back to English/i)).toBeInTheDocument();
+    });
   });
 });
