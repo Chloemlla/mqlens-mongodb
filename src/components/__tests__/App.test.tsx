@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '../../test/render-with-providers';
 import { resetUpdateTabStateDebounce } from '../../workspace/workspaceStore';
-import App from '../../App';
+import App, { tabLabelFor, type QueryTab } from '../../App';
 
 vi.mock('../../lib/vault', () => ({
   getVaultStatus: vi.fn().mockResolvedValue('unlocked'),
@@ -4006,6 +4006,160 @@ describe('App Component', () => {
       fireEvent.contextMenu(quickstartTab.closest('div')!);
 
       expect(screen.queryByTestId('context-menu')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('German localization (Task 5)', () => {
+    it('translates workspace tab labels', async () => {
+      const { i18next } = await import('@/lib/i18n');
+      await i18next.changeLanguage('de');
+      try {
+        const t = i18next.getFixedT('de', 'common');
+        const label = tabLabelFor({ type: 'settings' } as QueryTab, () => 'conn', t);
+        expect(label).toBe('Einstellungen');
+      } finally {
+        await i18next.changeLanguage('en');
+      }
+    });
+
+    it('finds a command palette action by its GERMAN title (Task 4 gap: PaletteAction.title was still English)', async () => {
+      const { i18next } = await import('@/lib/i18n');
+      await i18next.changeLanguage('de');
+      try {
+        const { fireEvent } = await import('@testing-library/react');
+        renderWithProviders(<App />);
+        await screen.findByTestId('mock-sidebar');
+
+        fireEvent.keyDown(window, { key: 'k', metaKey: true });
+        fireEvent.change(await screen.findByTestId('command-palette-input'), {
+          target: { value: 'Einstellungen' },
+        });
+        expect(await screen.findByText('Einstellungen öffnen')).toBeInTheDocument();
+      } finally {
+        await i18next.changeLanguage('en');
+      }
+    });
+
+    it('renders the tab context menu in German (Fix round 1 gap: Duplicate/Detach/Move to were still English)', async () => {
+      const { i18next } = await import('@/lib/i18n');
+      await i18next.changeLanguage('de');
+      try {
+        const { fireEvent, within, act } = await import('@testing-library/react');
+        renderWithProviders(<App />);
+        await screen.findByTestId('mock-sidebar');
+
+        // Seed a second open window (win-1, active tab "orders") so the
+        // menu's "Move to <window>" entry is populated — same technique as
+        // the "tab context menu — detach/move" describe block's
+        // seedForeignWindow helper (not reachable from this describe block's
+        // closure, so inlined here).
+        await act(async () => {
+          fireMockEvent('workspace-changed', {
+            revision: 1,
+            origin: 'win-1',
+            crossWindow: false,
+            workspace: {
+              revision: 1,
+              windows: [
+                { id: 'main', focusedPaneId: 'pane-1', splitTree: { kind: 'pane', id: 'pane-1', tabIds: ['quickstart'], activeTabId: 'quickstart' } },
+                { id: 'win-1', focusedPaneId: 'pane-1', splitTree: { kind: 'pane', id: 'pane-1', tabIds: ['conn-1.sales_db.orders'], activeTabId: 'conn-1.sales_db.orders' } },
+              ],
+              tabs: [
+                { id: 'quickstart', type: 'quickstart', profileId: '', profileName: '', db: '', collection: '' },
+                { id: 'conn-1.sales_db.orders', type: 'collection', profileId: '', profileName: '', db: 'sales_db', collection: 'orders' },
+              ],
+            },
+          });
+        });
+
+        fireEvent.click(screen.getByTestId('select-collection-btn'));
+        const tabStrip = screen.getByTestId('workspace-tab-strip');
+        const customersTab = await within(tabStrip).findByText('customers');
+        fireEvent.contextMenu(customersTab.closest('div')!);
+
+        expect(await screen.findByTestId('context-menu')).toBeInTheDocument();
+        expect(screen.getByText('Tab duplizieren')).toBeInTheDocument();
+        expect(screen.getByText('In neues Fenster abdocken')).toBeInTheDocument();
+        expect(screen.getByText('Verschieben nach win-1 (orders)')).toBeInTheDocument();
+      } finally {
+        await i18next.changeLanguage('en');
+      }
+    });
+  });
+
+  describe('German localization (Task 6 final review fixes)', () => {
+    // Regression test for Critical 3 (final review, task-6-report.md): despite
+    // commit 1422281 being titled "translate confirm dialogs", the single-doc
+    // delete dialog's body ("Delete this document? This cannot be undone.")
+    // and its "Delete" button stayed hardcoded English underneath an already-
+    // German title.
+    it('renders the single-document delete dialog body and Delete button in German', async () => {
+      const { i18next } = await import('@/lib/i18n');
+      await i18next.changeLanguage('de');
+      try {
+        mockInvoke.mockImplementation((cmd: string) => {
+          if (cmd === 'execute_mql_query') {
+            return Promise.resolve([
+              JSON.stringify({ _id: { $oid: '507f1f77bcf86cd799439011' }, name: 'John Doe' }),
+            ]);
+          }
+          return Promise.resolve([]);
+        });
+        const { fireEvent } = await import('@testing-library/react');
+        renderWithProviders(<App />);
+        await screen.findByTestId('mock-sidebar');
+        fireEvent.click(screen.getByTestId('select-collection-btn'));
+        expect(await screen.findByText(/"John Doe"/)).toBeInTheDocument();
+
+        fireEvent.click(screen.getAllByTestId('delete-doc-btn')[0]);
+        expect(await screen.findByTestId('dialog-title')).toHaveTextContent('Dokument löschen');
+        expect(
+          screen.getByText('Dieses Dokument löschen? Dies kann nicht rückgängig gemacht werden.'),
+        ).toBeInTheDocument();
+        expect(screen.getByTestId('dialog-confirm')).toHaveTextContent('Löschen');
+      } finally {
+        await i18next.changeLanguage('en');
+      }
+    });
+
+    // Regression test for Critical 3, remaining two holdouts: bulk delete and
+    // bulk update had translated bodies but English "Delete"/"Update"
+    // confirm buttons, and handleUpdateMany's operator-prompt body ('Update
+    // document (operators, e.g. {"$set": {...}}):') was English — with the
+    // `{"$set": {...}}` MongoDB-operator fragment expected to survive
+    // translation literally.
+    it('renders bulk delete/update confirm buttons and the update-many prompt message in German', async () => {
+      const { i18next } = await import('@/lib/i18n');
+      await i18next.changeLanguage('de');
+      try {
+        mockInvoke.mockImplementation((cmd: string) => {
+          if (cmd === 'execute_mql_query')
+            return Promise.resolve([JSON.stringify({ _id: '1', name: 'John Doe' })]);
+          if (cmd === 'count_documents') return Promise.resolve(3);
+          return Promise.resolve([]);
+        });
+        const { fireEvent } = await import('@testing-library/react');
+        renderWithProviders(<App />);
+        await screen.findByTestId('mock-sidebar');
+        fireEvent.click(screen.getByTestId('select-collection-btn'));
+        expect(await screen.findByText(/"John Doe"/)).toBeInTheDocument();
+
+        fireEvent.click(screen.getByTestId('delete-many-btn'));
+        expect(await screen.findByTestId('dialog-confirm')).toHaveTextContent('Löschen');
+        fireEvent.click(screen.getByTestId('dialog-cancel'));
+
+        fireEvent.click(screen.getByTestId('update-many-btn'));
+        expect(
+          await screen.findByText('Dokument aktualisieren (Operatoren, z. B. {"$set": {...}}):'),
+        ).toBeInTheDocument();
+        fireEvent.change(screen.getByTestId('dialog-input'), {
+          target: { value: '{"$set":{"tier":"Gold"}}' },
+        });
+        fireEvent.click(screen.getByTestId('dialog-confirm'));
+        expect(await screen.findByTestId('dialog-confirm')).toHaveTextContent('Aktualisieren');
+      } finally {
+        await i18next.changeLanguage('en');
+      }
     });
   });
 });
