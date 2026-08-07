@@ -53,9 +53,16 @@ export interface FindQueryBarProps {
 
 const queryColClass = (invalid: boolean) =>
   cn(
-    'flex min-w-0 flex-1 items-center border-r border-border bg-input/80 transition-colors last:border-r-0',
-    'focus-within:z-[1] focus-within:bg-input focus-within:ring-1 focus-within:ring-inset',
-    invalid ? 'focus-within:ring-destructive' : 'focus-within:ring-primary'
+    'relative flex min-w-0 flex-1 items-center border-r border-border bg-input/80 transition-colors last:border-r-0',
+    'focus-within:z-[1] focus-within:bg-input',
+    // The focus outline is an overlay pseudo-element, not `ring-inset`. A ring
+    // is an inset box-shadow, which paints UNDER child content — so anything in
+    // the field with a background of its own covered it and the outline
+    // survived only behind the semi-transparent label badge. Monaco paints its
+    // own layers here and wins over class-based background overrides, so the
+    // outline has to sit above the content rather than behind it.
+    "focus-within:after:pointer-events-none focus-within:after:absolute focus-within:after:inset-0 focus-within:after:content-[''] focus-within:after:border",
+    invalid ? 'focus-within:after:border-destructive' : 'focus-within:after:border-primary'
   );
 
 const fieldBadgeClass = (invalid: boolean) =>
@@ -131,13 +138,21 @@ export const FindQueryBar: React.FC<FindQueryBarProps> = ({
     setInternalOptionsOpen(open);
     onOptionsOpenChange?.(open);
   };
+  // Only projection and sort trigger the reveal. Skip/limit are mirrored by the
+  // results pager, so they are never actually hidden — and counting them meant
+  // changing the page size popped the panel open, which is one-way and so never
+  // closed again. The initial state above still considers pagination, because a
+  // restored query arrives at mount and an unusual page size is worth showing.
+  const hasHiddenOptionValues =
+    (projection.trim() !== '' && projection.trim() !== '{}') ||
+    (sort.trim() !== '' && sort.trim() !== '{}');
   // Reveal only on the transition into having values — not on every mount, or a
   // remount would undo a deliberate collapse that the host persisted.
-  const hadOptionValues = useRef(hasOptionValues);
+  const hadOptionValues = useRef(hasHiddenOptionValues);
   useEffect(() => {
-    if (hasOptionValues && !hadOptionValues.current) setOptionsOpen(true);
-    hadOptionValues.current = hasOptionValues;
-  }, [hasOptionValues]);
+    if (hasHiddenOptionValues && !hadOptionValues.current) setOptionsOpen(true);
+    hadOptionValues.current = hasHiddenOptionValues;
+  }, [hasHiddenOptionValues]);
   // Rows are CSS-hidden rather than unmounted: Monaco keeps its model (and the
   // fields stay queryable) instead of being torn down on every toggle.
   const optionsVisible = !collapsibleOptions || optionsOpen;

@@ -1265,3 +1265,171 @@ describe('Aggregation builder: collapse, undo/redo, $lookup form (#89)', () => {
     expect(body).toContain('"as": "userOrders"');
   });
 });
+
+describe('page size resync from the pager (#218)', () => {
+  const baseProps = {
+    connectionName: 'test-conn',
+    databaseName: 'test-db',
+    collectionName: 'test-coll',
+    onExplain: vi.fn(),
+    loading: false,
+  };
+
+  it('runs with the page size the pager last executed, not the one it mounted with', () => {
+    // The pager writes straight to `tab.lastQuery.limit`, but the builder's own
+    // `limit` was seeded once at mount and never resynced — so the next Run
+    // sent the stale mount-time value and silently undid the page size the
+    // user had just chosen from the pager.
+    const onExecute = vi.fn();
+    const { rerender } = render(
+      <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+    );
+
+    // User picks 100 in the pager: App re-runs, `tab.lastQuery.limit` is now
+    // 100, and DocumentViewer re-renders with the newly executed values.
+    rerender(
+      <DialogProvider>
+        <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 100, skip: 0, revision: 1 }} />
+      </DialogProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    expect(onExecute).toHaveBeenCalledWith(expect.objectContaining({ limit: 100 }));
+  });
+
+  it('leaves the limit alone on a re-render that did not change what was executed', () => {
+    const onExecute = vi.fn();
+    const { rerender } = render(
+      <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+    );
+
+    rerender(
+      <DialogProvider>
+        <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+      </DialogProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(onExecute).toHaveBeenCalledWith(expect.objectContaining({ limit: 50 }));
+  });
+
+  it('does not pop the Options panel open when the pager changes the page size', () => {
+    // The pager lives under the results grid and shows the page size itself, so
+    // resyncing the builder from it must not trigger the disclosure's
+    // "an option holds a non-default value" reveal. That reveal exists for
+    // projection/sort, which have no other surface — and it is one-way, so a
+    // spurious open never closes again.
+    const onExecute = vi.fn();
+    const { rerender } = render(
+      <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+    );
+    expect(screen.getByTestId('query-options-section').className).toContain('hidden');
+
+    rerender(
+      <DialogProvider>
+        <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 100, skip: 0, revision: 1 }} />
+      </DialogProvider>
+    );
+
+    expect(screen.getByTestId('query-options-section').className).toContain('hidden');
+  });
+
+  it('lets the row focus ring show across the whole field, not just the label', () => {
+    // queryColClass draws the focus affordance as `ring-inset`, which is a
+    // box-shadow painted UNDER child content. The editor wrapper used to set
+    // its own opaque `bg-input`, so the ring survived only behind the
+    // semi-transparent QUERY badge — focusing the field outlined the label
+    // instead of the box. jsdom cannot compare painted pixels, so this guards
+    // the invariant that makes it work: the row owns the background, the
+    // editor wrapper must not repaint over it.
+    render(<DocumentViewer {...baseProps} onExecute={vi.fn()} />);
+
+    const editorWrapper = screen.getByTestId('query-filter-input').closest('div');
+    const row = editorWrapper?.parentElement;
+
+    // Drawn as an overlay pseudo-element so nothing inside the field can paint
+    // over it — `ring-inset` is a box-shadow rendered under child content.
+    expect(row?.className).toContain('focus-within:after:border');
+    expect(row?.className).toContain('focus-within:after:absolute');
+    expect(row?.className).not.toContain('ring-inset');
+    expect(row?.className).toContain('bg-input/80');
+    expect(editorWrapper?.className ?? '').not.toContain('bg-input');
+  });
+
+  it('keeps an unexecuted limit edit when the tab is switched away and back (Codex P2)', () => {
+    // The builder cache restores an edit the user never ran. The resync effects
+    // also run on mount, so they immediately replaced that restored edit with
+    // the older executed value — switching tabs silently discarded it.
+    const onExecute = vi.fn();
+    render(
+      <DocumentViewer
+        {...baseProps}
+        onExecute={onExecute}
+        initialBuilderState={{
+          queryMode: 'find',
+          filterQuery: '',
+          sortQuery: '',
+          projectionQuery: '',
+          limit: '200',
+          skip: '0',
+          stages: [],
+        }}
+        pagerRequest={{ limit: 50, skip: 0, revision: 3 }}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    expect(onExecute).toHaveBeenCalledWith(expect.objectContaining({ limit: 200 }));
+  });
+
+  it('keeps a limit edit made while an earlier query was still running (Codex P2)', () => {
+    // The query bar stays editable during a run. When the in-flight request
+    // lands, App updates lastQuery and the executed value changes — which must
+    // not overwrite input the user typed after pressing Run.
+    const onExecute = vi.fn();
+    const { rerender } = render(
+      <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+    );
+
+    // User runs with 100 from the builder, then types 200 while it is loading.
+    const limitInput = screen.getAllByRole('spinbutton').at(-1)!;
+    fireEvent.change(limitInput, { target: { value: '200' } });
+
+    // The earlier request completes. It was a builder Run, not a pager move, so
+    // the pager request is unchanged and must not disturb the typed value.
+    rerender(
+      <DialogProvider>
+        <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+      </DialogProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    expect(onExecute).toHaveBeenCalledWith(expect.objectContaining({ limit: 200 }));
+  });
+
+  it('applies the pager page size even though App bumps the revision before the query lands', () => {
+    // App's real sequence is TWO renders: bumpPagerRevision setTabs first (new
+    // revision, lastQuery still old), then handleExecuteQuery resolves and
+    // updates lastQuery (new values, same revision). A revision-keyed effect
+    // reading the executed values therefore syncs to the STALE numbers and
+    // never runs again.
+    const onExecute = vi.fn();
+    const { rerender } = render(
+      <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 50, skip: 0, revision: 0 }} />
+    );
+
+    // The request and its revision arrive together, so there is no render in
+    // which the builder can see a new revision beside a stale page size.
+    rerender(
+      <DialogProvider>
+        <DocumentViewer {...baseProps} onExecute={onExecute} pagerRequest={{ limit: 100, skip: 0, revision: 1 }} />
+      </DialogProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    expect(onExecute).toHaveBeenCalledWith(expect.objectContaining({ limit: 100 }));
+  });
+});

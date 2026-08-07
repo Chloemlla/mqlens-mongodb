@@ -10,7 +10,7 @@ import { CommandPalette, type PaletteAction } from './components/CommandPalette'
 import { DocumentViewer, builderStateFromQueryTab, type BuilderState } from './components/DocumentViewer';
 import type { ChatMessage } from './components/AIChatPanel';
 import { clearChatRequest, renameChatRequest, resetChatRequests } from './lib/aiChatRequest';
-import { DataGrid } from './components/DataGrid';
+import { DataGrid, type ViewMode } from './components/DataGrid';
 import { ConnectionManager } from './components/ConnectionManager';
 import { SettingsView, type SettingsTabId, MONGO_TOOLS_DIR_KEY } from './components/SettingsModal';
 import { IndexViewer } from './components/IndexViewer';
@@ -120,6 +120,13 @@ export interface QueryTab {
   lastQuery?: { filter: string; sort: string; projection: string; limit: number; skip: number };
   // Last executed aggregation pipeline, so an aggregate view refreshes as an aggregate.
   lastAggregate?: Record<string, unknown>[];
+  // Results view mode, kept on the tab so it survives the grid remounting on
+  // every run and the tab being switched away (#218).
+  viewMode?: ViewMode;
+  // What the results pager last asked for. The values travel with the revision
+  // so the builder can never observe a new revision beside a stale page size —
+  // see DocumentViewer's pagerRequest prop.
+  pagerRequest?: { limit: number; skip: number; revision: number };
   // Pagination count state.
   totalCount?: number;
   countLoading?: boolean;
@@ -537,6 +544,9 @@ function Workspace() {
     tabBuilderStateCache.current.set(tabId, state);
     mirrorUpdateTabState(tabId, activeConnectionsRef.current, { builderState: state });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const handleViewModeChange = useCallback((tabId: string, mode: ViewMode) => {
+    setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, viewMode: mode } : t)));
   }, []);
   const handleChatMessagesChange = useCallback((tabId: string, messages: ChatMessage[]) => {
     const prev = tabChatCache.current.get(tabId);
@@ -2591,13 +2601,30 @@ function Workspace() {
     }
   };
 
+  // Records what the pager asked for so the query builder can follow it. The
+  // limit/skip are stored WITH the revision in one update: bumping a bare
+  // counter first let the builder see the new revision beside the not-yet
+  // updated lastQuery and sync to the old page size.
+  const notePagerRequest = (tabId: string, limit: number, skip: number) => {
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.id === tabId
+          ? { ...t, pagerRequest: { limit, skip, revision: (t.pagerRequest?.revision ?? 0) + 1 } }
+          : t
+      )
+    );
+  };
+
   const handlePageChange = (tab: QueryTab, newSkip: number) => {
     if (!tab.lastQuery) return;
-    handleExecuteQuery(tab, { ...tab.lastQuery, skip: Math.max(0, newSkip) });
+    const skip = Math.max(0, newSkip);
+    notePagerRequest(tab.id, tab.lastQuery.limit, skip);
+    handleExecuteQuery(tab, { ...tab.lastQuery, skip });
   };
 
   const handlePageSizeChange = (tab: QueryTab, newLimit: number) => {
     if (!tab.lastQuery) return;
+    notePagerRequest(tab.id, newLimit, 0);
     handleExecuteQuery(tab, { ...tab.lastQuery, limit: newLimit, skip: 0 });
   };
 
@@ -3600,6 +3627,7 @@ function Workspace() {
                 ?? builderStateFromQueryTab(tab.lastQuery, tab.lastAggregate)
               }
               onBuilderStateChange={(state) => handleBuilderStateChange(tab.id, state)}
+              pagerRequest={tab.pagerRequest}
               chatSessionKey={tab.id}
               initialChatMessages={tabChatCache.current.get(tab.id)?.messages ?? []}
               onChatMessagesChange={(messages) => handleChatMessagesChange(tab.id, messages)}
@@ -3657,6 +3685,8 @@ function Workspace() {
                     countLoading={tab.countLoading}
                     skip={tab.lastQuery?.skip ?? 0}
                     limit={tab.lastQuery?.limit ?? 50}
+                    viewMode={tab.viewMode ?? 'json'}
+                    onViewModeChange={(mode) => handleViewModeChange(tab.id, mode)}
                     onCreateSuggestedIndex={s => handleCreateSuggestedIndex(tab, s)}
                     {...(!tab.lastAggregate ? {
                       onPageChange: (newSkip: number) => handlePageChange(tab, newSkip),
