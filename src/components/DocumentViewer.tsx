@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AIChatPanel } from './AIChatPanel';
+import { AIChatPanel, type ChatMessage } from './AIChatPanel';
 import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
 import { useCollectionSchema } from '../lib/useCollectionSchema';
 import { collectionRef, type GeneratedQuery } from '../lib/mongoCommand';
-import { parseShellJson, parseQueryObject } from '../lib/shellDoc';
+import { parseShellJson, parseQueryObject, shellDocErrorKey } from '../lib/shellDoc';
 import {
   loadCollectionQueries,
   saveQuery,
@@ -37,7 +37,7 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from '@/components/ui/resizable';
-import type { Layout } from 'react-resizable-panels';
+import { useDefaultLayout, type Layout } from 'react-resizable-panels';
 import { cn } from '@/lib/utils';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 import {
@@ -210,50 +210,74 @@ interface DocumentViewerProps {
   /** Restored when remounting this tab's viewer (see App tab cache). */
   initialBuilderState?: BuilderState;
   onBuilderStateChange?: (state: BuilderState) => void;
+  /** Identifies this tab's chat so an in-flight AI request survives the
+   *  unmount that happens when the user switches tabs. */
+  chatSessionKey?: string;
+  /** Restored when remounting this tab's AI helper (see App tabChatCache). */
+  initialChatMessages?: ChatMessage[];
+  onChatMessagesChange?: (messages: ChatMessage[]) => void;
+  /** Whether the AI helper panel was open when this tab was last shown. */
+  initialAIHelperOpen?: boolean;
+  onAIHelperOpenChange?: (isOpen: boolean) => void;
   children?: React.ReactNode;
 }
 
-const OPERATORS = [
+// Comparison operators are bare symbols (=, !=, >, ...), not language, so they
+// stay literal `label`s. The word operators (in / not in / regex / exists)
+// are real English words a German user reads as prose, so they route through
+// `labelKey` instead — same module-level-constant pattern as STAGE_OPERATORS
+// below, translated at render time.
+const OPERATORS: { value: string; label?: string; labelKey?: string }[] = [
   { value: '$eq', label: '=' },
   { value: '$ne', label: '!=' },
   { value: '$gt', label: '>' },
   { value: '$gte', label: '>=' },
   { value: '$lt', label: '<' },
   { value: '$lte', label: '<=' },
-  { value: '$in', label: 'in' },
-  { value: '$nin', label: 'not in' },
-  { value: '$regex', label: 'regex' },
-  { value: '$exists', label: 'exists' },
+  { value: '$in', labelKey: 'documentViewer.builder.operators.in' },
+  { value: '$nin', labelKey: 'documentViewer.builder.operators.notIn' },
+  { value: '$regex', labelKey: 'documentViewer.builder.operators.regex' },
+  { value: '$exists', labelKey: 'documentViewer.builder.operators.exists' },
 ];
 
 // MongoDB aggregation pipeline stages, grouped for the stage-operator dropdown.
-const STAGE_OPERATORS: { group: string; stages: string[] }[] = [
+// `group` stays a stable English identifier (used as the React key); the
+// visible <optgroup> label is looked up from `labelKey` at render time, since
+// this constant is module-level and can't call the useTranslation hook.
+const STAGE_OPERATORS: { group: string; labelKey: string; stages: string[] }[] = [
   {
     group: 'Filtering & shaping',
+    labelKey: 'documentViewer.pipeline.stageGroups.filtering',
     stages: ['$match', '$project', '$addFields', '$set', '$unset', '$replaceRoot', '$replaceWith', '$redact'],
   },
   {
     group: 'Grouping & aggregation',
+    labelKey: 'documentViewer.pipeline.stageGroups.grouping',
     stages: ['$group', '$bucket', '$bucketAuto', '$sortByCount', '$count', '$facet'],
   },
   {
     group: 'Ordering & limiting',
+    labelKey: 'documentViewer.pipeline.stageGroups.ordering',
     stages: ['$sort', '$limit', '$skip', '$sample'],
   },
   {
     group: 'Arrays & joins',
+    labelKey: 'documentViewer.pipeline.stageGroups.arraysJoins',
     stages: ['$unwind', '$lookup', '$graphLookup', '$unionWith'],
   },
   {
     group: 'Windows & time series',
+    labelKey: 'documentViewer.pipeline.stageGroups.windows',
     stages: ['$setWindowFields', '$densify', '$fill'],
   },
   {
     group: 'Geospatial',
+    labelKey: 'documentViewer.pipeline.stageGroups.geospatial',
     stages: ['$geoNear'],
   },
   {
     group: 'Sources & output',
+    labelKey: 'documentViewer.pipeline.stageGroups.sourcesOutput',
     stages: ['$documents', '$out', '$merge'],
   },
 ];
@@ -520,10 +544,16 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   availableFields = [],
   initialBuilderState = DEFAULT_BUILDER_STATE,
   onBuilderStateChange,
+  chatSessionKey,
+  initialChatMessages = [],
+  onChatMessagesChange,
+  initialAIHelperOpen = false,
+  onAIHelperOpenChange,
   children
 }) => {
   const { prompt, toast } = useDialogs();
   const { t } = useTranslation('common');
+  const { t: td } = useTranslation('documents');
   const { schema } = useCollectionSchema(connectionId, databaseName, collectionName);
   const [filterQuery, setFilterQuery] = useState(initialBuilderState.filterQuery);
   const [projectionQuery, setProjectionQuery] = useState(initialBuilderState.projectionQuery);
@@ -587,7 +617,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen, onBuilderStateChange]);
 
   // AI chat assistant — open/close only; the panel owns its own chat state.
-  const [isAIHelperOpen, setIsAIHelperOpen] = useState(false);
+  const [isAIHelperOpen, setIsAIHelperOpenState] = useState(initialAIHelperOpen);
+  const setIsAIHelperOpen = (open: boolean) => {
+    setIsAIHelperOpenState(open);
+    onAIHelperOpenChange?.(open);
+  };
 
   // Pipeline undo/redo: every stage mutation goes through commitStages, which
   // snapshots the previous list. Keystroke-level content edits coalesce via a
@@ -705,7 +739,13 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         .map(s => ({ [s.operator]: parseShellJson(s.content) }));
       onExecuteAggregate(pipeline);
     } catch (e: any) {
-      setError(`Invalid JSON syntax: ${e.message}`);
+      setError(
+        // Our own parse failures carry a code and get a translated message;
+        // errors from the underlying parser only have an English message.
+        shellDocErrorKey(e)
+          ? td(shellDocErrorKey(e)!)
+          : td('documentViewer.errors.invalidJsonSyntax', { message: e.message }),
+      );
     }
   };
 
@@ -1105,10 +1145,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   const handleSaveQuery = async (alsoFavorite = false) => {
     const name = await prompt({
-      title: 'Save query',
-      message: 'Enter a name for this query:',
-      placeholder: 'Query name',
-      validate: (v) => (v.trim() ? null : 'Name is required'),
+      title: td('documentViewer.dialogs.saveQuery.title'),
+      message: td('documentViewer.dialogs.saveQuery.message'),
+      placeholder: td('documentViewer.dialogs.saveQuery.placeholder'),
+      validate: (v) => (v.trim() ? null : td('documentViewer.dialogs.saveQuery.nameRequired')),
     });
     if (!name?.trim()) return;
     try {
@@ -1238,7 +1278,13 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         });
       }
     } catch (e: any) {
-      setError(`Invalid JSON syntax: ${e.message}`);
+      setError(
+        // Our own parse failures carry a code and get a translated message;
+        // errors from the underlying parser only have an English message.
+        shellDocErrorKey(e)
+          ? td(shellDocErrorKey(e)!)
+          : td('documentViewer.errors.invalidJsonSyntax', { message: e.message }),
+      );
     }
   };
 
@@ -1303,7 +1349,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         await onExplain(JSON.stringify(compiledFilter));
       }
     } catch (e: any) {
-      setError(e.message || String(e));
+      // Explain is reachable with an invalid filter — the dropdown item has no
+      // `disabled` guard, only the trigger does — so this path has to map our
+      // own parse errors to a translated message like the two above it.
+      const key = shellDocErrorKey(e);
+      setError(key ? td(key) : e.message || String(e));
     } finally {
       setExplainLoading(false);
     }
@@ -1333,6 +1383,24 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     return { 'document-main': 100 };
   }, [workspaceRightPanel]);
 
+  // Switching tabs unmounts this view, so without persistence the group fell
+  // back to the fixed 70/30 above every time and the user's drag was lost.
+  // `panelIds` keys the saved layout by which right-hand panel is open, so the
+  // query builder and the AI helper remember their own widths instead of
+  // fighting over one entry.
+  const workspacePanelIds = useMemo(() => {
+    if (workspaceRightPanel === 'query-builder') return ['document-main', 'query-builder'];
+    if (workspaceRightPanel === 'ai-helper') return ['document-main', 'ai-helper'];
+    return ['document-main'];
+  }, [workspaceRightPanel]);
+
+  const { defaultLayout: savedWorkspaceLayout, onLayoutChanged: saveWorkspaceLayout } =
+    useDefaultLayout({
+      id: 'document-viewer-workspace',
+      panelIds: workspacePanelIds,
+      storage: typeof localStorage === 'undefined' ? undefined : localStorage,
+    });
+
   return (
     <div className="relative flex h-full min-h-0 flex-col min-w-0">
       
@@ -1343,9 +1411,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <User size={12} className="shrink-0" />
             <span
               className={cn('truncate font-semibold', !connectionUser && 'italic')}
-              title={connectionUser ? `Authenticated as ${connectionUser}` : 'Connection has no authentication'}
+              title={connectionUser ? td('documentViewer.breadcrumbs.authenticatedAs', { user: connectionUser }) : td('documentViewer.breadcrumbs.noAuthentication')}
             >
-              {connectionUser || 'no auth'}
+              {connectionUser || td('documentViewer.breadcrumbs.noAuth')}
             </span>
           </div>
           <ChevronRight size={10} className="shrink-0 text-muted-foreground" />
@@ -1378,10 +1446,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               disabled={loading || explainLoading || !canRun}
               size="sm"
               className="h-7 rounded-r-none px-2.5 text-[11px]"
-              title={!canRun ? 'Fix the query syntax to run' : `Execute query (${formatShortcut(shortcutById('run-query')!)})`}
+              title={!canRun ? td('documentViewer.tooltips.runDisabled') : td('documentViewer.tooltips.executeQuery', { shortcut: formatShortcut(shortcutById('run-query')!) })}
             >
               <Play size={11} fill="currentColor" />
-              Run
+              {td('documentViewer.actions.run')}
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -1397,11 +1465,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               <DropdownMenuContent align="start" className="min-w-[120px]">
                 <DropdownMenuItem onClick={handleRun}>
                   <Play size={11} />
-                  Run Query
+                  {td('documentViewer.actions.runQuery')}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={handleExplain}>
                   <Cpu size={11} />
-                  Run Explain
+                  {td('documentViewer.actions.runExplain')}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -1411,13 +1479,13 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="h-7 gap-1.5 text-[11px]">
                 <FolderOpen size={11} className="text-primary" />
-                Load query
+                {td('documentViewer.actions.loadQuery')}
                 <ChevronDown size={10} className="text-muted-foreground" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-[200px]" data-testid="load-query-dropdown">
               {savedQueries.length === 0 ? (
-                <DropdownMenuItem disabled>No saved queries</DropdownMenuItem>
+                <DropdownMenuItem disabled>{td('documentViewer.empty.noSavedQueries')}</DropdownMenuItem>
               ) : (
                 savedQueries.map((sq) => (
                   <DropdownMenuItem
@@ -1446,7 +1514,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                           handleToggleQueryFavorite(sq);
                         }}
                         data-testid={`favorite-saved-${sq.id}`}
-                        title={isQueryFavorited(sq) ? 'Remove from favorites' : 'Add to favorites'}
+                        title={isQueryFavorited(sq) ? td('documentViewer.tooltips.removeFromFavorites') : td('documentViewer.tooltips.addToFavorites')}
                       >
                         <Heart size={11} className={isQueryFavorited(sq) ? 'fill-current' : ''} />
                       </Button>
@@ -1459,7 +1527,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                           handleDeleteSaved(sq.id);
                         }}
                         data-testid={`delete-saved-${sq.id}`}
-                        title="Delete saved query"
+                        title={td('documentViewer.tooltips.deleteSavedQuery')}
                       >
                         <Trash2 size={11} />
                       </Button>
@@ -1474,21 +1542,21 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="h-7 gap-1.5 text-[11px]">
                 <Save size={11} className="text-primary" />
-                Save query
+                {td('documentViewer.actions.saveQuery')}
                 <ChevronDown size={10} className="text-muted-foreground" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-[150px]">
               <DropdownMenuItem onClick={() => void handleSaveQuery(false)} data-testid="save-query-item">
                 <Save size={11} />
-                Save as new query...
+                {td('documentViewer.actions.saveAsNew')}
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => void handleSaveQuery(true)}
                 data-testid="save-favorite-query-item"
               >
                 <Heart size={11} />
-                Save and add to favorites
+                {td('documentViewer.actions.saveAndFavorite')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -1497,13 +1565,13 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="h-7 gap-1.5 text-[11px]" data-testid="history-btn">
                 <History size={11} className="text-warning" />
-                Query history
+                {td('documentViewer.actions.queryHistory')}
                 <ChevronDown size={10} className="text-muted-foreground" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-[260px]" data-testid="history-dropdown">
               {queryHistory.length === 0 ? (
-                <DropdownMenuItem disabled>No history yet</DropdownMenuItem>
+                <DropdownMenuItem disabled>{td('documentViewer.empty.noHistory')}</DropdownMenuItem>
               ) : (
                 queryHistory.map((h, i) => (
                   <DropdownMenuItem
@@ -1514,8 +1582,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                     <History size={11} />
                     <span className="truncate">
                       {h.query.queryType === 'aggregate'
-                        ? `aggregate · ${(h.query.pipeline ?? []).length} stage(s)`
-                        : `find · ${JSON.stringify(h.query.filter ?? {})}`}
+                        ? td('documentViewer.history.aggregateSummary', { count: (h.query.pipeline ?? []).length })
+                        : td('documentViewer.history.findSummary', { filter: JSON.stringify(h.query.filter ?? {}) })}
                     </span>
                   </DropdownMenuItem>
                 ))
@@ -1527,18 +1595,18 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="h-7 gap-1.5 text-[11px]">
                 <Anchor size={11} className="text-chart-4" />
-                Set default query
+                {td('documentViewer.actions.setDefaultQuery')}
                 <ChevronDown size={10} className="text-muted-foreground" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-[200px]">
               <DropdownMenuItem onClick={handleSetDefault} data-testid="set-default-item">
                 <Check size={11} />
-                Pin current query as default
+                {td('documentViewer.actions.pinAsDefault')}
               </DropdownMenuItem>
               <DropdownMenuItem onClick={handleClearDefault} data-testid="clear-default-item">
                 <Trash2 size={11} />
-                Clear default
+                {td('documentViewer.actions.clearDefault')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -1547,7 +1615,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="h-7 gap-1.5 text-[11px]">
                 <ExternalLink size={11} className="text-muted-foreground" />
-                Open query in...
+                {td('documentViewer.actions.openQueryIn')}
                 <ChevronDown size={10} className="text-muted-foreground" />
               </Button>
             </DropdownMenuTrigger>
@@ -1565,7 +1633,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 }}
               >
                 <ExternalLink size={11} />
-                Open in mongosh
+                {td('documentViewer.actions.openInMongosh')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -1580,10 +1648,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               onClick={onOpenExport}
               className="h-7 gap-1.5 text-[11px]"
               data-testid="export-btn"
-              title="Open export workspace"
+              title={td('documentViewer.tooltips.openExportWorkspace')}
             >
               <Download size={11} />
-              Export
+              {td('documentViewer.actions.export')}
             </Button>
           )}
           {onImport && (
@@ -1594,10 +1662,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               onClick={onImport}
               className="h-7 gap-1.5 text-[11px]"
               data-testid="import-btn"
-              title="Import documents from a file"
+              title={td('documentViewer.tooltips.importDocuments')}
             >
               <Upload size={11} />
-              Import
+              {td('documentViewer.actions.import')}
             </Button>
           )}
           <Button
@@ -1612,7 +1680,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             data-testid="toggle-ai-helper"
           >
             <Sparkles size={11} className="text-primary" />
-            <span className="font-semibold text-primary">AI Helper</span>
+            <span className="font-semibold text-primary">{td('documentViewer.actions.aiHelper')}</span>
           </Button>
 
           <Button
@@ -1652,7 +1720,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             data-testid="toggle-query-builder"
           >
             <DatabaseZap size={11} className="text-success" />
-            Visual Query Builder
+            {td('documentViewer.actions.visualQueryBuilder')}
           </Button>
         </div>
       </div>
@@ -1661,7 +1729,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       <ResizablePanelGroup
         id="document-viewer-workspace"
         orientation="horizontal"
-        defaultLayout={workspaceDefaultLayout}
+        defaultLayout={savedWorkspaceLayout ?? workspaceDefaultLayout}
+        onLayoutChanged={saveWorkspaceLayout}
         className="min-h-0 min-w-0 flex-1"
       >
         <ResizablePanel id="document-main" minSize="30%" className="flex min-h-0 flex-col">
@@ -1676,7 +1745,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                   queryMode === 'find' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'
                 )}
               >
-                Find
+                {td('documentViewer.tabs.find')}
               </button>
               <button
                 type="button"
@@ -1687,7 +1756,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                   queryMode === 'aggregate' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'
                 )}
               >
-                Aggregation
+                {td('documentViewer.tabs.aggregation')}
               </button>
             </div>
 
@@ -1733,16 +1802,16 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <div className="flex max-h-[min(380px,42vh)] flex-col overflow-hidden border-b border-border bg-muted/20">
               <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
                 <Badge variant="outline" className="font-mono text-[10px]">
-                  {stages.length} stage{stages.length !== 1 ? 's' : ''}
+                  {td('documentViewer.pipeline.stageCount', { count: stages.length })}
                 </Badge>
                 <Button variant="outline" size="sm" onClick={addStage} className="h-7 gap-1 text-[11px]">
                   <Plus size={11} />
-                  Add Stage
+                  {td('documentViewer.actions.addStage')}
                 </Button>
-                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={undoStages} disabled={stagesPast.current.length === 0} aria-label="Undo pipeline change" title="Undo pipeline change">
+                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={undoStages} disabled={stagesPast.current.length === 0} aria-label={td('documentViewer.tooltips.undoPipelineChange')} title={td('documentViewer.tooltips.undoPipelineChange')}>
                   <Undo2 size={11} />
                 </Button>
-                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={redoStages} disabled={stagesFuture.current.length === 0} aria-label="Redo pipeline change" title="Redo pipeline change">
+                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={redoStages} disabled={stagesFuture.current.length === 0} aria-label={td('documentViewer.tooltips.redoPipelineChange')} title={td('documentViewer.tooltips.redoPipelineChange')}>
                   <Redo2 size={11} />
                 </Button>
                 <div className="flex-grow" />
@@ -1784,7 +1853,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                           onDragEnd={() => setDragStageIndex(null)}
                         >
                           <GripVertical size={11} className="shrink-0 text-muted-foreground" aria-hidden="true" />
-                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => toggleStageCollapsed(stage.id)} aria-label={stage.collapsed ? `Expand stage ${index + 1}` : `Collapse stage ${index + 1}`} title={stage.collapsed ? `Expand stage ${index + 1}` : `Collapse stage ${index + 1}`}>
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => toggleStageCollapsed(stage.id)} aria-label={stage.collapsed ? td('documentViewer.tooltips.expandStage', { n: index + 1 }) : td('documentViewer.tooltips.collapseStage', { n: index + 1 })} title={stage.collapsed ? td('documentViewer.tooltips.expandStage', { n: index + 1 }) : td('documentViewer.tooltips.collapseStage', { n: index + 1 })}>
                             {stage.collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
                           </Button>
                           <span className="inline-flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded bg-accent text-[10px] text-muted-foreground">{index + 1}</span>
@@ -1794,8 +1863,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                               onChange={(e) => updateStageOperator(stage.id, e.target.value)}
                               className="cursor-pointer appearance-none border-0 bg-transparent py-0.5 pl-1 pr-4 font-mono text-xs font-semibold text-chart-4 outline-none"
                             >
-                              {STAGE_OPERATORS.map(({ group, stages: groupStages }) => (
-                                <optgroup key={group} label={group}>
+                              {STAGE_OPERATORS.map(({ group, labelKey, stages: groupStages }) => (
+                                <optgroup key={group} label={td(labelKey)}>
                                   {groupStages.map(op => (
                                     <option key={op} value={op}>{op}</option>
                                   ))}
@@ -1805,19 +1874,19 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                             <ChevronDown size={10} className="pointer-events-none absolute right-0.5 text-muted-foreground" />
                           </div>
                           <div className="flex-grow" />
-                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => runToStage(index)} disabled={loading || stage.disabled} title={`Run pipeline to stage ${index + 1}`} aria-label={`Run pipeline to stage ${index + 1}`}>
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => runToStage(index)} disabled={loading || stage.disabled} title={td('documentViewer.tooltips.runPipelineToStage', { n: index + 1 })} aria-label={td('documentViewer.tooltips.runPipelineToStage', { n: index + 1 })}>
                             <Play size={11} />
                           </Button>
-                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => toggleStageDisabled(stage.id)} title={stage.disabled ? `Enable stage ${index + 1}` : `Disable stage ${index + 1}`} aria-label={stage.disabled ? `Enable stage ${index + 1}` : `Disable stage ${index + 1}`}>
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => toggleStageDisabled(stage.id)} title={stage.disabled ? td('documentViewer.tooltips.enableStage', { n: index + 1 }) : td('documentViewer.tooltips.disableStage', { n: index + 1 })} aria-label={stage.disabled ? td('documentViewer.tooltips.enableStage', { n: index + 1 }) : td('documentViewer.tooltips.disableStage', { n: index + 1 })}>
                             {stage.disabled ? <EyeOff size={11} /> : <Eye size={11} />}
                           </Button>
-                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => moveStageUp(index)} disabled={index === 0} aria-label={`Move stage ${index + 1} up`}>
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => moveStageUp(index)} disabled={index === 0} aria-label={td('documentViewer.tooltips.moveStageUp', { n: index + 1 })}>
                             <ChevronUp size={11} />
                           </Button>
-                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => moveStageDown(index)} disabled={index === stages.length - 1} aria-label={`Move stage ${index + 1} down`}>
+                          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => moveStageDown(index)} disabled={index === stages.length - 1} aria-label={td('documentViewer.tooltips.moveStageDown', { n: index + 1 })}>
                             <ChevronDown size={11} />
                           </Button>
-                          <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive hover:text-destructive" onClick={() => removeStage(stage.id)} aria-label={`Remove stage ${index + 1}`}>
+                          <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive hover:text-destructive" onClick={() => removeStage(stage.id)} aria-label={td('documentViewer.tooltips.removeStage', { n: index + 1 })}>
                             <Trash2 size={11} />
                           </Button>
                         </div>
@@ -1889,7 +1958,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold text-foreground">
                 <DatabaseZap size={11} className="text-success" />
-                <span>Visual Query Builder</span>
+                <span>{td('documentViewer.actions.visualQueryBuilder')}</span>
               </div>
               <div className="flex items-center gap-2">
                 {(rules.length > 0 || projectionRules.length > 0 || sortRules.length > 0) && (
@@ -1901,10 +1970,10 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                     }}
                     className="text-[10px] text-muted-foreground transition-colors hover:text-destructive"
                   >
-                    Clear All
+                    {td('documentViewer.actions.clearAll')}
                   </button>
                 )}
-                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setIsQueryBuilderOpen(false)} title="Close Panel">
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setIsQueryBuilderOpen(false)} title={td('documentViewer.tooltips.closePanel')}>
                   <X size={12} />
                 </Button>
               </div>
@@ -1912,7 +1981,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
             <ScrollArea className="min-h-0 flex-1">
             <div className="flex flex-col gap-2 p-3">
-              
+
               {/* Card 1: Query (Filter) */}
               <div className="rounded-md border border-border bg-background" data-testid="query-card">
                 <div className="flex items-center justify-between border-b border-border px-2 py-2">
@@ -1924,7 +1993,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                       className="h-3.5 w-3.5 rounded border-border accent-primary"
                       data-testid="query-enable-checkbox"
                     />
-                    <span>Query</span>
+                    <span>{td('documentViewer.builder.query')}</span>
                   </label>
                   {isQueryEnabled && rules.length > 0 && (
                     <select
@@ -1933,8 +2002,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                       className="h-7 max-w-[130px] rounded-md border border-border bg-background px-1 text-[10px]"
                       data-testid="query-match-type"
                     >
-                      <option value="and">Match All ($and)</option>
-                      <option value="or">Match Any ($or)</option>
+                      <option value="and">{td('documentViewer.builder.matchAll', { op: '$and' })}</option>
+                      <option value="or">{td('documentViewer.builder.matchAny', { op: '$or' })}</option>
                     </select>
                   )}
                 </div>
@@ -1946,7 +2015,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         className="cursor-pointer rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
                         data-testid="query-dropzone"
                       >
-                        <span>+ Click to add query rules</span>
+                        <span>{td('documentViewer.builder.clickToAddQueryRules')}</span>
                       </div>
                     ) : (
                       <div className="flex flex-col gap-2">
@@ -1961,16 +2030,16 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                     type="text"
                                     value={rule.field === '__custom__' ? '' : rule.field}
                                     onChange={(e) => updateRule(rule.id, { field: e.target.value })}
-                                    placeholder="field.path"
+                                    placeholder={td('documentViewer.builder.fieldPathPlaceholder')}
                                     className="h-7 min-w-0 flex-1 font-mono text-[11px]"
                                     data-testid={`rule-field-custom-${rule.id}`}
                                   />
                                   {fields.length > 0 && (
-                                    <button 
+                                    <button
                                       onClick={() => updateRule(rule.id, { field: fields[0] })}
                                       className="shrink-0 text-[10px] text-primary hover:underline"
                                     >
-                                      List
+                                      {td('documentViewer.actions.listShortcut')}
                                     </button>
                                   )}
                                 </div>
@@ -1984,7 +2053,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                   {fields.map(f => (
                                     <option key={f} value={f}>{f}</option>
                                   ))}
-                                  <option value="__custom__">Custom field...</option>
+                                  <option value="__custom__">{td('documentViewer.builder.customField')}</option>
                                 </select>
                               )}
 
@@ -1996,7 +2065,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                 data-testid={`rule-operator-${rule.id}`}
                               >
                                 {OPERATORS.map(op => (
-                                  <option key={op.value} value={op.value}>{op.label}</option>
+                                  <option key={op.value} value={op.value}>{op.labelKey ? td(op.labelKey) : op.label}</option>
                                 ))}
                               </select>
 
@@ -2016,17 +2085,17 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                   type="text"
                                   value={rule.value}
                                   onChange={(e) => updateRule(rule.id, { value: e.target.value })}
-                                  placeholder="value"
+                                  placeholder={td('documentViewer.builder.valuePlaceholder')}
                                   className="h-7 min-w-0 flex-1 font-mono text-[11px]"
                                   data-testid={`rule-value-${rule.id}`}
                                 />
                               )}
 
                               {/* Delete button */}
-                              <button 
+                              <button
                                 onClick={() => deleteRule(rule.id)}
                                 className="p-1 rounded text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-                                title="Remove Rule"
+                                title={td('documentViewer.tooltips.removeRule')}
                               >
                                 <Trash2 size={11} />
                               </button>
@@ -2035,7 +2104,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         })}
                         <Button variant="outline" size="sm" onClick={addRule} className="h-7 w-full gap-1 text-[11px]" data-testid="query-add-rule-btn">
                           <Plus size={11} />
-                          <span>Add Rule</span>
+                          <span>{td('documentViewer.actions.addRule')}</span>
                         </Button>
                       </div>
                     )}
@@ -2054,7 +2123,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                       className="h-3.5 w-3.5 rounded border-border accent-primary"
                       data-testid="projection-enable-checkbox"
                     />
-                    <span>Projection</span>
+                    <span>{td('documentViewer.builder.projection')}</span>
                   </label>
                 </div>
                 {isProjectionEnabled && (
@@ -2065,7 +2134,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         className="cursor-pointer rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
                         data-testid="projection-dropzone"
                       >
-                        <span>+ Click to add projection criteria</span>
+                        <span>{td('documentViewer.builder.clickToAddProjection')}</span>
                       </div>
                     ) : (
                       <div className="flex flex-col gap-2">
@@ -2076,20 +2145,20 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                               {/* Field selector */}
                               {isCustomField ? (
                                 <div className="flex items-center gap-1 flex-1 min-w-0">
-                                  <input 
+                                  <input
                                     type="text"
                                     value={rule.field === '__custom__' ? '' : rule.field}
                                     onChange={(e) => updateProjectionRule(rule.id, { field: e.target.value })}
-                                    placeholder="field.path"
+                                    placeholder={td('documentViewer.builder.fieldPathPlaceholder')}
                                     className="h-7 min-w-0 flex-1 font-mono text-[11px]"
                                     data-testid={`projection-field-custom-${rule.id}`}
                                   />
                                   {fields.length > 0 && (
-                                    <button 
+                                    <button
                                       onClick={() => updateProjectionRule(rule.id, { field: fields[0] })}
                                       className="shrink-0 text-[10px] text-primary hover:underline"
                                     >
-                                      List
+                                      {td('documentViewer.actions.listShortcut')}
                                     </button>
                                   )}
                                 </div>
@@ -2103,7 +2172,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                   {fields.map(f => (
                                     <option key={f} value={f}>{f}</option>
                                   ))}
-                                  <option value="__custom__">Custom field...</option>
+                                  <option value="__custom__">{td('documentViewer.builder.customField')}</option>
                                 </select>
                               )}
 
@@ -2114,17 +2183,17 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                 className="h-7 w-[100px] shrink-0 rounded-md border border-border bg-background px-2 text-[11px]"
                                 data-testid={`projection-include-${rule.id}`}
                               >
-                                <option value="1">Include (1)</option>
-                                <option value="0">Exclude (0)</option>
+                                <option value="1">{td('documentViewer.builder.includeOption', { n: 1 })}</option>
+                                <option value="0">{td('documentViewer.builder.excludeOption', { n: 0 })}</option>
                               </select>
 
                               <div className="flex-grow" />
 
                               {/* Delete button */}
-                              <button 
+                              <button
                                 onClick={() => deleteProjectionRule(rule.id)}
                                 className="p-1 rounded text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-                                title="Remove Rule"
+                                title={td('documentViewer.tooltips.removeRule')}
                               >
                                 <Trash2 size={11} />
                               </button>
@@ -2133,7 +2202,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         })}
                         <Button variant="outline" size="sm" onClick={addProjectionRule} className="h-7 w-full gap-1 text-[11px]" data-testid="projection-add-rule-btn">
                           <Plus size={11} />
-                          <span>Add Projection</span>
+                          <span>{td('documentViewer.actions.addProjection')}</span>
                         </Button>
                       </div>
                     )}
@@ -2152,7 +2221,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                       className="h-3.5 w-3.5 rounded border-border accent-primary"
                       data-testid="sort-enable-checkbox"
                     />
-                    <span>Sort</span>
+                    <span>{td('documentViewer.builder.sort')}</span>
                   </label>
                 </div>
                 {isSortEnabled && (
@@ -2163,7 +2232,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         className="cursor-pointer rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
                         data-testid="sort-dropzone"
                       >
-                        <span>+ Click to add sort criteria</span>
+                        <span>{td('documentViewer.builder.clickToAddSort')}</span>
                       </div>
                     ) : (
                       <div className="flex flex-col gap-2">
@@ -2174,20 +2243,20 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                               {/* Field selector */}
                               {isCustomField ? (
                                 <div className="flex items-center gap-1 flex-1 min-w-0">
-                                  <input 
+                                  <input
                                     type="text"
                                     value={rule.field === '__custom__' ? '' : rule.field}
                                     onChange={(e) => updateSortRule(rule.id, { field: e.target.value })}
-                                    placeholder="field.path"
+                                    placeholder={td('documentViewer.builder.fieldPathPlaceholder')}
                                     className="h-7 min-w-0 flex-1 font-mono text-[11px]"
                                     data-testid={`sort-field-custom-${rule.id}`}
                                   />
                                   {fields.length > 0 && (
-                                    <button 
+                                    <button
                                       onClick={() => updateSortRule(rule.id, { field: fields[0] })}
                                       className="shrink-0 text-[10px] text-primary hover:underline"
                                     >
-                                      List
+                                      {td('documentViewer.actions.listShortcut')}
                                     </button>
                                   )}
                                 </div>
@@ -2201,7 +2270,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                   {fields.map(f => (
                                     <option key={f} value={f}>{f}</option>
                                   ))}
-                                  <option value="__custom__">Custom field...</option>
+                                  <option value="__custom__">{td('documentViewer.builder.customField')}</option>
                                 </select>
                               )}
 
@@ -2212,17 +2281,17 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                                 className="h-7 w-[75px] shrink-0 rounded-md border border-border bg-background px-2 text-[11px]"
                                 data-testid={`sort-direction-${rule.id}`}
                               >
-                                <option value="1">Asc (1)</option>
-                                <option value="-1">Desc (-1)</option>
+                                <option value="1">{td('documentViewer.builder.ascOption', { n: 1 })}</option>
+                                <option value="-1">{td('documentViewer.builder.descOption', { n: -1 })}</option>
                               </select>
 
                               <div className="flex-grow" />
 
                               {/* Delete button */}
-                              <button 
+                              <button
                                 onClick={() => deleteSortRule(rule.id)}
                                 className="p-1 rounded text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-                                title="Remove Rule"
+                                title={td('documentViewer.tooltips.removeRule')}
                               >
                                 <Trash2 size={11} />
                               </button>
@@ -2231,7 +2300,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                         })}
                         <Button variant="outline" size="sm" onClick={addSortRule} className="h-7 w-full gap-1 text-[11px]" data-testid="sort-add-rule-btn">
                           <Plus size={11} />
-                          <span>Add Sort Field</span>
+                          <span>{td('documentViewer.actions.addSortField')}</span>
                         </Button>
                       </div>
                     )}
@@ -2244,7 +2313,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
             <div className="flex shrink-0 justify-end border-t border-border bg-card p-2">
               <Button onClick={handleRun} disabled={loading || !canRun} size="sm" className="h-7 text-[11px]">
-                Apply
+                {td('documentViewer.actions.apply')}
               </Button>
             </div>
             </div>
@@ -2257,6 +2326,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
             <ResizableHandle withHandle data-testid="ai-helper-resizer" />
             <ResizablePanel id="ai-helper" minSize="18%" maxSize="50%" className="flex min-h-0 flex-col">
               <AIChatPanel
+                sessionKey={chatSessionKey}
                 variant="editor"
                 embedded
                 databaseName={databaseName}
@@ -2266,6 +2336,8 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 onClose={() => setIsAIHelperOpen(false)}
                 onInsertQuery={handleInsertQuery}
                 onInsertAndRunQuery={handleInsertAndRunQuery}
+                initialMessages={initialChatMessages}
+                onMessagesChange={onChatMessagesChange}
               />
             </ResizablePanel>
           </>

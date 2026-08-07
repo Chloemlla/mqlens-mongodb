@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
 import Editor from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
@@ -65,25 +66,28 @@ interface ParsedCall {
   argText: string;
 }
 
-const HELP_LINES = [
-  'Shell helpers',
-  '  show dbs                 list databases',
-  '  show collections         list collections in current db',
-  '  use <db>                 switch current database',
+// Keys into shell:mongoShell.help — translated at the call site (`help` command
+// handler below) rather than here, since this module-level constant can't call
+// the useTranslation hook. A blank string renders as a blank line unchanged.
+const HELP_LINE_KEYS = [
+  'help.title',
+  'help.showDbs',
+  'help.showCollections',
+  'help.useDb',
   '',
-  'Collection methods (rendered in the Data Viewer)',
-  '  db.<coll>.find(<query>).sort(<sort>).skip(n).limit(n)',
-  '  db.<coll>.findOne(<query>)',
-  '  db.<coll>.aggregate([{ $match }, { $sort }, { $skip }, { $limit }])',
-  '  db.<coll>.countDocuments(<query>)',
-  '  db.<coll>.getIndexes()',
+  'help.collectionMethodsHeader',
+  'help.findSyntax',
+  'help.findOneSyntax',
+  'help.aggregateSyntax',
+  'help.countDocumentsSyntax',
+  'help.getIndexesSyntax',
   '',
-  'JavaScript scripts (run via mongosh)',
-  '  Write multi-line JS: variables, loops, functions, try/catch.',
-  '  printjson(db.<coll>.find().toArray())   print results',
-  '  load("script.js")                       run a .js file',
+  'help.jsHeader',
+  'help.jsMultiline',
+  'help.printjson',
+  'help.load',
   '',
-  '  cls / clear              clear this console',
+  'help.clsClear',
 ];
 
 const splitCalls = (source: string): { calls: ParsedCall[]; rest: string } => {
@@ -116,7 +120,12 @@ const splitCalls = (source: string): { calls: ParsedCall[]; rest: string } => {
   return { calls, rest: source.slice(i) };
 };
 
-const parseLoose = (source: string, fallback: unknown = {}) => {
+// Pure, module-scope helper — can't call the useTranslation hook. Every call
+// site is inside the component, where the real `t` is in scope, so it's
+// threaded through as a required parameter instead; the thrown message ends
+// up in a shell `error` entry the user reads, so it must be translated like
+// any other visible copy.
+const parseLoose = (source: string, fallback: unknown, t: (key: string, opts?: any) => string) => {
   const trimmed = source.trim();
   if (!trimmed) return fallback;
   try {
@@ -129,7 +138,7 @@ const parseLoose = (source: string, fallback: unknown = {}) => {
         .replace(/,(\s*[}\]])/g, '$1');
       return JSON.parse(normalized);
     } catch {
-      throw new Error(`Invalid mongosh JSON literal: ${trimmed}`);
+      throw new Error(t('shell:mongoShell.errors.invalidJsonLiteral', { value: trimmed }));
     }
   }
 };
@@ -189,6 +198,11 @@ const extractVersion = (value: unknown) => {
   return text.match(/\d+\.\d+\.\d+(?:[-\w.]*)?/)?.[0] || text || 'unavailable';
 };
 
+// Reproduces mongosh's own startup banner verbatim (same convention as
+// HELP_LINE_KEYS' findSyntax/aggregateSyntax/etc. below: real mongosh output
+// is English-only regardless of the host OS locale, so translating this
+// would misrepresent what the actual CLI tool prints). Not UI copy — i18n
+// out of scope by design, kept as an exempt literal.
 const buildStartupLines = (
   logId: string,
   target: string,
@@ -213,6 +227,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   onInstallTools,
   reconnectSignal,
 }) => {
+  const { t } = useTranslation('shell');
   const [currentDb, setCurrentDb] = useState(databaseName);
   const startupLogId = useMemo(createLogId, []);
   // Display the connection name in the startup banner, never the URI — the URI
@@ -362,13 +377,16 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         if (session.stdout.length > 0 || session.stderr.length > 0) {
           appendCommandOutput({ stdout: session.stdout, stderr: session.stderr });
         }
-        setEntries((prev) => [...prev, { kind: 'note', text: 'mongosh session attached' }]);
+        setEntries((prev) => [...prev, { kind: 'note', text: t('mongoShell.notes.sessionAttached') }]);
       } catch (err: any) {
         if (!cancelled) {
           setSessionId(null);
           setEntries((prev) => [
             ...prev,
-            { kind: 'error', message: `mongosh session unavailable: ${err.message || String(err)}` },
+            {
+              kind: 'error',
+              message: t('mongoShell.notes.sessionUnavailable', { detail: err.message || String(err) }),
+            },
           ]);
         }
       } finally {
@@ -435,21 +453,23 @@ export const MongoShell: React.FC<MongoShellProps> = ({
 
   const browseForMongosh = async () => {
     try {
-      const picked = await openFileDialog({ multiple: false, title: 'Locate the mongosh binary' });
+      const picked = await openFileDialog({ multiple: false, title: t('mongoShell.gate.browseDialogTitle') });
       if (typeof picked === 'string' && picked) await saveMongoshPath(picked);
     } catch {
       /* user cancelled */
     }
   };
 
-  // OS-specific manual install hint for the gate card.
+  // OS-specific manual install hint for the gate card. The commands themselves
+  // are literal shell input the user copies verbatim, so only the parenthetical
+  // notes around them are translated (Global Constraint 2).
   const installHint = useMemo(() => {
     const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
     if (/mac/i.test(ua)) return 'brew install mongosh';
-    if (/win/i.test(ua)) return 'winget install MongoDB.Shell (or the MSI from mongodb.com)';
-    if (/linux/i.test(ua)) return 'sudo apt install mongodb-mongosh (or your distro’s package)';
-    return 'install mongosh from mongodb.com';
-  }, []);
+    if (/win/i.test(ua)) return `winget install MongoDB.Shell (${t('mongoShell.gate.installNote.windows')})`;
+    if (/linux/i.test(ua)) return `sudo apt install mongodb-mongosh (${t('mongoShell.gate.installNote.linux')})`;
+    return t('mongoShell.gate.installNote.generic');
+  }, [t]);
 
   const executeFind = async (
     collName: string,
@@ -459,8 +479,8 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   ) => {
     const op = calls[0];
     const call = (name: string) => calls.find((candidate) => candidate.name === name);
-    const filter = parseLoose(firstArg(op.argText), {});
-    const sort = call('sort') ? parseLoose(call('sort')!.argText, {}) : {};
+    const filter = parseLoose(firstArg(op.argText), {}, t);
+    const sort = call('sort') ? parseLoose(call('sort')!.argText, {}, t) : {};
     const skip = call('skip') ? Number.parseInt(call('skip')!.argText, 10) || 0 : 0;
     const limit = forceLimit ?? (call('limit') ? Number.parseInt(call('limit')!.argText, 10) || 50 : 50);
     const started = performance.now();
@@ -480,14 +500,14 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       ...prev,
       {
         kind: 'note',
-        text: `${docs.length} document${docs.length === 1 ? '' : 's'} -> Data Viewer`,
+        text: t('mongoShell.notes.resultToDataViewer', { count: docs.length }),
       },
     ]);
   };
 
   const executeAggregate = async (collName: string, calls: ParsedCall[]) => {
-    const pipeline = parseLoose(calls[0].argText, []) as Array<Record<string, unknown>>;
-    if (!Array.isArray(pipeline)) throw new Error('aggregate() expects a pipeline array');
+    const pipeline = parseLoose(calls[0].argText, [], t) as Array<Record<string, unknown>>;
+    if (!Array.isArray(pipeline)) throw new Error(t('mongoShell.errors.aggregateExpectsPipeline'));
     // Run the real pipeline (every stage — $group, $project, $unwind, …) via the
     // driver, rather than collapsing it down to a find().
     const started = performance.now();
@@ -504,7 +524,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       ...prev,
       {
         kind: 'note',
-        text: `${docs.length} document${docs.length === 1 ? '' : 's'} -> Data Viewer`,
+        text: t('mongoShell.notes.resultToDataViewer', { count: docs.length }),
       },
     ]);
   };
@@ -550,7 +570,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
 
   const cancelDestructive = () => {
     setPendingDestructive(null);
-    setEntries((prev) => [...prev, { kind: 'note', text: 'Destructive command cancelled.' }]);
+    setEntries((prev) => [...prev, { kind: 'note', text: t('mongoShell.notes.destructiveCancelled') }]);
   };
 
   const runCommand = async (commandOverride?: string) => {
@@ -565,7 +585,8 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         return;
       }
       if (/^help$/i.test(raw)) {
-        setEntries((prev) => [...prev, { kind: 'text', lines: HELP_LINES }]);
+        const helpLines = HELP_LINE_KEYS.map((key) => (key ? t(`mongoShell.${key}`) : ''));
+        setEntries((prev) => [...prev, { kind: 'text', lines: helpLines }]);
         setTab('console');
         return;
       }
@@ -581,7 +602,10 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       if (useMatch) {
         setCurrentDb(useMatch[1]);
         if (!ranExternally) {
-          setEntries((prev) => [...prev, { kind: 'note', text: `switched to db ${useMatch[1]}` }]);
+          setEntries((prev) => [
+            ...prev,
+            { kind: 'note', text: t('mongoShell.notes.switchedToDb', { db: useMatch[1] }) },
+          ]);
         }
         setTab('console');
         return;
@@ -628,7 +652,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
             id: connectionId,
             database: currentDb,
             collection: collName,
-            filter: JSON.stringify(parseLoose(firstArg(calls[0].argText), {})),
+            filter: JSON.stringify(parseLoose(firstArg(calls[0].argText), {}, t)),
           });
           setEntries((prev) => [...prev, { kind: 'value', value: count }, { kind: 'note', text: `${Math.round((performance.now() - started) * 10) / 10} ms` }]);
           setTab('console');
@@ -645,7 +669,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       // gated behind a session, so the no-session case is unreachable in practice;
       // guard defensively.
       if (ranExternally) return;
-      throw new Error('mongosh session required to run scripts');
+      throw new Error(t('mongoShell.errors.sessionRequiredForScripts'));
     } catch (err: any) {
       setEntries((prev) => [...prev, { kind: 'error', message: err.message || String(err) }]);
       setTab('console');
@@ -693,14 +717,14 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           {!sessionAttempted ? (
             <>
               <div className="h-6 w-6 animate-spin rounded-full border-b-2 border-primary" />
-              <span className="text-sm text-muted-foreground">Starting mongosh session…</span>
+              <span className="text-sm text-muted-foreground">{t('mongoShell.gate.startingSession')}</span>
             </>
           ) : (
             <>
               <Terminal size={28} className="text-muted-foreground" />
-              <div className="text-sm font-semibold text-foreground">MongoShell requires mongosh</div>
+              <div className="text-sm font-semibold text-foreground">{t('mongoShell.gate.requiresMongosh')}</div>
               <div className="max-w-sm text-xs leading-relaxed text-muted-foreground">
-                A live mongosh session is required to run queries and scripts here.
+                {t('mongoShell.gate.requiresMongoshBody')}
               </div>
               {detectedMongosh && (
                 <div
@@ -708,7 +732,10 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                   data-testid="shell-detected-mongosh"
                 >
                   <div className="text-foreground">
-                    Found <span className="font-semibold">mongosh {detectedMongosh.version}</span>
+                    {t('mongoShell.gate.found')}{' '}
+                    <span className="font-semibold">
+                      {t('mongoShell.gate.foundMongoshVersion', { version: detectedMongosh.version })}
+                    </span>
                   </div>
                   <div className="truncate font-mono text-ui-2xs text-muted-foreground" title={detectedMongosh.path}>
                     {detectedMongosh.path}
@@ -719,39 +746,43 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                     onClick={() => void saveMongoshPath(detectedMongosh.path)}
                     data-testid="shell-use-detected-btn"
                   >
-                    Use this binary
+                    {t('mongoShell.gate.useThisBinary')}
                   </Button>
                 </div>
               )}
               <div className="mt-1 flex items-center gap-2">
                 {onInstallTools && (
                   <Button onClick={onInstallTools} data-testid="shell-install-tools-btn">
-                    Install tools…
+                    {t('mongoShell.gate.installTools')}
                   </Button>
                 )}
                 <Button variant="outline" onClick={() => void browseForMongosh()} data-testid="shell-browse-mongosh-btn">
-                  Browse for binary…
+                  {t('mongoShell.gate.browseForBinary')}
                 </Button>
                 {onOpenSettings && (
                   <Button variant="outline" onClick={onOpenSettings} data-testid="gate-open-settings">
-                    Open Settings
+                    {t('mongoShell.gate.openSettings')}
                   </Button>
                 )}
                 <Button variant="outline" onClick={() => setRetryNonce((n) => n + 1)} data-testid="gate-retry">
-                  Retry
+                  {t('mongoShell.gate.retry')}
                 </Button>
               </div>
               <div className="max-w-sm text-ui-2xs text-muted-foreground" data-testid="shell-install-hint">
-                Or install it yourself: <code className="font-mono">{installHint}</code> — see the{' '}
-                <button
-                  type="button"
-                  className="text-primary underline-offset-2 hover:underline"
-                  onClick={() => void openUrl('https://www.mongodb.com/docs/mongodb-shell/install/')}
-                  data-testid="shell-mongosh-docs-link"
-                >
-                  mongosh install docs
-                </button>
-                .
+                <Trans i18nKey="shell:mongoShell.gate.installHint" t={t} values={{ hint: installHint }}>
+                  Or install it yourself:{' '}
+                  <code className="font-mono">{{ hint: installHint } as unknown as string}</code>{' '}
+                  — see the{' '}
+                  <button
+                    type="button"
+                    className="text-primary underline-offset-2 hover:underline"
+                    onClick={() => void openUrl('https://www.mongodb.com/docs/mongodb-shell/install/')}
+                    data-testid="shell-mongosh-docs-link"
+                  >
+                    mongosh install docs
+                  </button>
+                  .
+                </Trans>
               </div>
             </>
           )}
@@ -777,17 +808,17 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           </span>
           <Button size="sm" onClick={() => runRef.current()} disabled={running}>
             <Play size={11} />
-            Run
+            {t('mongoShell.toolbar.run')}
           </Button>
           <Button
             variant="outline"
             size="sm"
             onClick={() => setIsAIOpen((v) => !v)}
             data-testid="shell-ai-toggle"
-            title="AI assistant"
+            title={t('mongoShell.toolbar.aiToggleTitle')}
           >
             <Sparkles size={11} />
-            AI
+            {t('mongoShell.toolbar.aiToggleLabel')}
           </Button>
         </div>
         <div className="min-h-0 flex-1">
@@ -860,7 +891,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
             loading={
               <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
                 <Terminal size={22} />
-                <span>Loading editor...</span>
+                <span>{t('mongoShell.editor.loading')}</span>
               </div>
             }
           />
@@ -887,7 +918,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                 onClick={() => setTab('console')}
               >
                 <Terminal size={12} className={tab === 'console' ? 'text-success' : ''} />
-                Console
+                {t('mongoShell.console.tabLabel')}
               </TabsTrigger>
               {viewer && (
                 <TabsTrigger
@@ -896,7 +927,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                   onClick={() => setTab('viewer')}
                 >
                   <Braces size={12} className={tab === 'viewer' ? 'text-primary' : ''} />
-                  Data Viewer
+                  {t('mongoShell.console.dataViewerTabLabel')}
                   <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">{viewer.docs.length}</Badge>
                 </TabsTrigger>
               )}
@@ -904,7 +935,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           </Tabs>
           <span className="flex-1" />
           {tab === 'console' ? (
-            <Button type="button" variant="ghost" size="icon" className="h-7 w-7" title="Clear console" onClick={() => setEntries([])}>
+            <Button type="button" variant="ghost" size="icon" className="h-7 w-7" title={t('mongoShell.console.clearTitle')} onClick={() => setEntries([])}>
               <Eraser size={12} />
             </Button>
           ) : (
@@ -919,7 +950,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         {tab === 'console' ? (
           <div className="min-h-0 flex-1 overflow-y-auto p-2 font-mono text-xs" ref={scrollRef}>
             {entries.length === 0 && (
-              <div className="py-4 text-center text-muted-foreground">Console cleared - run a command above.</div>
+              <div className="py-4 text-center text-muted-foreground">{t('mongoShell.console.cleared')}</div>
             )}
             {entries.map((entry, index) => {
               if (entry.kind === 'input') {
@@ -986,23 +1017,25 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-sm">
               <AlertCircle size={18} className="text-destructive" />
-              Destructive operation
+              {t('mongoShell.destructiveDialog.title')}
             </DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground">
-            This script runs <strong className="text-foreground">{pendingDestructive.operation}</strong>, which can permanently
-            delete data. Review it before running.
+            <Trans i18nKey="shell:mongoShell.destructiveDialog.body" t={t} values={{ operation: pendingDestructive.operation }}>
+              This script runs <strong className="text-foreground">{{ operation: pendingDestructive.operation } as unknown as string}</strong>, which can permanently
+              delete data. Review it before running.
+            </Trans>
           </p>
           <pre className="max-h-[200px] overflow-auto rounded-md bg-muted p-3 font-mono text-xs text-foreground">
             {pendingDestructive.command}
           </pre>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={cancelDestructive} data-testid="destructive-cancel">
-              Cancel
+              {t('mongoShell.destructiveDialog.cancel')}
             </Button>
             <Button type="button" variant="destructive" onClick={confirmDestructive} data-testid="destructive-run">
               <Play size={11} />
-              Run anyway
+              {t('mongoShell.destructiveDialog.runAnyway')}
             </Button>
           </DialogFooter>
         </DialogContent>
