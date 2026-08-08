@@ -210,6 +210,16 @@ interface DocumentViewerProps {
   /** Restored when remounting this tab's viewer (see App tab cache). */
   initialBuilderState?: BuilderState;
   onBuilderStateChange?: (state: BuilderState) => void;
+  /** What the results pager last asked for, with a revision only it bumps.
+   *
+   *  The values travel WITH the revision on purpose. Syncing from the executed
+   *  `lastQuery` instead was wrong twice over: keyed on the values it fired on
+   *  mount (discarding a restored but unexecuted edit) and when an unrelated
+   *  in-flight run landed (discarding input typed after Run); keyed on the
+   *  revision it fired one render too early, because App bumps the revision
+   *  before the query resolves — so the builder synced to the OLD page size and
+   *  never corrected. One atomic object removes the window entirely. */
+  pagerRequest?: { limit: number; skip: number; revision: number };
   /** Identifies this tab's chat so an in-flight AI request survives the
    *  unmount that happens when the user switches tabs. */
   chatSessionKey?: string;
@@ -544,6 +554,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   availableFields = [],
   initialBuilderState = DEFAULT_BUILDER_STATE,
   onBuilderStateChange,
+  pagerRequest,
   chatSessionKey,
   initialChatMessages = [],
   onChatMessagesChange,
@@ -560,6 +571,18 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const [sortQuery, setSortQuery] = useState(initialBuilderState.sortQuery);
   const [limit, setLimit] = useState(initialBuilderState.limit);
   const [skip, setSkip] = useState(initialBuilderState.skip);
+
+  // One-way resync from the pager, and ONLY from the pager. The ref starts at
+  // the revision present on mount, so mounting never applies — otherwise
+  // switching tabs would overwrite a restored-but-unrun edit. Everything else
+  // that changes the executed query leaves these fields alone.
+  const appliedPagerRevision = useRef(pagerRequest?.revision);
+  useEffect(() => {
+    if (!pagerRequest || pagerRequest.revision === appliedPagerRevision.current) return;
+    appliedPagerRevision.current = pagerRequest.revision;
+    setLimit(String(pagerRequest.limit));
+    setSkip(String(pagerRequest.skip));
+  }, [pagerRequest]);
   const [explainLoading, setExplainLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
