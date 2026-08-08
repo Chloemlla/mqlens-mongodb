@@ -3877,6 +3877,69 @@ describe('App Component', () => {
       expect(screen.getByText('Move to win-1 (orders)')).toBeInTheDocument();
     });
 
+    it('offers Close Tab, and Close Others only when there is another tab', async () => {
+      const { fireEvent, within } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+
+      // Only Quick Start: closing it is offered, but there is nothing else to
+      // close and nothing to its right.
+      const tabStrip = screen.getByTestId('workspace-tab-strip');
+      fireEvent.contextMenu((await within(tabStrip).findByText('Quick Start')).closest('div')!);
+      await screen.findByTestId('context-menu');
+      expect(screen.getByText('Close Tab')).toBeInTheDocument();
+      expect(screen.queryByText('Close Other Tabs')).not.toBeInTheDocument();
+      expect(screen.queryByText('Close Tabs to the Right')).not.toBeInTheDocument();
+    });
+
+    it('leaves Quick Start alone when closing other tabs', async () => {
+      const { fireEvent, within, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+
+      // Quick Start + customers. "Close Other Tabs" from customers must not
+      // sweep away the home tab as collateral.
+      fireEvent.click(screen.getByTestId('select-collection-btn'));
+      const tabStrip = screen.getByTestId('workspace-tab-strip');
+      const customersTab = await within(tabStrip).findByText('customers');
+
+      fireEvent.contextMenu(customersTab.closest('div')!);
+      await screen.findByTestId('context-menu');
+      // Quick Start is the only other tab, and it is excluded — so there is
+      // nothing left to close and the entry is not offered at all.
+      expect(screen.queryByText('Close Other Tabs')).not.toBeInTheDocument();
+
+      // It is still closable on purpose, from its own context menu.
+      fireEvent.keyDown(document, { key: 'Escape' });
+      fireEvent.contextMenu((await within(tabStrip).findByText('Quick Start')).closest('div')!);
+      await screen.findByTestId('context-menu');
+      fireEvent.click(screen.getByText('Close Tab'));
+      await waitFor(() =>
+        expect(within(screen.getByTestId('workspace-tab-strip')).queryByText('Quick Start')).toBeNull()
+      );
+    });
+
+    it('closes the tabs to the right of the clicked tab, and only those', async () => {
+      const { fireEvent, within, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+
+      // Quick Start + customers, in that order.
+      fireEvent.click(screen.getByTestId('select-collection-btn'));
+      const tabStrip = screen.getByTestId('workspace-tab-strip');
+      await within(tabStrip).findByText('customers');
+
+      fireEvent.contextMenu((await within(tabStrip).findByText('Quick Start')).closest('div')!);
+      await screen.findByTestId('context-menu');
+      fireEvent.click(screen.getByText('Close Tabs to the Right'));
+
+      await waitFor(() =>
+        expect(within(screen.getByTestId('workspace-tab-strip')).queryByText('customers')).toBeNull()
+      );
+      // The clicked tab itself survives — "to the right" excludes it.
+      expect(within(screen.getByTestId('workspace-tab-strip')).getByText('Quick Start')).toBeInTheDocument();
+    });
+
     it('hides "Detach to New Window" when this window holds only one tab, but still offers "Move to <window>"', async () => {
       const { fireEvent, within } = await import('@testing-library/react');
       renderWithProviders(<App />);
@@ -3965,7 +4028,7 @@ describe('App Component', () => {
       expect(screen.getAllByTestId(/^pane-pane-/)).toHaveLength(1);
     });
 
-    it('hides both cross-window items for an unmirrored (export/import) tab, showing a disabled explanatory entry instead', async () => {
+    it('hides both cross-window items for an unmirrored (export/import) tab, but still offers the close actions', async () => {
       mockInvoke.mockImplementation((cmd: string) => {
         if (cmd === 'execute_mql_query') return Promise.resolve([JSON.stringify({ _id: '1', name: 'Ada' })]);
         return Promise.resolve([]);
@@ -3991,21 +4054,36 @@ describe('App Component', () => {
       const placeholder = screen.getByText('Export/import tabs stay in their window');
       expect(placeholder.closest('button')).toBeDisabled();
       expect(placeholder.closest('button')).toHaveAttribute('title', 'Export/import tabs stay in their window');
+
+      // Closing is local — `dispatchWorkspace` drops unmirrored ids from what
+      // it mirrors — so the restriction covers detach/move only. The note now
+      // explains what is missing rather than replacing the entire menu.
+      expect(screen.getByText('Close Tab')).toBeInTheDocument();
+      // Quick Start and the customers tab share this pane; only customers is
+      // bulk-closable, which is enough for the entry to appear.
+      expect(screen.getByText('Close Other Tabs')).toBeInTheDocument();
+      // Nothing sits to the right of the export tab.
+      expect(screen.queryByText('Close Tabs to the Right')).not.toBeInTheDocument();
     });
 
-    it('does not open an empty context menu for the sole tab when no other windows exist', async () => {
+    it('offers only Close Tab for the sole tab when no other windows exist', async () => {
       const { fireEvent, within } = await import('@testing-library/react');
       renderWithProviders(<App />);
       await screen.findByTestId('mock-sidebar');
 
-      // Only Quick Start is open, and no other windows were seeded — both
-      // "Detach to New Window" and any "Move to" entries are absent, so
-      // buildTabContextMenuItems returns [] and the menu must not open.
+      // Only Quick Start is open and no other windows were seeded, so
+      // "Detach to New Window" and every "Move to" entry are absent. The menu
+      // used to be empty and therefore suppressed; closing is always available
+      // now — the tab strip's own X offers it for every tab — so it opens with
+      // that single entry.
       const tabStrip = screen.getByTestId('workspace-tab-strip');
       const quickstartTab = await within(tabStrip).findByText('Quick Start');
       fireEvent.contextMenu(quickstartTab.closest('div')!);
 
-      expect(screen.queryByTestId('context-menu')).not.toBeInTheDocument();
+      expect(await screen.findByTestId('context-menu')).toBeInTheDocument();
+      expect(screen.getByText('Close Tab')).toBeInTheDocument();
+      expect(screen.queryByText('Detach to New Window')).not.toBeInTheDocument();
+      expect(screen.queryByText('Close Other Tabs')).not.toBeInTheDocument();
     });
   });
 
