@@ -2698,6 +2698,91 @@ describe('App Component', () => {
       const filterInput = await screen.findByTestId('query-filter-input');
       expect((filterInput as HTMLInputElement).value).toBe('{"seeded":true}');
     });
+
+    it('a rebound tab MOVED to another window keeps its session — the survival check translates profile-space ids', async () => {
+      // Reconnecting re-keys the tab to `new-conn-1.…` while the workspace goes
+      // on storing `profile:p1.…`. A tab that merely moved to another window is
+      // gone from THIS window's tree but still in the document; comparing the
+      // two id spaces directly made it look deleted, and the dispose that
+      // followed killed the mongosh child the move was meant to carry across.
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'workspace_get') return Promise.resolve(workspaceSnapshot);
+        if (cmd === 'load_connection_profiles') {
+          return Promise.resolve([{ id: 'p1', name: 'Prod Cluster', uri: 'mongodb://prod', ssh: null }]);
+        }
+        if (cmd === 'connect_db') return Promise.resolve('new-conn-1');
+        if (cmd === 'execute_mql_query') return Promise.resolve([JSON.stringify({ _id: '1', name: 'Ada' })]);
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor, act } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+
+      const [firstBtn] = await screen.findAllByRole('button', { name: /Reconnect Prod Cluster/ });
+      fireEvent.click(firstBtn);
+      await waitFor(() => {
+        expect(screen.queryAllByTestId('reconnect-banner')).toHaveLength(0);
+      });
+
+      // A live session for the tab that is about to move.
+      const { writeShellSession, readShellSession } = await import('../../lib/mongoshSession');
+      writeShellSession('new-conn-1.sales_db.customers', {
+        sessionId: 'sess-live',
+        currentDb: 'sales_db',
+      });
+
+      calls.length = 0;
+
+      // `customers` has moved to win-1; main keeps only `orders`.
+      await act(async () => {
+        fireMockEvent('workspace-changed', {
+          revision: 2,
+          origin: 'win-1',
+          crossWindow: true,
+          workspace: {
+            revision: 2,
+            windows: [
+              {
+                id: 'main',
+                focusedPaneId: 'pane-2',
+                splitTree: {
+                  kind: 'pane',
+                  id: 'pane-2',
+                  tabIds: ['profile:p1.sales_db.orders'],
+                  activeTabId: 'profile:p1.sales_db.orders',
+                },
+              },
+              {
+                id: 'win-1',
+                focusedPaneId: 'pane-9',
+                splitTree: {
+                  kind: 'pane',
+                  id: 'pane-9',
+                  tabIds: ['profile:p1.sales_db.customers'],
+                  activeTabId: 'profile:p1.sales_db.customers',
+                },
+              },
+            ],
+            tabs: workspaceSnapshot.tabs,
+          },
+        });
+      });
+
+      // `disposeShellSession` always clears the backend entry, so that call is
+      // the tell that the tab was treated as deleted rather than moved.
+      const cleared = calls.filter(
+        (c) => c.cmd === 'clear_shell_tab_state' && c.args?.tabId === 'new-conn-1.sales_db.customers'
+      );
+      expect(cleared).toEqual([]);
+      expect(calls.filter((c) => c.cmd === 'stop_mongosh_session')).toEqual([]);
+
+      // The backend session lives on for the destination window, but THIS
+      // renderer forgets its copy: moving the tab back must re-read the state
+      // the other window has been updating, not this stale snapshot.
+      expect(readShellSession('new-conn-1.sales_db.customers')).toBeUndefined();
+    });
   });
 
   describe('dispatchWorkspace no-op mirror gate (#97 phase 2 final review Fix 3)', () => {
