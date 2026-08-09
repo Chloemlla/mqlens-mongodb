@@ -10,6 +10,13 @@ import { CommandPalette, type PaletteAction } from './components/CommandPalette'
 import { DocumentViewer, builderStateFromQueryTab, type BuilderState } from './components/DocumentViewer';
 import type { ChatMessage } from './components/AIChatPanel';
 import { clearChatRequest, renameChatRequest, resetChatRequests } from './lib/aiChatRequest';
+import {
+  disposeShellSession,
+  disposeShellSessionsForTabs,
+  forgetShellSession,
+  renameShellSession,
+  retargetShellSessionDatabase,
+} from './lib/mongoshSession';
 import { DataGrid, type ViewMode } from './components/DataGrid';
 import { ConnectionManager } from './components/ConnectionManager';
 import { SettingsView, type SettingsTabId, MONGO_TOOLS_DIR_KEY } from './components/SettingsModal';
@@ -100,7 +107,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { FolderCode, KeyRound, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
+import { FolderCode, KeyRound, X, ChevronsRight, XSquare, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
 import logoMark from './assets/logo-mark.svg';
 
 export interface QueryTab {
@@ -445,7 +452,9 @@ function Workspace() {
   // so both must live here — same pattern as `tabBuilderStateCache` (#120).
   // Open state survives tab switches; only the panel close control (or opening
   // the query builder) turns it off.
-  const tabChatCache = useRef(new Map<string, { messages: ChatMessage[]; isOpen: boolean }>());
+  const tabChatCache = useRef(
+    new Map<string, { messages: ChatMessage[]; isOpen: boolean; chatId?: string }>()
+  );
   // Workspace-store mirroring plumbing (Phase 2 Task 5). Mirroring starts
   // DISABLED — the restore effect below is the only thing allowed to turn it
   // on, once workspace_get has resolved (snapshot applied or none found).
@@ -550,11 +559,21 @@ function Workspace() {
   }, []);
   const handleChatMessagesChange = useCallback((tabId: string, messages: ChatMessage[]) => {
     const prev = tabChatCache.current.get(tabId);
-    tabChatCache.current.set(tabId, { messages, isOpen: prev?.isOpen ?? false });
+    tabChatCache.current.set(tabId, { ...prev, messages, isOpen: prev?.isOpen ?? false });
   }, []);
   const handleAIHelperOpenChange = useCallback((tabId: string, isOpen: boolean) => {
     const prev = tabChatCache.current.get(tabId);
-    tabChatCache.current.set(tabId, { messages: prev?.messages ?? [], isOpen });
+    tabChatCache.current.set(tabId, { ...prev, messages: prev?.messages ?? [], isOpen });
+  }, []);
+  /** Which stored conversation a tab has open — the transcript itself lives in
+   *  the backend chat store, not here. */
+  const handleAIChatIdChange = useCallback((tabId: string, chatId: string) => {
+    const prev = tabChatCache.current.get(tabId);
+    tabChatCache.current.set(tabId, {
+      messages: prev?.messages ?? [],
+      isOpen: prev?.isOpen ?? false,
+      chatId,
+    });
   }, []);
   const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
   const [isConnectionModalOpen, setIsConnectionModalOpen] = useState(false);
@@ -653,6 +672,9 @@ function Workspace() {
       // The in-flight request follows the tab; dropping it here would lose a
       // reply that is already on its way.
       renameChatRequest(oldId, newId);
+      // So does the shell session — it is a live process, and leaving it under
+      // the dead id would strand it while the rebound tab spawned another.
+      renameShellSession(oldId, newId);
     }
 
     // Dispatched straight to the layout reducer via `dispatchLayout`,
@@ -797,6 +819,9 @@ function Workspace() {
             // stale transcript after hydrate reuses ids.
             tabChatCache.current.clear();
             resetChatRequests();
+            // Scoped to the ids this window is about to hydrate: a global clear
+            // would strip other windows' live shells of their recovery mapping.
+            void disposeShellSessionsForTabs(snapshot.tabs.map((t) => t.id));
             const windowTabIds = new Set(snapshot.tabs.map((t) => t.id));
             const profileNames = new Map<string, string>();
             for (const t of ws.tabs) {
@@ -1916,6 +1941,19 @@ function Workspace() {
     dispatchWorkspace({ type: 'open_tab', tabId });
   };
 
+  /** Carry a tab's chat state to its new id. A rename mints a new tab id, so
+   *  without this the renamed tab opens with no remembered conversation and an
+   *  in-flight reply is left addressed to a key nothing will mount under
+   *  again. `rebindProfileTabs` already does this for the same reason. */
+  const moveTabChatState = useCallback((oldId: string, newId: string) => {
+    const chat = tabChatCache.current.get(oldId);
+    if (chat) {
+      tabChatCache.current.set(newId, chat);
+      tabChatCache.current.delete(oldId);
+    }
+    renameChatRequest(oldId, newId);
+  }, []);
+
   const handleCollectionRenamed = (
     connectionId: string,
     dbName: string,
@@ -1942,7 +1980,14 @@ function Workspace() {
       .map(t => ({ oldId: t.id, newId: renameTab(t).id }))
       .filter(p => p.oldId !== p.newId);
     setTabs(prev => prev.map(renameTab));
-    renamedPairs.forEach(({ oldId, newId }) => dispatchWorkspace({ type: 'rename_tab', oldId, newId }));
+    renamedPairs.forEach(({ oldId, newId }) => {
+      // A rename mints a new tab id, so the shell session has to follow it —
+      // otherwise the live mongosh child is stranded under the dead id and the
+      // renamed tab starts a second one.
+      renameShellSession(oldId, newId);
+      moveTabChatState(oldId, newId);
+      dispatchWorkspace({ type: 'rename_tab', oldId, newId });
+    });
     invalidatePaletteNamespaceIndex(connectionId);
   };
 
@@ -1989,10 +2034,29 @@ function Workspace() {
     };
 
     const renamedPairs = tabs
-      .map(t => ({ oldId: t.id, newId: renameTab(t).id }))
+      .map(t => ({ oldId: t.id, newId: renameTab(t).id, isShell: t.type === 'shell' }))
       .filter(p => p.oldId !== p.newId);
     setTabs(prev => prev.map(renameTab));
-    renamedPairs.forEach(({ oldId, newId }) => dispatchWorkspace({ type: 'rename_tab', oldId, newId }));
+    renamedPairs.forEach(({ oldId, newId, isShell }) => {
+      // A rename mints a new tab id, so the shell session has to follow it —
+      // otherwise the live mongosh child is stranded under the dead id and the
+      // renamed tab starts a second one.
+      const moved = renameShellSession(oldId, newId);
+      if (isShell) {
+        // Moving the session is not enough when the DATABASE is what changed:
+        // the retained mongosh child is still `use`-d into the old name, and
+        // Sidebar renames with `dropSource: true`, so a write from this
+        // apparently-renamed tab would recreate the database the rename just
+        // dropped. Called synchronously, not off `moved`: the `setTabs` above
+        // re-keys this tab, so React remounts the shell before any awaited
+        // continuation would run and the new instance would seed itself from a
+        // registry entry still naming the old database. The retarget only falls
+        // back to awaiting the rename when nothing is cached to remount from.
+        void retargetShellSessionDatabase(newId, newName, moved);
+      }
+      moveTabChatState(oldId, newId);
+      dispatchWorkspace({ type: 'rename_tab', oldId, newId });
+    });
     invalidatePaletteNamespaceIndex(connectionId);
   };
 
@@ -2183,6 +2247,7 @@ function Workspace() {
       tabBuilderStateCache.current.delete(action.tabId);
       tabChatCache.current.delete(action.tabId);
       clearChatRequest(action.tabId);
+      void disposeShellSession(action.tabId);
       // #91: forget this tab's generate-task tracking on close (running or
       // finished) — otherwise reopening "Generate Data…" on the same
       // namespace reuses the same deterministic tab id and the fresh view
@@ -2205,11 +2270,21 @@ function Workspace() {
       // connect, so any stale entries either of those leaves behind
       // permanently fall outside the tab-id space any future tab could
       // ever resolve — harmless, not reachable again. No fix needed there.
+      const closing = new Set(action.tabIds);
       action.tabIds.forEach((id) => {
         generateTaskIdsRef.current.delete(id);
+        tabBuilderStateCache.current.delete(id);
         tabChatCache.current.delete(id);
         clearChatRequest(id);
+        void disposeShellSession(id);
       });
+      // Prune `tabs[]` here rather than leaving it to the caller. Every
+      // pre-existing call site happened to do its own `setTabs` first, so the
+      // gap was invisible until a new one did not — and the symptom is a
+      // layout/tabs mismatch ("tabs[] contains ids missing from workspace
+      // layout") rather than anything that points at the cause. Filtering twice
+      // is harmless; forgetting to filter is not. `close_tab` already does this.
+      setTabs((prev) => prev.filter((t) => !closing.has(t.id)));
     }
     dispatchLayout(action);
 
@@ -2354,15 +2429,17 @@ function Workspace() {
   // backend has no record of them — so both are hidden for them, replaced
   // by a single disabled, explanatory entry.
   const buildTabContextMenuItems = (tabId: string): ContextMenuItem[] => {
-    if (unmirroredTabIdsRef.current.has(tabId)) {
-      const explanation = tShell('workspaceTabBar.contextMenu.unmirroredExplanation');
-      return [{ label: explanation, onClick: () => {}, disabled: true, title: explanation }];
-    }
-
+    // Unmirrored (export/import/generate) tabs exist only in this renderer, so
+    // anything that hands the tab to the BACKEND is unavailable to them. The
+    // close group is not in that category — closing is purely local, and
+    // `dispatchWorkspace` already strips unmirrored ids from what it mirrors,
+    // for `close_many` as well as `close_tab`. Gating the WHOLE menu on this
+    // left an export tab unable to close itself or its neighbours at all.
+    const isUnmirrored = unmirroredTabIdsRef.current.has(tabId);
     const items: ContextMenuItem[] = [];
 
     const dupSource = tabs.find((t) => t.id === tabId && t.type === 'collection');
-    if (dupSource) {
+    if (dupSource && !isUnmirrored) {
       items.push({
         label: tShell('workspaceTabBar.contextMenu.duplicateTab'),
         icon: <Copy />,
@@ -2370,12 +2447,49 @@ function Workspace() {
       });
     }
 
-    if (allTabIds(layout).length > 1) {
+    if (!isUnmirrored && allTabIds(layout).length > 1) {
       items.push({
         label: tShell('workspaceTabBar.contextMenu.detachToNewWindow'),
         icon: <ExternalLink />,
         separatorBefore: items.length > 0,
         onClick: () => handleDetachTab(tabId),
+      });
+    }
+
+    // Close group. Scoped to the pane holding this tab, which is what "others"
+    // and "to the right" mean on a tab strip — a second pane's tabs are a
+    // different strip and are left alone. `close_many` is one op rather than a
+    // loop of `close_tab`, so the pane folds once and the backend sees a single
+    // mirrored action.
+    const paneTabIds = paneOfTab(layout.root, tabId)?.tabIds ?? [];
+    const tabIndex = paneTabIds.indexOf(tabId);
+    // Quick Start is the workspace's home tab, not a document: a bulk close
+    // aimed at query tabs should not sweep it away as collateral. Closing it
+    // deliberately still works — its own X, and Close Tab when it is the tab
+    // that was right-clicked.
+    const isBulkClosable = (id: string) =>
+      id !== tabId && tabs.find((t) => t.id === id)?.type !== 'quickstart';
+    const otherTabIds = paneTabIds.filter(isBulkClosable);
+    const rightTabIds = (tabIndex >= 0 ? paneTabIds.slice(tabIndex + 1) : []).filter(isBulkClosable);
+
+    items.push({
+      label: tShell('workspaceTabBar.contextMenu.closeTab'),
+      icon: <X />,
+      separatorBefore: items.length > 0,
+      onClick: () => closeTabById(tabId),
+    });
+    if (otherTabIds.length > 0) {
+      items.push({
+        label: tShell('workspaceTabBar.contextMenu.closeOthers'),
+        icon: <XSquare />,
+        onClick: () => dispatchWorkspace({ type: 'close_many', tabIds: otherTabIds }),
+      });
+    }
+    if (rightTabIds.length > 0) {
+      items.push({
+        label: tShell('workspaceTabBar.contextMenu.closeToTheRight'),
+        icon: <ChevronsRight />,
+        onClick: () => dispatchWorkspace({ type: 'close_many', tabIds: rightTabIds }),
       });
     }
 
@@ -2385,7 +2499,7 @@ function Workspace() {
     // "Detach to New Window" item was actually pushed) — otherwise the
     // first "Move to" entry would render an orphan divider line at the very
     // top of the menu.
-    otherWindows.forEach((w, i) => {
+    (isUnmirrored ? [] : otherWindows).forEach((w, i) => {
       const hint = activeTabHintFor(w, allTabs, t);
       const target = hint ? `${w.id} (${hint})` : w.id;
       items.push({
@@ -2395,6 +2509,19 @@ function Workspace() {
         onClick: () => handleMoveTab(tabId, w.id),
       });
     });
+
+    // Kept as a trailing note rather than the whole menu: it now explains what
+    // is ABSENT (detach/move) instead of standing in for everything.
+    if (isUnmirrored) {
+      const explanation = tShell('workspaceTabBar.contextMenu.unmirroredExplanation');
+      items.push({
+        label: explanation,
+        onClick: () => {},
+        disabled: true,
+        title: explanation,
+        separatorBefore: items.length > 0,
+      });
+    }
 
     return items;
   };
@@ -2806,6 +2933,20 @@ function Workspace() {
           tabBuilderStateCache.current.clear();
           tabChatCache.current.clear();
           resetChatRequests();
+          // Not every tab here is gone from the DOCUMENT. This branch also runs
+          // when the last tab of a secondary window is moved elsewhere — that
+          // move is why the window disappeared — and the destination is about
+          // to attach to that tab's mongosh session. Disposing it would kill
+          // the process and delete the state the other window is reaching for.
+          const survivors = new Set(
+            payload.workspace.windows
+              .flatMap((w) => allPanes(w.splitTree).flatMap((p) => p.tabIds))
+              .map((id) => toLiveSpaceId(id, connections))
+          );
+          tabsRef.current.forEach((t) => {
+            if (survivors.has(t.id)) forgetShellSession(t.id);
+            else void disposeShellSession(t.id);
+          });
           dispatchLayout({ type: 'hydrate', layout: createInitialLayout([], null) });
           return;
         }
@@ -2869,10 +3010,33 @@ function Workspace() {
         );
         if (leaving.length > 0) {
           const leavingIds = new Set(leaving.map((t) => t.id));
+          // "Leaving" means gone from THIS window's tree — which includes a tab
+          // that was merely moved or detached to another window. Those are still
+          // in the document, and killing their mongosh child would either strand
+          // the destination with a dead session id or lose the REPL state it is
+          // supposed to carry across. Only dispose tabs that left the workspace
+          // entirely.
+          // Translated to live space, exactly like `foreignLiveIds` above: the
+          // workspace stores profile-space ids, `leavingIds` holds live ones, so
+          // an untranslated comparison would report every rebound tab as gone
+          // from the document and kill the session the move was meant to carry.
+          const stillInWorkspace = new Set(
+            payload.workspace.windows
+              .flatMap((w) => allPanes(w.splitTree).flatMap((p) => p.tabIds))
+              .map((id) => toLiveSpaceId(id, connections))
+          );
           leavingIds.forEach((id) => {
             tabBuilderStateCache.current.delete(id);
             tabChatCache.current.delete(id);
             clearChatRequest(id);
+            // Gone from the document: end the session. Merely moved to another
+            // window: that window owns the child now, so it must keep running —
+            // but this renderer's cached copy has to go, or moving the tab back
+            // would seed it from a snapshot predating everything the other
+            // window did, and a command still in flight here would mirror its
+            // stale transcript over the newer one.
+            if (stillInWorkspace.has(id)) forgetShellSession(id);
+            else void disposeShellSession(id);
             unmirroredTabIdsRef.current.delete(id);
           });
           setTabs((prev) => prev.filter((t) => !leavingIds.has(t.id)));
@@ -3015,6 +3179,7 @@ function Workspace() {
             tabBuilderStateCache.current.delete(id);
             tabChatCache.current.delete(id);
             clearChatRequest(id);
+            void disposeShellSession(id);
             unmirroredTabIdsRef.current.delete(id);
           });
           setTabs((prev) => prev.filter((t) => !removedIds.has(t.id)));
@@ -3631,8 +3796,10 @@ function Workspace() {
               chatSessionKey={tab.id}
               initialChatMessages={tabChatCache.current.get(tab.id)?.messages ?? []}
               onChatMessagesChange={(messages) => handleChatMessagesChange(tab.id, messages)}
-              initialAIHelperOpen={tabChatCache.current.get(tab.id)?.isOpen ?? false}
+              initialAIHelperOpen={tabChatCache.current.get(tab.id)?.isOpen}
               onAIHelperOpenChange={(isOpen) => handleAIHelperOpenChange(tab.id, isOpen)}
+              aiChatId={tabChatCache.current.get(tab.id)?.chatId}
+              onAIChatIdChange={(chatId) => handleAIChatIdChange(tab.id, chatId)}
               onExecute={q => handleExecuteQuery(tab, q)}
               onExecuteAggregate={pipeline => handleExecuteAggregate(tab, pipeline)}
               onExplain={filter => handleExplainQuery(tab, filter)}
@@ -3934,6 +4101,7 @@ function Workspace() {
               onOpenSettings={handleOpenToolsSettings}
               onInstallTools={handleOpenToolSetup}
               reconnectSignal={shellReconnectNonce}
+              sessionKey={tab.id}
             />
           );
         })()}

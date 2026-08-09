@@ -17,6 +17,18 @@
       "closeTitle": "Close AI Assistant",
       "title": "AI Query Assistant"
     },
+    "history": {
+      "clearAll": "Delete all conversations",
+      "clearScope": "Delete this collection's conversations",
+      "current": "open",
+      "delete": "Delete this conversation",
+      "empty": "No conversations yet",
+      "newChat": "New chat",
+      "openElsewhere": "Already open in another tab",
+      "thisCollectionOnly": "This collection only",
+      "title": "Chat history",
+      "untitled": "Untitled chat"
+    },
     "queryType": {
       "aggregate": "Aggregation pipeline",
       "find": "Find query",
@@ -267,12 +279,15 @@
       "resultToDataViewer_one": "{{count}} document -> Data Viewer",
       "resultToDataViewer_other": "{{count}} documents -> Data Viewer",
       "sessionAttached": "mongosh session attached",
+      "sessionRestarting": "restarting mongosh session…",
       "sessionUnavailable": "mongosh session unavailable: {{detail}}",
       "switchedToDb": "switched to db {{db}}"
     },
     "toolbar": {
       "aiToggleLabel": "AI",
       "aiToggleTitle": "AI assistant",
+      "restartSession": "Restart",
+      "restartSessionTitle": "Stop this mongosh session and start a new one",
       "run": "Run"
     }
   },
@@ -456,6 +471,9 @@
     "closeTab": "Close {{label}}",
     "closeTooltip": "Close tab",
     "contextMenu": {
+      "closeOthers": "Close Other Tabs",
+      "closeTab": "Close Tab",
+      "closeToTheRight": "Close Tabs to the Right",
       "detachToNewWindow": "Detach to New Window",
       "duplicateTab": "Duplicate Tab",
       "moveToWindow": "Move to {{target}}",

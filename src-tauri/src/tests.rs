@@ -1791,7 +1791,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = start_mongosh_session_impl(&state, &conn_id, "mongodb://mock", "db", "")
+        let err = start_mongosh_session_impl(&state, &conn_id, "mongodb://mock", "db", "", "")
             .await
             .err()
             .expect("read-only connection must refuse a mongosh session");
@@ -1816,7 +1816,7 @@ mod tests {
             crate::connections::ConnectionMode::ConfirmDestructive,
         )
         .unwrap();
-        let err = start_mongosh_session_impl(&cd_state, &cd_id, "mongodb://mock", "db", "")
+        let err = start_mongosh_session_impl(&cd_state, &cd_id, "mongodb://mock", "db", "", "")
             .await
             .err()
             .expect("mock connections still can't run an external mongosh");
@@ -1832,7 +1832,7 @@ mod tests {
         let normal_id = connect_db_impl(&normal_state, "mongodb://mock", None)
             .await
             .expect("connect mock");
-        let err = start_mongosh_session_impl(&normal_state, &normal_id, "mongodb://mock", "db", "")
+        let err = start_mongosh_session_impl(&normal_state, &normal_id, "mongodb://mock", "db", "", "")
             .await
             .err()
             .expect("mock connections still can't run an external mongosh");
@@ -2675,6 +2675,7 @@ mod tests {
         assert_eq!(legacy.openai_model, "gpt-4o");
         assert_eq!(legacy.gemini_model, "gemini-1.5-flash");
         assert_eq!(legacy.ai_custom_instructions, "");
+        assert_eq!(legacy.ai_history_retention_months, 3);
 
         // resolve_local_command falls back to built-in defaults when unset.
         assert_eq!(
@@ -4186,4 +4187,657 @@ mod tests {
             .await
             .expect("disconnect must succeed even with no registered meta");
     }
+}
+
+#[cfg(test)]
+mod shell_tab_state_tests {
+    use crate::state::AppState;
+    use crate::{
+        clear_shell_tab_state_impl, get_shell_tab_state_impl, rename_shell_tab_state_impl,
+        set_shell_tab_state_impl, shell_tab_ids_for_window,
+    };
+
+    fn state() -> AppState {
+        AppState::new()
+    }
+
+    #[test]
+    fn a_closed_window_is_remembered_so_a_pending_start_can_abandon_itself() {
+        // Closing a window destroys the renderer that would have cancelled a
+        // `start_mongosh_session` still in flight, and that child has no
+        // session id to record until it exists — so the close sweep finds
+        // nothing to stop and the process survives until the app exits. The
+        // start consults this and stops the child it just spawned.
+        use crate::state::LockExt;
+        use crate::window_is_closed;
+        let st = state();
+
+        assert!(!window_is_closed(&st, "win-1").unwrap());
+        // No owning window recorded (an older frontend, or the main window
+        // before it has a label) must never look closed.
+        assert!(!window_is_closed(&st, "").unwrap());
+
+        st.closed_windows.lock_safe().unwrap().insert("win-1".into());
+
+        assert!(window_is_closed(&st, "win-1").unwrap());
+        assert!(!window_is_closed(&st, "win-2").unwrap());
+
+        // Labels are reused within a session, so respawning one must clear it —
+        // otherwise every start in the new window would kill its own child.
+        st.closed_windows.lock_safe().unwrap().remove("win-1");
+        assert!(!window_is_closed(&st, "win-1").unwrap());
+    }
+
+    #[test]
+    fn claiming_stamps_the_new_owner_and_returns_what_is_actually_stored() {
+        // The claim exists because a moved tab's entry still names the window
+        // it left. It touches only the owner field and hands back the current
+        // value, so the caller never replays a snapshot of its own over a write
+        // the previous owner made in the meantime.
+        use crate::claim_shell_tab_state_impl;
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-1", "windowId": "win-1", "entries": ["kept"] }),
+        )
+        .unwrap();
+
+        let claimed = claim_shell_tab_state_impl(&st, "tab-1", "win-2")
+            .unwrap()
+            .expect("an existing tab is claimable");
+
+        assert_eq!(claimed.get("windowId").unwrap(), "win-2");
+        assert_eq!(claimed.get("sessionId").unwrap(), "sess-1");
+        assert_eq!(
+            claimed.get("entries").unwrap(),
+            &serde_json::json!(["kept"]),
+            "claiming must not drop the rest of the value"
+        );
+        // ...and the change stuck, so the close sweep can find it.
+        assert_eq!(
+            shell_tab_ids_for_window(&st, "win-2").unwrap(),
+            vec!["tab-1".to_string()]
+        );
+        assert!(shell_tab_ids_for_window(&st, "win-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_write_from_the_previous_owner_is_dropped_whole() {
+        // The departed renderer's mirror is fire-and-forget, so a write from it
+        // can land after the destination has claimed the tab. It carries a
+        // snapshot taken BEFORE the move: merging it would restore the old
+        // window as owner, and overwrite the transcript, database and session
+        // id the new owner has recorded since.
+        use crate::claim_shell_tab_state_impl;
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-1", "windowId": "win-1" }),
+        )
+        .unwrap();
+        claim_shell_tab_state_impl(&st, "tab-1", "win-2").unwrap();
+        // What the new owner has recorded since taking it.
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-2", "entries": ["new"], "windowId": "win-2" }),
+        )
+        .unwrap();
+
+        // The old owner's delayed write, still naming itself.
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-1", "entries": ["stale"], "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        let stored = get_shell_tab_state_impl(&st, "tab-1").unwrap().unwrap();
+        assert_eq!(stored.get("windowId").unwrap(), "win-2");
+        assert_eq!(stored.get("sessionId").unwrap(), "sess-2");
+        assert_eq!(
+            stored.get("entries").unwrap(),
+            &serde_json::json!(["new"]),
+            "the stale snapshot overwrote the new owner's transcript"
+        );
+    }
+
+    #[test]
+    fn a_write_from_a_closed_window_is_refused_and_hands_back_its_child() {
+        // The close sweep has already run, so recreating the entry would leave
+        // the mongosh child it names with nothing pointing at it. The id comes
+        // back so the caller can stop it.
+        use crate::state::LockExt;
+        let st = state();
+        st.closed_windows.lock_safe().unwrap().insert("win-9".into());
+
+        let orphan = set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-late", "windowId": "win-9" }),
+        )
+        .unwrap();
+
+        assert_eq!(orphan.as_deref(), Some("sess-late"));
+        assert_eq!(
+            get_shell_tab_state_impl(&st, "tab-1").unwrap(),
+            None,
+            "a closed window's write recreated its entry"
+        );
+    }
+
+    #[test]
+    fn a_closed_window_s_write_is_not_treated_as_an_orphan_once_another_window_owns_the_tab() {
+        // The moved tab was claimed by its destination before the source
+        // window closed, so the source's queued write names a session the
+        // DESTINATION is now using. Stopping it would kill a live shell.
+        use crate::state::LockExt;
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-live", "windowId": "win-2" }),
+        )
+        .unwrap();
+        st.closed_windows.lock_safe().unwrap().insert("win-1".into());
+
+        let orphan = set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-live", "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        assert_eq!(orphan, None, "the destination's live session was stopped");
+        assert_eq!(
+            get_shell_tab_state_impl(&st, "tab-1")
+                .unwrap()
+                .unwrap()
+                .get("windowId")
+                .unwrap(),
+            "win-2"
+        );
+    }
+
+    #[test]
+    fn the_close_sweep_leaves_a_tab_another_window_has_claimed() {
+        // The sweep enumerates a window's tabs and then takes them one by one;
+        // a destination can claim one in between. Taking it anyway would delete
+        // state that now belongs to the other window and stop its child.
+        use crate::{claim_shell_tab_state_impl, take_shell_tab_state_if_owned};
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "s", "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        // Enumerated as win-1's, then claimed by win-2 before the take.
+        claim_shell_tab_state_impl(&st, "tab-1", "win-2").unwrap();
+
+        assert_eq!(take_shell_tab_state_if_owned(&st, "tab-1", "win-1").unwrap(), None);
+        assert!(
+            get_shell_tab_state_impl(&st, "tab-1").unwrap().is_some(),
+            "the new owner's state was swept away"
+        );
+        // The real owner can still take it.
+        assert!(take_shell_tab_state_if_owned(&st, "tab-1", "win-2").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_placeholder_entry_does_not_hide_a_newly_started_child() {
+        // A tab usually holds a placeholder with a null id while its session
+        // starts. If the write carrying the real id arrives after the window is
+        // marked closed, "an entry exists" is not evidence anyone is tracking
+        // that child — the sweep would stop the null (i.e. nothing) and the new
+        // mongosh process would survive to app exit.
+        use crate::state::LockExt;
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": serde_json::Value::Null, "windowId": "win-9" }),
+        )
+        .unwrap();
+        st.closed_windows.lock_safe().unwrap().insert("win-9".into());
+
+        let orphan = set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-new", "windowId": "win-9" }),
+        )
+        .unwrap();
+
+        assert_eq!(orphan.as_deref(), Some("sess-new"));
+    }
+
+    #[test]
+    fn a_closed_window_write_naming_the_recorded_session_is_not_stopped_twice() {
+        use crate::state::LockExt;
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-1", "windowId": "win-9" }),
+        )
+        .unwrap();
+        st.closed_windows.lock_safe().unwrap().insert("win-9".into());
+
+        // The sweep will take this entry and stop sess-1 itself.
+        let orphan = set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "sess-1", "windowId": "win-9" }),
+        )
+        .unwrap();
+
+        assert_eq!(orphan, None);
+    }
+
+    #[test]
+    fn the_current_owner_keeps_writing_normally() {
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "s", "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "s", "entries": ["mine"], "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        let stored = get_shell_tab_state_impl(&st, "tab-1").unwrap().unwrap();
+        assert_eq!(stored.get("entries").unwrap(), &serde_json::json!(["mine"]));
+    }
+
+    #[test]
+    fn a_write_that_names_no_window_keeps_the_recorded_owner() {
+        // How a caller with nothing to say about ownership behaves. It must not
+        // be able to lose its own data to this guard.
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "s", "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        set_shell_tab_state_impl(&st, "tab-1", serde_json::json!({ "entries": ["anon"] })).unwrap();
+
+        let stored = get_shell_tab_state_impl(&st, "tab-1").unwrap().unwrap();
+        assert_eq!(stored.get("entries").unwrap(), &serde_json::json!(["anon"]));
+        assert_eq!(stored.get("windowId").unwrap(), "win-1");
+    }
+
+    #[test]
+    fn a_brand_new_entry_takes_the_owner_its_creator_supplies() {
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "fresh",
+            serde_json::json!({ "sessionId": "s", "windowId": "win-3" }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            shell_tab_ids_for_window(&st, "win-3").unwrap(),
+            vec!["fresh".to_string()]
+        );
+    }
+
+    #[test]
+    fn disowning_only_gives_up_a_claim_you_still_hold() {
+        use crate::{claim_shell_tab_state_impl, disown_shell_tab_state_impl};
+        let st = state();
+        set_shell_tab_state_impl(
+            &st,
+            "tab-1",
+            serde_json::json!({ "sessionId": "s", "windowId": "win-1" }),
+        )
+        .unwrap();
+
+        // Someone else has taken it since; the late disown must not strip them.
+        claim_shell_tab_state_impl(&st, "tab-1", "win-2").unwrap();
+        disown_shell_tab_state_impl(&st, "tab-1", "win-1").unwrap();
+        assert_eq!(
+            shell_tab_ids_for_window(&st, "win-2").unwrap(),
+            vec!["tab-1".to_string()]
+        );
+
+        // The real owner giving it up leaves it unowned, ready to be re-taken.
+        disown_shell_tab_state_impl(&st, "tab-1", "win-2").unwrap();
+        assert!(shell_tab_ids_for_window(&st, "win-2").unwrap().is_empty());
+        let stored = get_shell_tab_state_impl(&st, "tab-1").unwrap().unwrap();
+        assert_eq!(stored.get("sessionId").unwrap(), "s", "the rest of the value survived");
+    }
+
+    #[test]
+    fn claiming_a_tab_with_no_state_is_a_no_op() {
+        use crate::claim_shell_tab_state_impl;
+        assert_eq!(
+            claim_shell_tab_state_impl(&state(), "nope", "win-2").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lists_only_the_tabs_a_given_window_owns() {
+        // Closing a secondary window with the OS X button runs no frontend
+        // code, so the backend stops that window's shells itself. It has to
+        // find them by the recorded owner: the workspace's tab ids are
+        // profile-space while these keys are live-space, so a shell rebound to
+        // a connection — the only kind with a child worth stopping — is filed
+        // under an id the workspace never mentions.
+        let st = state();
+        let owned = serde_json::json!({ "sessionId": "a", "windowId": "window-2" });
+        set_shell_tab_state_impl(&st, "live.tab-1", owned).unwrap();
+        set_shell_tab_state_impl(
+            &st,
+            "main.tab",
+            serde_json::json!({ "sessionId": "b", "windowId": "main" }),
+        )
+        .unwrap();
+        // Predates the stamp, or was written by an older build.
+        set_shell_tab_state_impl(&st, "unstamped", serde_json::json!({ "sessionId": "c" }))
+            .unwrap();
+
+        assert_eq!(
+            shell_tab_ids_for_window(&st, "window-2").unwrap(),
+            vec!["live.tab-1".to_string()]
+        );
+        assert!(shell_tab_ids_for_window(&st, "window-9").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stores_and_returns_a_tabs_state() {
+        let st = state();
+        let value = serde_json::json!({ "sessionId": "sess-1", "entries": [] });
+        set_shell_tab_state_impl(&st, "tab-1", value.clone()).unwrap();
+
+        assert_eq!(get_shell_tab_state_impl(&st, "tab-1").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn an_unknown_tab_has_no_state() {
+        assert_eq!(get_shell_tab_state_impl(&state(), "nope").unwrap(), None);
+    }
+
+    #[test]
+    fn clearing_one_tab_leaves_the_others() {
+        let st = state();
+        set_shell_tab_state_impl(&st, "tab-1", serde_json::json!({ "sessionId": "a" })).unwrap();
+        set_shell_tab_state_impl(&st, "tab-2", serde_json::json!({ "sessionId": "b" })).unwrap();
+
+        clear_shell_tab_state_impl(&st, "tab-1").unwrap();
+
+        assert_eq!(get_shell_tab_state_impl(&st, "tab-1").unwrap(), None);
+        assert!(get_shell_tab_state_impl(&st, "tab-2").unwrap().is_some());
+    }
+
+    #[test]
+    fn rename_moves_the_state_to_the_new_tab_id() {
+        let st = state();
+        let value = serde_json::json!({ "sessionId": "sess-1" });
+        set_shell_tab_state_impl(&st, "old", value.clone()).unwrap();
+
+        rename_shell_tab_state_impl(&st, "old", "new").unwrap();
+
+        assert_eq!(get_shell_tab_state_impl(&st, "old").unwrap(), None);
+        assert_eq!(get_shell_tab_state_impl(&st, "new").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn renaming_an_unknown_tab_is_a_no_op() {
+        let st = state();
+        rename_shell_tab_state_impl(&st, "missing", "new").unwrap();
+        assert_eq!(get_shell_tab_state_impl(&st, "new").unwrap(), None);
+    }
+
+
+mod chat_claim_tests {
+    use crate::chats::{claim_chat, release_chat, release_window_chats};
+
+    #[tokio::test]
+    async fn one_panel_at_a_time_holds_a_conversation() {
+        // Two tabs in the SAME window are two panels, so the owner token is
+        // per-panel: keying this on the window would let both adopt one chat
+        // and then save their own transcript over the other's.
+        assert!(claim_chat("c1".into(), "main#1".into()).await.unwrap());
+        assert!(!claim_chat("c1".into(), "main#2".into()).await.unwrap());
+        // ...including a panel in another window.
+        assert!(!claim_chat("c1".into(), "win-2#1".into()).await.unwrap());
+        // Re-claiming your own is fine — a remount must not lock itself out.
+        assert!(claim_chat("c1".into(), "main#1".into()).await.unwrap());
+
+        release_chat("c1".into(), "main#1".into()).await.unwrap();
+        assert!(claim_chat("c1".into(), "main#2".into()).await.unwrap());
+        release_chat("c1".into(), "main#2".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_late_release_cannot_free_someone_else_s_chat() {
+        claim_chat("c2".into(), "main#1".into()).await.unwrap();
+        release_chat("c2".into(), "main#1".into()).await.unwrap();
+        claim_chat("c2".into(), "main#2".into()).await.unwrap();
+
+        // The first panel finishing its teardown after the second took over.
+        release_chat("c2".into(), "main#1".into()).await.unwrap();
+
+        assert!(
+            !claim_chat("c2".into(), "main#3".into()).await.unwrap(),
+            "the new holder lost its claim to a stale release"
+        );
+        release_chat("c2".into(), "main#2".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_a_window_frees_every_chat_its_panels_held() {
+        // Those panels get no chance to release anything themselves.
+        claim_chat("c3".into(), "win-9#1".into()).await.unwrap();
+        claim_chat("c4".into(), "win-9#2".into()).await.unwrap();
+        claim_chat("c5".into(), "main#1".into()).await.unwrap();
+
+        release_window_chats("win-9");
+
+        assert!(claim_chat("c3".into(), "main#7".into()).await.unwrap());
+        assert!(claim_chat("c4".into(), "main#7".into()).await.unwrap());
+        assert!(
+            !claim_chat("c5".into(), "main#8".into()).await.unwrap(),
+            "another window's claim was collateral"
+        );
+    }
+}
+
+mod chat_store_tests {
+    use crate::chats::{
+        prune_expired, save_store_to_file, summaries, upsert_chat, Chat, ChatMessage, ChatScope,
+        ChatStore, MAX_MESSAGES,
+    };
+
+    fn chat(id: &str, collection: &str, updated_at: &str) -> Chat {
+        Chat {
+            id: id.to_string(),
+            title: format!("chat {id}"),
+            messages: vec![],
+            connection_name: "Local".to_string(),
+            database: "test-db".to_string(),
+            collection: collection.to_string(),
+            variant: "editor".to_string(),
+            created_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    fn scope(collection: &str, variant: &str) -> ChatScope {
+        ChatScope {
+            connection_name: "Local".to_string(),
+            database: "test-db".to_string(),
+            collection: collection.to_string(),
+            variant: variant.to_string(),
+        }
+    }
+
+    #[test]
+    fn saving_the_same_chat_twice_replaces_it_rather_than_duplicating() {
+        // The panel saves the whole conversation on every message, so save has
+        // to be idempotent or one chat becomes N.
+        let mut second = chat("c1", "users", "2026-01-02T00:00:00Z");
+        second.title = "renamed".to_string();
+
+        let out = upsert_chat(vec![chat("c1", "users", "2026-01-01T00:00:00Z")], second, 200);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "renamed");
+    }
+
+    #[test]
+    fn chats_come_back_newest_first_and_capped() {
+        let existing = vec![
+            chat("old", "users", "2026-01-01T00:00:00Z"),
+            chat("mid", "users", "2026-01-02T00:00:00Z"),
+        ];
+
+        let out = upsert_chat(existing, chat("new", "users", "2026-01-03T00:00:00Z"), 2);
+
+        assert_eq!(
+            out.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "mid"],
+            "the oldest chat is the one dropped by the cap"
+        );
+    }
+
+    #[test]
+    fn a_long_conversation_keeps_its_most_recent_messages() {
+        // Pruned from the top, the way the transcript scrolls — losing the end
+        // of a conversation would be losing the part still being worked on.
+        let mut c = chat("c1", "users", "2026-01-01T00:00:00Z");
+        c.messages = (0..MAX_MESSAGES + 10)
+            .map(|i| ChatMessage {
+                id: format!("m{i}"),
+                role: "user".to_string(),
+                text: format!("msg {i}"),
+                query: None,
+                error: None,
+            })
+            .collect();
+
+        let out = upsert_chat(vec![], c, 200);
+
+        assert_eq!(out[0].messages.len(), MAX_MESSAGES);
+        assert_eq!(out[0].messages.first().unwrap().id, "m10");
+        assert_eq!(
+            out[0].messages.last().unwrap().id,
+            format!("m{}", MAX_MESSAGES + 9)
+        );
+    }
+
+    #[test]
+    fn retention_drops_only_what_predates_the_cutoff() {
+        let existing = vec![
+            chat("stale", "users", "2025-01-01T00:00:00Z"),
+            chat("fresh", "users", "2026-06-01T00:00:00Z"),
+        ];
+
+        let out = prune_expired(existing, "2026-01-01T00:00:00Z");
+
+        assert_eq!(out.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["fresh"]);
+    }
+
+    #[test]
+    fn an_absent_cutoff_prunes_nothing() {
+        // A caller with no retention setting to apply must not wipe the store.
+        let existing = vec![chat("c1", "users", "2020-01-01T00:00:00Z")];
+        assert_eq!(prune_expired(existing.clone(), "").len(), 1);
+    }
+
+    #[test]
+    fn a_chat_with_no_timestamp_survives_retention() {
+        // Hand-edited or written by an older build: dropping it silently would
+        // be worse than keeping it.
+        let existing = vec![chat("undated", "users", "")];
+        assert_eq!(prune_expired(existing, "2026-01-01T00:00:00Z").len(), 1);
+    }
+
+    #[test]
+    fn listing_narrows_to_a_scope_or_shows_everything() {
+        let mut shell_chat = chat("shell-1", "users", "2026-01-04T00:00:00Z");
+        shell_chat.variant = "shell".to_string();
+        let chats = vec![
+            chat("users-1", "users", "2026-01-03T00:00:00Z"),
+            chat("orders-1", "orders", "2026-01-02T00:00:00Z"),
+            shell_chat,
+        ];
+
+        let scoped = summaries(&chats, Some(&scope("users", "editor")));
+        assert_eq!(
+            scoped.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["users-1"],
+            "same collection in the shell is a different conversation"
+        );
+
+        let all = summaries(&chats, None);
+        assert_eq!(
+            all.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["shell-1", "users-1", "orders-1"],
+            "the global list is newest first across scopes"
+        );
+    }
+
+    #[test]
+    fn summaries_leave_the_messages_behind() {
+        // The list renders titles; shipping every transcript would make it grow
+        // with the size of the conversations rather than their number.
+        let mut c = chat("c1", "users", "2026-01-01T00:00:00Z");
+        c.messages = vec![ChatMessage {
+            id: "m0".to_string(),
+            role: "user".to_string(),
+            text: "hello".to_string(),
+            query: None,
+            error: None,
+        }];
+
+        let out = summaries(&[c], None);
+
+        assert_eq!(out[0].message_count, 1);
+        let json = serde_json::to_string(&out[0]).unwrap();
+        assert!(!json.contains("hello"), "summary carried the transcript: {json}");
+    }
+
+    #[test]
+    fn a_corrupt_or_missing_file_reads_as_an_empty_store() {
+        use crate::chats::load_store_from_file;
+        let dir = std::env::temp_dir().join("mqlens-chat-store-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let missing = dir.join("does-not-exist.json");
+        assert_eq!(load_store_from_file(&missing), ChatStore::default());
+
+        let corrupt = dir.join("corrupt.json");
+        std::fs::write(&corrupt, "{ not json").unwrap();
+        assert_eq!(load_store_from_file(&corrupt), ChatStore::default());
+    }
+
+    #[test]
+    fn a_saved_store_round_trips() {
+        let dir = std::env::temp_dir().join("mqlens-chat-store-roundtrip");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("chats.json");
+        let store = ChatStore {
+            chats: vec![chat("c1", "users", "2026-01-01T00:00:00Z")],
+        };
+
+        save_store_to_file(&path, &store).unwrap();
+
+        assert_eq!(crate::chats::load_store_from_file(&path), store);
+        assert!(!path.with_extension("json.tmp").exists(), "temp file left behind");
+    }
+}
+
 }
