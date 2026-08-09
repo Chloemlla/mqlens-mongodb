@@ -4,6 +4,20 @@ export const UI_ZOOM_MAX = 1.5;
 export const UI_ZOOM_STEP = 0.05;
 export const UI_ZOOM_DEFAULT = 1;
 
+/** Query-bar row height (design px at the default 13px root font). Drives the
+ *  query, projection and sort rows alike so the bar stays symmetric. */
+export const QUERY_BAR_HEIGHT_MIN = 23;
+export const QUERY_BAR_HEIGHT_MAX = 64;
+export const QUERY_BAR_HEIGHT_DEFAULT = 29;
+/** Option rows (projection / sort / skip / limit) stay at this compact height
+ *  whatever the query field is set to — like Compass, where only the primary
+ *  document editor grows and the small inputs never do. */
+export const QUERY_BAR_OPTION_HEIGHT = 22.75;
+export function clampQueryBarHeight(px: number): number {
+  if (!Number.isFinite(px)) return QUERY_BAR_HEIGHT_DEFAULT;
+  return Math.round(Math.min(Math.max(px, QUERY_BAR_HEIGHT_MIN), QUERY_BAR_HEIGHT_MAX));
+}
+
 /** Auto UI scale from display DPI / resolution (clamped for readability). */
 export function computeAutoDpiScale(): number {
   if (typeof window === "undefined") return 1;
@@ -46,6 +60,23 @@ export function applyUiScale(userZoom = UI_ZOOM_DEFAULT): number {
   const scale = computeEffectiveUiScale(userZoom);
   document.documentElement.style.setProperty("--ui-scale", String(scale));
   return scale;
+}
+
+/**
+ * Monaco takes an absolute px font size and can't read CSS variables, so its
+ * editors would keep one fixed size while the rest of the interface scales with
+ * the font-size setting and zoom. Convert a size chosen against the default
+ * 13px root font into the equivalent at the user's current settings.
+ */
+export const EDITOR_FONT_BASELINE_PX = 13;
+export function scaleEditorFontSize(
+  baseAt13px: number,
+  rootFontSizePx = EDITOR_FONT_BASELINE_PX,
+  userZoom = UI_ZOOM_DEFAULT
+): number {
+  const effectiveRoot = rootFontSizePx * computeEffectiveUiScale(userZoom);
+  const scaled = (baseAt13px * effectiveRoot) / EDITOR_FONT_BASELINE_PX;
+  return Math.round(scaled * 10) / 10;
 }
 
 /** Read effective root font size in px (user setting × DPI scale). */

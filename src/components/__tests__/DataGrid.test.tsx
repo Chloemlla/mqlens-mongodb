@@ -354,6 +354,17 @@ describe('DataGrid Component', () => {
     expect(writeText).toHaveBeenCalledWith('Alice Smith');
   });
 
+  it('copies an ObjectId cell as the raw hex, not the EJSON wrapper (#220)', () => {
+    const writeText = vi.fn();
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    // The _id cell renders as the bare hex string; right-click it and copy.
+    fireEvent.contextMenu(screen.getByText('603d779f4f102e3a185c3220'));
+    fireEvent.click(screen.getByText('Copy value'));
+    expect(writeText).toHaveBeenCalledWith('603d779f4f102e3a185c3220');
+  });
+
   it('shows the same context menu in the JSON view', () => {
     render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} onDeleteDocument={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: /json/i }));
@@ -601,6 +612,72 @@ describe('DataGrid — Compare documents', () => {
   });
 });
 
+describe('DataGrid table header/body scroll sync (#219)', () => {
+  it('keeps the header aligned by mirroring the body\'s horizontal scroll', () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    const header = screen.getByTestId('table-header');
+    const body = screen.getByTestId('table-body-scroll');
+
+    // jsdom has no layout: fake the overflow that makes a box scrollable, since
+    // only a horizontally-scrollable element is allowed to drive the header.
+    const overflowing = (el: HTMLElement) => {
+      Object.defineProperty(el, 'clientWidth', { value: 500, configurable: true });
+      Object.defineProperty(el, 'scrollWidth', { value: 1400, configurable: true });
+    };
+    overflowing(body);
+
+    body.scrollLeft = 240;
+    fireEvent.scroll(body);
+    expect(header.scrollLeft).toBe(240);
+
+    body.scrollLeft = 0;
+    fireEvent.scroll(body);
+    expect(header.scrollLeft).toBe(0);
+  });
+
+  it('syncs from the virtualized list\'s inner scroller too (scroll does not bubble)', () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    const header = screen.getByTestId('table-header');
+    const body = screen.getByTestId('table-body-scroll');
+    // react-window renders its own overflow:auto element inside the wrapper; a
+    // scroll there must still reach the header, which only works via capture.
+    const inner = body.firstElementChild as HTMLElement;
+    expect(inner).toBeTruthy();
+    Object.defineProperty(inner, 'clientWidth', { value: 500, configurable: true });
+    Object.defineProperty(inner, 'scrollWidth', { value: 1400, configurable: true });
+
+    inner.scrollLeft = 310;
+    fireEvent.scroll(inner);
+    expect(header.scrollLeft).toBe(310);
+  });
+
+  it('ignores a purely vertical scroller so it cannot reset the header', () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    const header = screen.getByTestId('table-header');
+    const body = screen.getByTestId('table-body-scroll');
+    Object.defineProperty(body, 'clientWidth', { value: 500, configurable: true });
+    Object.defineProperty(body, 'scrollWidth', { value: 1400, configurable: true });
+    body.scrollLeft = 200;
+    fireEvent.scroll(body);
+    expect(header.scrollLeft).toBe(200);
+
+    // A sibling box that only scrolls vertically (scrollWidth == clientWidth)
+    // must not drag the header back to 0.
+    const inner = body.firstElementChild as HTMLElement;
+    Object.defineProperty(inner, 'clientWidth', { value: 500, configurable: true });
+    Object.defineProperty(inner, 'scrollWidth', { value: 500, configurable: true });
+    inner.scrollLeft = 0;
+    fireEvent.scroll(inner);
+    expect(header.scrollLeft).toBe(200);
+  });
+});
+
 describe('DataGrid column resize', () => {
   it('renders a resize handle per table column and resizes with the keyboard', () => {
     render(<DataGrid documents={mockDocuments} />);
@@ -633,5 +710,38 @@ describe('DataGrid column resize', () => {
     fireEvent.mouseMove(window, { clientX: 360 });
     fireEvent.mouseUp(window);
     expect(headerCell.style.width).toBe('240px');
+  });
+});
+
+describe('view mode persistence (#218)', () => {
+  const docs = [{ _id: '1', name: 'Alice' }];
+
+  it('renders the view mode it is given instead of always defaulting to JSON', () => {
+    // The results pane is `{tab.loading ? <spinner/> : <DataGrid/>}`, so the
+    // grid unmounts on every run and its local viewMode reset to 'json'.
+    // Given a viewMode it must honour it, which is what survives the remount.
+    render(<DataGrid documents={docs} viewMode="table" onViewModeChange={() => {}} />);
+
+    const table = screen.getByRole('button', { name: /table/i });
+    expect(table.className).toContain('bg-accent');
+  });
+
+  it('reports a view mode change upward so the owner can store it on the tab', () => {
+    const onViewModeChange = vi.fn();
+    render(<DataGrid documents={docs} viewMode="json" onViewModeChange={onViewModeChange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+
+    expect(onViewModeChange).toHaveBeenCalledWith('tree');
+  });
+
+  it('still switches views on its own when no owner is managing it', () => {
+    // MongoShell renders <DataGrid documents={...}/> with no view-mode props;
+    // that path has to keep working uncontrolled.
+    render(<DataGrid documents={docs} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    expect(screen.getByRole('button', { name: /table/i }).className).toContain('bg-accent');
   });
 });

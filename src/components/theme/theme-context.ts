@@ -9,6 +9,8 @@ export interface ThemeContextValue {
   setPreset: (presetId: string) => void;
   setMode: (mode: ThemeMode) => void;
   setFontSize: (size: number) => void;
+  /** Query-bar row height in design px (query, projection and sort alike). */
+  setQueryBarHeight: (px: number) => void;
   setUiZoom: (zoom: number) => void;
   zoomIn: () => void;
   zoomOut: () => void;

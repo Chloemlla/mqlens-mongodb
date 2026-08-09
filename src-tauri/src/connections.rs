@@ -49,6 +49,10 @@ fn default_anthropic_model() -> String {
 fn default_ai_provider() -> String {
     "anthropic".to_string()
 }
+
+fn default_ai_history_retention_months() -> u8 {
+    3
+}
 fn default_openai_model() -> String {
     "gpt-4o".to_string()
 }
@@ -83,8 +87,21 @@ fn default_spacing_density() -> String {
     "cozy".to_string()
 }
 
+/// Query-bar row height in design px (at the default 13px root font); the UI
+/// scales it like everything else.
+fn default_query_bar_height() -> u8 {
+    29
+}
+
 fn default_ui_zoom() -> f32 {
     1.0
+}
+
+/// UI language setting. "system" follows the device language; "en"/"de" pin it.
+/// Defaults to "system" so a non-English device is localized without the user
+/// having to find the setting.
+fn default_locale() -> String {
+    "system".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -105,12 +122,16 @@ pub struct AppearanceSettings {
     pub spacing_density: String,
     #[serde(default = "default_ui_zoom")]
     pub ui_zoom: f32,
+    #[serde(default = "default_query_bar_height")]
+    pub query_bar_height: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppSettings {
     #[serde(default)]
     pub mongosh_path: String,
+    #[serde(default = "default_locale")]
+    pub locale: String,
     // Which AI provider the query assistant uses:
     // anthropic | openai | gemini | claude-code | codex | cursor | antigravity
     #[serde(default = "default_ai_provider")]
@@ -133,6 +154,9 @@ pub struct AppSettings {
     // Extra instructions appended to the generated system prompt for any provider.
     #[serde(default)]
     pub ai_custom_instructions: String,
+    /// How long to keep AI Helper chat/prompt history (1–12 months).
+    #[serde(default = "default_ai_history_retention_months")]
+    pub ai_history_retention_months: u8,
     // Auto-update channel: "stable" (default) or "dev".
     #[serde(default = "default_update_channel")]
     pub update_channel: String,
@@ -145,6 +169,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             mongosh_path: String::new(),
+            locale: default_locale(),
             ai_provider: default_ai_provider(),
             anthropic_api_key: String::new(),
             anthropic_model: default_anthropic_model(),
@@ -154,6 +179,7 @@ impl Default for AppSettings {
             gemini_model: default_gemini_model(),
             local_commands: std::collections::HashMap::new(),
             ai_custom_instructions: String::new(),
+            ai_history_retention_months: default_ai_history_retention_months(),
             update_channel: default_update_channel(),
             appearance: AppearanceSettings::default(),
         }

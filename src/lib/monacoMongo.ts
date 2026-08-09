@@ -2,7 +2,7 @@ import type { Monaco } from '@monaco-editor/react';
 import { getCompletions, type Surface, type CompletionKind } from './mongoCompletions';
 import type { SchemaMap } from './useCollectionSchema';
 
-interface ModelMeta { surface: Surface; getFields: () => string[]; getSchema: () => SchemaMap | undefined; getCollections?: () => string[]; getStageOperator?: () => string | undefined; }
+interface ModelMeta { surface: Surface; getFields: () => string[]; getSchema: () => SchemaMap | undefined; getCollections?: () => string[]; getStageOperator?: () => string | undefined; getShellSyntax?: () => boolean | undefined; }
 const modelMeta = new Map<string, ModelMeta>();
 let registered = false;
 
@@ -35,9 +35,10 @@ export function registerMongoCompletionProvider(monaco: Monaco) {
     d.setCompilerOptions({ ...d.getCompilerOptions(), lib: ['es2020'], allowNonTsExtensions: true });
   }
 
-  // Disable the built-in JSON language completions ($schema, etc.) so only our
-  // Mongo provider contributes in the filter/projection/sort/aggregation editors.
-  // Keep diagnostics/validation on.
+  // Belt-and-braces: also disable the built-in JSON language completions
+  // ($schema, etc.) in case any editor still uses JSON mode. The query editors
+  // themselves now run in JavaScript mode with diagnostics turned off (see
+  // QueryEditor), since query text is mongosh-style, not strict JSON.
   const json = (monaco.languages as unknown as { json?: any }).json;
   if (json?.jsonDefaults) {
     const jd = json.jsonDefaults;
@@ -61,11 +62,14 @@ export function registerMongoCompletionProvider(monaco: Monaco) {
         startLineNumber: position.lineNumber, startColumn: position.column,
         endLineNumber: position.lineNumber, endColumn: model.getLineMaxColumn(position.lineNumber),
       });
-      const token = textBeforeCursor.match(/[\w$]*$/)?.[0] ?? '';
+      // In the query surfaces a dotted field path (usage.total) is ONE token, so
+      // a half-typed nested key like "usage.to" matches and replaces the whole
+      // path. The shell surface keeps db.coll.method segmented (dot-free token).
+      const token = textBeforeCursor.match(meta.surface === 'shell' ? /[\w$]*$/ : /[\w$.]*$/)?.[0] ?? '';
       const items = getCompletions({
         surface: meta.surface, textBeforeCursor, textAfterCursor, token,
         fields: meta.getFields(), schema: meta.getSchema(), collections: meta.getCollections?.(),
-        stageOperator: meta.getStageOperator?.(),
+        stageOperator: meta.getStageOperator?.(), shellSyntax: meta.getShellSyntax?.(),
       });
       const range = {
         startLineNumber: position.lineNumber, endLineNumber: position.lineNumber,
