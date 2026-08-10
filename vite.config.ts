@@ -1,4 +1,5 @@
 import path from "node:path";
+import { createRequire } from "node:module";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
@@ -12,6 +13,21 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Bundle the parser's CommonJS entry, not the ESM wrapper shipped beside
+      // it. That wrapper is `import mod from "./index.js"` plus a named
+      // re-export per function, and the CJS entry sets `__esModule` with its
+      // own `default` — so a bundler hands the wrapper the DEFAULT export (one
+      // function) where it expects the whole namespace, and every named export
+      // resolves to undefined. `parseFilter` then became `undefined` at module
+      // init and every query in a packaged build failed with "is not a
+      // function", whatever it contained. Dev never showed it: unbundled, the
+      // named import is resolved at run time and works.
+      //
+      // Resolved through the package's own entry rather than a written-out
+      // path, so it follows the package if it moves.
+      "mongodb-query-parser": createRequire(import.meta.url).resolve(
+        "mongodb-query-parser",
+      ),
     },
   },
 
