@@ -902,16 +902,33 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const [isProjectionValid, setIsProjectionValid] = useState(true);
   const [isSortValid, setIsSortValid] = useState(true);
 
+  // The reason, not just the fact. A query that fails on a character the user
+  // cannot see — a smart quote, a zero-width space pasted in from a browser —
+  // reads as correct on screen, and a bare "Invalid JSON" gives them nothing
+  // to act on.
+  const [filterError, setFilterError] = useState<string | null>(null);
+
   useEffect(() => {
     try {
       if (filterQuery.trim()) {
         parseQueryObject(filterQuery);
       }
       setIsFilterValid(true);
-    } catch {
+      setFilterError(null);
+    } catch (err) {
       setIsFilterValid(false);
+      // Our own parse failures carry a code and have a translated message;
+      // only the underlying parser's errors are stuck in English. Same rule
+      // the Run and Explain paths follow.
+      const key = shellDocErrorKey(err);
+      setFilterError(
+        key ? td(key) : err instanceof Error ? err.message : String(err)
+      );
     }
-  }, [filterQuery]);
+    // `td` too: switching the interface language re-renders this component but
+    // would not re-run the effect, leaving an existing tooltip frozen in the
+    // old language while everything around it changed.
+  }, [filterQuery, td]);
 
   useEffect(() => {
     try {
@@ -1833,6 +1850,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                   if (isQueryBuilderOpen) syncSortRulesFromInput(v);
                 }}
                 filterInvalid={!isFilterValid}
+                filterError={filterError}
                 projectionInvalid={!isProjectionValid}
                 sortInvalid={!isSortValid}
                 fields={fields}
