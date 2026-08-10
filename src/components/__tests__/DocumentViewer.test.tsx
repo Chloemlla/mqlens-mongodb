@@ -182,6 +182,15 @@ describe('DocumentViewer Component', () => {
     fireEvent.change(filterInput, { target: { value: '{invalid' } });
     const badge = await screen.findByText('Invalid JSON');
     await waitFor(() => expect(badge.getAttribute('title')).toBeTruthy());
+
+    // Our own failures have a translated message; only the parser's are stuck
+    // in English. A bare `5` is not a query object.
+    fireEvent.change(filterInput, { target: { value: '5' } });
+    await waitFor(() =>
+      expect(screen.getByText('Invalid JSON').getAttribute('title')).not.toBe(
+        'Query must be an object'
+      )
+    );
   });
 
   it('performs JSON validation on typing', async () => {
@@ -309,6 +318,42 @@ describe('DocumentViewer Component', () => {
       expect(await screen.findByText('Filterparameter geleert')).toBeInTheDocument();
     } finally {
       await i18next.changeLanguage('en');
+    }
+  });
+
+  it('re-translates a parse error when the language changes', async () => {
+    const { i18next } = await import('@/lib/i18n');
+    try {
+      render(
+        <DocumentViewer
+          connectionName="test-conn"
+          databaseName="test-db"
+          collectionName="test-coll"
+          onExecute={mockOnExecute}
+          onExplain={mockOnExplain}
+          loading={false}
+        />
+      );
+      // A bare value is not a query object — one of our own errors, so it has
+      // a translated message rather than the parser's English one.
+      fireEvent.change(screen.getByTestId('query-filter-input'), { target: { value: '5' } });
+      const english = await waitFor(() => {
+        const title = screen.getByTestId('query-invalid-badge').getAttribute('title');
+        expect(title).toBeTruthy();
+        return title;
+      });
+
+      await act(async () => {
+        await i18next.changeLanguage('de');
+      });
+
+      await waitFor(() =>
+        expect(screen.getByTestId('query-invalid-badge').getAttribute('title')).not.toBe(english)
+      );
+    } finally {
+      await act(async () => {
+        await i18next.changeLanguage('en');
+      });
     }
   });
 

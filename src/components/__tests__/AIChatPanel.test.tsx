@@ -398,6 +398,12 @@ JSON.stringify({ explanation: 'x', queryType: 'find', filter: {}, sort: {} })
     fireEvent.change(screen.getByTestId('chat-input'), { target: { value: 'the question' } });
     fireEvent.click(screen.getByTestId('chat-send-btn'));
     await screen.findByText('the question');
+    // The panel cannot persist anything until its scope lookup resolves, and
+    // this test is about where a reply is FILED, not about racing that lookup.
+    // Waiting for the question to be stored keeps the two apart; without it
+    // the switch below can beat the first save on a slow machine and the
+    // conversation is never written at all.
+    await waitFor(() => expect(chatStore.find((c) => c.id === 'chat-one')).toBeTruthy());
 
     // Switch away mid-request.
     fireEvent.click(screen.getByTestId('ai-chat-new-btn'));
