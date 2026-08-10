@@ -134,8 +134,217 @@ export function shellDocErrorKey(err: unknown): string | null {
   return null;
 }
 
+/** Invisible characters that ride along with pasted text. */
+const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]/;
+/** Spaces that are not the space character: NBSP and the typographic run. */
+const UNICODE_SPACE = /[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/;
+const CURLY_PAIRS: Record<string, string> = { '\u201C': '\u201D', '\u2018': '\u2019' };
+
+/**
+ * Undo what copying a query out of a browser, a chat window or a document does
+ * to it.
+ *
+ * A query pasted from anywhere that applies smart quotes arrives with `“ ”`
+ * instead of `" "`, and text copied out of a web page routinely carries a
+ * zero-width space. Both read as perfectly ordinary queries on screen — the
+ * zero-width one is literally invisible — and both made the parser fail with
+ * nothing to go on but "Invalid JSON".
+ *
+ * Conservative on purpose:
+ *
+ * - Straight-quoted strings are copied out verbatim, so a value that contains
+ *   a curly quote or an exotic space keeps it.
+ * - Regex literals are copied out verbatim. `/“ACME”/` is a pattern that
+ *   really does contain smart quotes, and rewriting them would leave a filter
+ *   that still runs and quietly matches different documents.
+ * - A curly quote is only rewritten when its matching partner appears later.
+ *   A lone `’` is an apostrophe, and inventing a string around it would
+ *   corrupt a query that works today.
+ * - Trailing semicolons go, because a filter copied off the end of a
+ *   JavaScript statement brings one.
+ */
+export function normalizePastedQuery(text: string): string {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    // Verbatim: whatever is inside a straight-quoted string is the user's data.
+    if (c === '"' || c === "'") {
+      out += c;
+      i++;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          out += text[i] + (text[i + 1] ?? '');
+          i += 2;
+          continue;
+        }
+        out += text[i];
+        if (text[i] === c) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    // Verbatim: a regex literal's contents are a pattern, not syntax.
+    if (c === '/' && startsRegex(out)) {
+      const end = endOfRegex(text, i);
+      if (end !== -1) {
+        out += text.slice(i, end);
+        i = end;
+        continue;
+      }
+    }
+    const closer = CURLY_PAIRS[c];
+    if (closer) {
+      const end = closingSmartQuote(text, i + 1, closer);
+      if (end !== -1) {
+        out += asStraightString(text.slice(i + 1, end));
+        i = end + 1;
+        continue;
+      }
+      // No partner: an apostrophe, not a delimiter. Leave it exactly as it is.
+    }
+    if (ZERO_WIDTH.test(c)) {
+      i++;
+      continue;
+    }
+    out += UNICODE_SPACE.test(c) ? ' ' : c;
+    i++;
+  }
+  return stripTrailingSemicolons(out);
+}
+
+/**
+ * Where a smart-quoted run actually ends.
+ *
+ * Not simply the next `’`: in `‘O’Reilly’` that one is an apostrophe, and
+ * taking it would turn a common pasted value into `"O"Reilly’`. Nor the last
+ * one, which would swallow `‘x’, b: ‘y’` whole. A closing delimiter is
+ * followed by something structural — a comma, a closing bracket, a colon when
+ * the run was a key, or nothing at all — where an apostrophe inside a word is
+ * followed by more word.
+ *
+ * The lookahead reads the ORIGINAL text, so it has to skip what the rest of
+ * this normalizer is about to remove: a paste carries its damage in
+ * combination, and `“x”;` or `“x”<zero-width>}` would otherwise keep its curly
+ * quotes because the closer was followed by something not yet cleaned up.
+ *
+ * -1 when no candidate qualifies, which leaves the text exactly as the user
+ * typed it: a parse error they can see beats a silent change of meaning.
+ */
+function closingSmartQuote(text: string, from: number, closer: string): number {
+  for (let i = text.indexOf(closer, from); i !== -1; i = text.indexOf(closer, i + 1)) {
+    let j = i + 1;
+    // `\s` already covers the non-breaking and typographic spaces, but not the
+    // zero-width run, which this normalizer drops outright.
+    while (j < text.length && (/\s/.test(text[j]) || ZERO_WIDTH.test(text[j]))) j++;
+    if (j >= text.length || ',}])'.includes(text[j]) || text[j] === ':' || text[j] === ';') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Re-quote a smart-quoted run as a straight-quoted one, changing NOTHING else.
+ *
+ * Only the delimiters were wrong, so only the delimiters are replaced.
+ * Re-encoding the body — `JSON.stringify`, say — escapes its backslashes a
+ * second time, and `“a\nb”` stops meaning a newline and starts meaning the
+ * two characters, which is the same silent change of meaning this whole
+ * function exists to avoid. Escape pairs pass through untouched; only a
+ * straight quote that would end the string early gets escaped.
+ */
+function asStraightString(body: string): string {
+  let out = '"';
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === '\\') {
+      // A trailing lone backslash would escape the quote this adds.
+      out += c + (body[i + 1] ?? '\\');
+      i++;
+      continue;
+    }
+    out += c === '"' ? '\\"' : c;
+  }
+  return `${out}"`;
+}
+
+/**
+ * Whether a `/` here opens a regex literal rather than divides.
+ *
+ * In a query a regex is always a value, so it follows a key's colon, a comma,
+ * an opening bracket, or nothing at all. Division does not appear in filter
+ * syntax — arithmetic goes through `$divide` — so this cannot mistake one for
+ * the other.
+ */
+function startsRegex(before: string): boolean {
+  const prev = before.replace(/\s+$/, '').slice(-1);
+  return prev === '' || prev === ':' || prev === ',' || prev === '[' || prev === '(' || prev === '{';
+}
+
+/**
+ * The index just past a regex literal's closing `/` and flags, or -1 if it
+ * never closes — in which case the `/` was something else and is left alone.
+ */
+function endOfRegex(text: string, start: number): number {
+  let i = start + 1;
+  let inClass = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '\\') {
+      i += 2;
+      continue;
+    }
+    if (c === '\n') return -1;
+    if (c === '[') inClass = true;
+    else if (c === ']') inClass = false;
+    else if (c === '/' && !inClass) {
+      i++;
+      while (i < text.length && /[a-z]/i.test(text[i])) i++;
+      return i;
+    }
+    i++;
+  }
+  return -1;
+}
+
+/** Drop `;` off the end, but only when it is not inside a string. */
+function stripTrailingSemicolons(text: string): string {
+  let cut = text.length;
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      i++;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (text[i] === c) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      cut = text.length;
+      continue;
+    }
+    if (c === ';' || /\s/.test(c)) {
+      if (c === ';' && cut === text.length) cut = i;
+    } else {
+      cut = text.length;
+    }
+    i++;
+  }
+  return cut === text.length ? text : text.slice(0, cut);
+}
+
 export function parseShellJson(text: string): any {
-  const trimmed = text.trim();
+  const trimmed = normalizePastedQuery(text).trim();
   if (!trimmed) return {};
   // parseFilter signals "unparseable / not a valid query" by returning an empty
   // string rather than throwing (e.g. `{ _id }`, a half-typed field). Surface

@@ -145,3 +145,123 @@ describe('parseShellJson — NumberLong precision (#222 review)', () => {
     expect(parseShellJson('{ a: 1 }')).toEqual({ a: 1 });
   });
 });
+
+describe('parseShellJson — queries pasted from somewhere else', () => {
+  // A query copied out of a browser, a chat window or a document arrives with
+  // characters that look exactly like the ones the user meant. The parser
+  // rejected them with nothing to go on but "Invalid JSON", on a query that
+  // reads as perfectly correct on screen.
+  it('accepts smart double quotes', () => {
+    expect(parseShellJson('domain: “account.test.com”')).toEqual({
+      domain: 'account.test.com',
+    });
+  });
+
+  it('accepts smart single quotes', () => {
+    expect(parseShellJson('domain: ‘account.test.com’')).toEqual({
+      domain: 'account.test.com',
+    });
+  });
+
+  it('accepts a zero-width space, which nobody can see', () => {
+    expect(parseShellJson('domain:​ "account.test.com"')).toEqual({
+      domain: 'account.test.com',
+    });
+  });
+
+  it('accepts a non-breaking space', () => {
+    expect(parseShellJson('domain: "account.test.com"')).toEqual({
+      domain: 'account.test.com',
+    });
+  });
+
+  it('accepts a trailing semicolon, as copied off a JavaScript line', () => {
+    expect(parseShellJson('{ domain: "account.test.com" };')).toEqual({
+      domain: 'account.test.com',
+    });
+  });
+
+  it('leaves a smart quote inside a string alone', () => {
+    // The user is searching for that character. Rewriting it would change what
+    // the query means.
+    expect(parseShellJson('note: "he said “hi”"')).toEqual({
+      note: 'he said “hi”',
+    });
+  });
+
+  it('leaves a lone curly apostrophe alone', () => {
+    // No closing partner, so it is an apostrophe rather than a delimiter —
+    // in a regex here, where inventing a string would corrupt a query that
+    // works today.
+    const parsed = parseShellJson('name: /don’t/');
+    expect(parsed.name.$regularExpression.pattern).toBe('don’t');
+  });
+
+  it('keeps an apostrophe inside a smart-quoted value', () => {
+    // The `’` after O is part of the name, not the end of the string. Taking
+    // it produced `"O"Reilly’` and rejected a perfectly ordinary value.
+    expect(parseShellJson('name: ‘O’Reilly’')).toEqual({ name: 'O’Reilly' });
+  });
+
+  it('does not run one smart-quoted value into the next', () => {
+    expect(parseShellJson('{a: ‘x’, b: ‘y’}')).toEqual({ a: 'x', b: 'y' });
+  });
+
+  it('handles a smart-quoted key', () => {
+    expect(parseShellJson('{“domain”: “a.com”}')).toEqual({ domain: 'a.com' });
+  });
+
+  it('keeps escape sequences meaning what they meant', () => {
+    // Only the delimiters were wrong. Re-encoding the body escapes its
+    // backslashes a second time, so `\n` stops being a newline and starts
+    // being two characters — a filter that quietly matches something else.
+    // Source text here is: q: “a\nb”
+    expect(parseShellJson('q: \u201Ca\\nb\u201D')).toEqual({ q: 'a\nb' });
+    // Source text: path: “C:\\temp”, which a shell string reads as one slash.
+    expect(parseShellJson('path: \u201CC:\\\\temp\u201D')).toEqual({ path: 'C:\\temp' });
+  });
+
+  it('copes with several paste artifacts at once', () => {
+    // A paste brings its damage in combination. The lookahead that finds the
+    // closing quote reads the original text, so it has to skip what the rest
+    // of the normalizer is about to remove.
+    expect(parseShellJson('domain: “x”;')).toEqual({ domain: 'x' });
+    expect(parseShellJson('{domain: “x”​}')).toEqual({ domain: 'x' });
+    expect(parseShellJson('{“domain”​: “x”}')).toEqual({ domain: 'x' });
+  });
+
+  it('leaves a regex literal alone, smart quotes and all', () => {
+    // `/“ACME”/` is a pattern that really does contain those characters.
+    // Rewriting them leaves a filter that still runs and quietly matches
+    // different documents, which is worse than refusing to parse.
+    const parsed = parseShellJson('name: /“ACME”/');
+    expect(parsed.name.$regularExpression.pattern).toBe('“ACME”');
+  });
+
+  it('leaves a regex alone inside an array of values', () => {
+    const parsed = parseShellJson('tags: {$in: [/“a”/, "b"]}');
+    expect(parsed.tags.$in[0].$regularExpression.pattern).toBe('“a”');
+    expect(parsed.tags.$in[1]).toBe('b');
+  });
+
+  it('keeps regex flags and escaped slashes', () => {
+    const parsed = parseShellJson('path: /a\\/b/i');
+    expect(parsed.path.$regularExpression.pattern).toBe('a\\/b');
+    expect(parsed.path.$regularExpression.options).toBe('i');
+  });
+
+  it('still fixes smart quotes that are not in a regex', () => {
+    // The regex carve-out must not swallow the rest of the query.
+    expect(parseShellJson('{ name: /x/, domain: “a.com” }')).toMatchObject({
+      domain: 'a.com',
+    });
+  });
+
+  it('keeps a semicolon that belongs to a value', () => {
+    expect(parseShellJson('sql: "a;"')).toEqual({ sql: 'a;' });
+  });
+
+  it('keeps a straight quote found inside a smart-quoted run', () => {
+    expect(parseShellJson('q: “say "hi"”')).toEqual({ q: 'say "hi"' });
+  });
+});
