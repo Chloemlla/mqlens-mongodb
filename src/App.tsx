@@ -9,7 +9,19 @@ import { Sidebar } from './components/Sidebar';
 import { CommandPalette, type PaletteAction } from './components/CommandPalette';
 import { DocumentViewer, builderStateFromQueryTab, type BuilderState } from './components/DocumentViewer';
 import type { ChatMessage } from './components/AIChatPanel';
-import { clearChatRequest, renameChatRequest, resetChatRequests } from './lib/aiChatRequest';
+import {
+  clearChatRequest,
+  getPendingChatRequest,
+  renameChatRequest,
+  resetChatRequests,
+  takeSettledChatRequest,
+} from './lib/aiChatRequest';
+import {
+  appendReplyToChat,
+  releaseChatsForTab,
+  retargetChatScope,
+  transferChatClaim,
+} from './lib/aiChatStore';
 import {
   disposeShellSession,
   disposeShellSessionsForTabs,
@@ -668,6 +680,11 @@ function Workspace() {
       if (chat) {
         tabChatCache.current.set(newId, chat);
         tabChatCache.current.delete(oldId);
+        // And the open-chat claim, whose owner token is built from the tab id.
+        // Left under the profile-space id it would keep the conversation marked
+        // as open, the rebound tab would be refused it, and closing that tab
+        // would release only the new owner.
+        if (chat.chatId) void transferChatClaim(chat.chatId, oldId, newId);
       }
       // The in-flight request follows the tab; dropping it here would lose a
       // reply that is already on its way.
@@ -1950,8 +1967,33 @@ function Workspace() {
     if (chat) {
       tabChatCache.current.set(newId, chat);
       tabChatCache.current.delete(oldId);
+      // The open-chat claim is held under an owner token built from the tab id,
+      // so a rename has to move it as well. Left behind, the old owner keeps
+      // the conversation marked as open — the remounted tab claims under its
+      // new id, is refused, and nothing releases the stale claim until the
+      // whole window closes.
+      if (chat.chatId) void transferChatClaim(chat.chatId, oldId, newId);
     }
     renameChatRequest(oldId, newId);
+  }, []);
+
+  /** Hand an in-flight or already-settled reply to the stored conversation.
+   *  Used when a tab leaves this renderer: the destination is a different
+   *  window with its own request registry and cannot see ours, but the chat
+   *  store is shared. */
+  const parkPendingReply = useCallback((tabId: string) => {
+    const chatId = tabChatCache.current.get(tabId)?.chatId;
+    if (!chatId) return;
+    // A reply that settled while the tab was inactive is sitting unconsumed in
+    // the registry — `getPendingChatRequest` deliberately reports nothing for
+    // it, so it has to be taken separately or it goes out with the clear.
+    const settled = takeSettledChatRequest(tabId);
+    if (settled) {
+      void appendReplyToChat(chatId, settled);
+      return;
+    }
+    const inFlight = getPendingChatRequest(tabId);
+    if (inFlight) void inFlight.then((reply) => appendReplyToChat(chatId, reply));
   }, []);
 
   const handleCollectionRenamed = (
@@ -1988,6 +2030,18 @@ function Workspace() {
       moveTabChatState(oldId, newId);
       dispatchWorkspace({ type: 'rename_tab', oldId, newId });
     });
+    // The stored conversations still name the old collection; without this the
+    // renamed tab reads its own chat as belonging somewhere else and refuses to
+    // continue it.
+    const renamedConnection = activeConnections.find((c) => c.id === connectionId);
+    if (renamedConnection) {
+      for (const variant of ['editor', 'shell'] as const) {
+        void retargetChatScope(
+          { connectionName: renamedConnection.name, database: dbName, collection: oldName, variant },
+          { database: dbName, collection: newName }
+        );
+      }
+    }
     invalidatePaletteNamespaceIndex(connectionId);
   };
 
@@ -2057,6 +2111,16 @@ function Workspace() {
       moveTabChatState(oldId, newId);
       dispatchWorkspace({ type: 'rename_tab', oldId, newId });
     });
+    // Every conversation under the old database name — including collections
+    // with no open tab, which this renderer cannot enumerate, so the backend
+    // matches on the database alone.
+    const renamedConnection = activeConnections.find((c) => c.id === connectionId);
+    if (renamedConnection) {
+      void retargetChatScope(
+        { connectionName: renamedConnection.name, database: oldName },
+        { database: newName }
+      );
+    }
     invalidatePaletteNamespaceIndex(connectionId);
   };
 
@@ -2247,6 +2311,10 @@ function Workspace() {
       tabBuilderStateCache.current.delete(action.tabId);
       tabChatCache.current.delete(action.tabId);
       clearChatRequest(action.tabId);
+      // The tab held its conversation for as long as it existed — panels do not
+      // release on unmount, because an inactive tab is unmounted and still owns
+      // its chat. Closing is where that ends.
+      releaseChatsForTab(action.tabId);
       void disposeShellSession(action.tabId);
       // #91: forget this tab's generate-task tracking on close (running or
       // finished) — otherwise reopening "Generate Data…" on the same
@@ -2276,6 +2344,7 @@ function Workspace() {
         tabBuilderStateCache.current.delete(id);
         tabChatCache.current.delete(id);
         clearChatRequest(id);
+        releaseChatsForTab(id);
         void disposeShellSession(id);
       });
       // Prune `tabs[]` here rather than leaving it to the caller. Every
@@ -2929,6 +2998,10 @@ function Workspace() {
           // call for this same close (see that effect's comment).
           windowClosingRef.current = true;
           closeWorkspaceWindow();
+          // Same reasoning as the leaving branch below: this window is going
+          // away, so park anything still owed to a conversation before the
+          // registries go with it.
+          tabsRef.current.forEach((t) => parkPendingReply(t.id));
           setTabs([]);
           tabBuilderStateCache.current.clear();
           tabChatCache.current.clear();
@@ -3027,8 +3100,10 @@ function Workspace() {
           );
           leavingIds.forEach((id) => {
             tabBuilderStateCache.current.delete(id);
+            parkPendingReply(id);
             tabChatCache.current.delete(id);
             clearChatRequest(id);
+            releaseChatsForTab(id);
             // Gone from the document: end the session. Merely moved to another
             // window: that window owns the child now, so it must keep running —
             // but this renderer's cached copy has to go, or moving the tab back
@@ -3179,6 +3254,11 @@ function Workspace() {
             tabBuilderStateCache.current.delete(id);
             tabChatCache.current.delete(id);
             clearChatRequest(id);
+            // These tabs are going away with their connection. Panels do not
+            // release their conversation on unmount, so without this the chats
+            // stay claimed by tabs that no longer exist and read as open
+            // elsewhere until the window closes.
+            releaseChatsForTab(id);
             void disposeShellSession(id);
             unmirroredTabIdsRef.current.delete(id);
           });

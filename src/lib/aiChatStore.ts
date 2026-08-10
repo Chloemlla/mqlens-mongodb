@@ -123,16 +123,23 @@ export function newChatId(): string {
 const locallyHeld = new Set<string>();
 
 /**
- * A token identifying one PANEL, not one window.
+ * A token identifying one TAB, not one panel instance and not one window.
  *
- * Two tabs in the same window are two panels and must not both hold a chat, so
- * a window label alone is too coarse; the window prefix is still there because
- * a closing window has to be able to drop everything its panels held.
+ * Two tabs in the same window must not both hold a conversation, so a window
+ * label alone is too coarse. Nor can it be per mount: inactive tabs unmount and
+ * a tab that comes back has to be able to re-take the chat it never stopped
+ * pointing at. The window prefix stays because a closing window drops
+ * everything its tabs held.
  */
-let panelSeq = 0;
+export function tabChatOwner(tabId: string): string {
+  return `${windowLabel()}#${tabId}`;
+}
+
+/** For a panel rendered outside the tab system, which owns nothing shared. */
+let looseSeq = 0;
 export function newPanelOwner(): string {
-  panelSeq += 1;
-  return `${windowLabel()}#${panelSeq}`;
+  looseSeq += 1;
+  return `${windowLabel()}#loose-${looseSeq}`;
 }
 
 /** Take a conversation, or find out that another panel has it. */
@@ -158,7 +165,7 @@ export function isHeldLocally(id: string): boolean {
 /** Test seam. */
 export function resetOpenChats(): void {
   locallyHeld.clear();
-  panelSeq = 0;
+  looseSeq = 0;
 }
 
 /**
@@ -177,8 +184,18 @@ export async function listChats(scope?: ChatScope): Promise<ChatSummary[]> {
 }
 
 export async function loadChat(id: string): Promise<StoredChat | undefined> {
-  const chat = await invoke<StoredChat | null>('load_chat', { id }).catch(() => null);
-  return chat ?? undefined;
+  const chat = await invoke<unknown>('load_chat', { id }).catch(() => null);
+  // Shape-checked rather than trusted: this crosses the IPC boundary, and
+  // anything merely truthy — an array, say — would otherwise be read for fields
+  // it does not have. A chat with no id is not a chat, and treating one as a
+  // scope silently puts the panel into read-only mode.
+  if (!chat || typeof chat !== 'object' || Array.isArray(chat)) return undefined;
+  const candidate = chat as Partial<StoredChat>;
+  if (typeof candidate.id !== 'string') return undefined;
+  return {
+    ...(candidate as StoredChat),
+    messages: Array.isArray(candidate.messages) ? candidate.messages : [],
+  };
 }
 
 /** Create or update a conversation. Fire-and-forget at the call sites: the
@@ -189,6 +206,70 @@ export async function saveChat(chat: StoredChat): Promise<void> {
 
 export async function deleteChat(id: string): Promise<void> {
   await invoke('delete_chat', { id }).catch(() => undefined);
+}
+
+/**
+ * Append an assistant reply to a stored conversation the panel is not showing.
+ *
+ * Used when an answer arrives with nowhere local to land — the tab moved to
+ * another window, or the panel has since switched conversations. One backend
+ * command, because load-then-save is two round trips with the store lock
+ * released between them: a panel saving in that window would either lose this
+ * message or be overwritten by it. The message id is assigned backend-side for
+ * the same reason.
+ */
+export async function appendReplyToChat(
+  chatId: string,
+  reply: { text: string; query?: unknown; error?: boolean }
+): Promise<void> {
+  await invoke('append_chat_message', {
+    chatId,
+    role: 'assistant',
+    text: reply.text,
+    query: reply.query ?? null,
+    error: reply.error ?? null,
+    updatedAt: new Date().toISOString(),
+  }).catch(() => undefined);
+}
+
+/**
+ * Follow a renamed database or collection.
+ *
+ * The rename re-keys the tab but leaves the stored conversations naming the old
+ * namespace, after which the panel reads its own chat as foreign and refuses to
+ * continue it.
+ */
+export async function retargetChatScope(
+  scope: { connectionName: string; database: string; collection?: string; variant?: 'editor' | 'shell' },
+  next: { database: string; collection?: string }
+): Promise<void> {
+  await invoke('retarget_chat_scope', {
+    connectionName: scope.connectionName,
+    database: scope.database,
+    // Omitted for a database rename: conversations about collections with no
+    // open tab have to move too, and the caller cannot enumerate those.
+    collection: scope.collection ?? null,
+    variant: scope.variant ?? null,
+    newDatabase: next.database,
+    newCollection: next.collection ?? null,
+  }).catch(() => undefined);
+}
+
+/** Move a conversation's claim to a tab's new id — renames and profile rebinds
+ *  mint new tab ids, and the owner token is built from one. */
+export async function transferChatClaim(
+  chatId: string,
+  oldTabId: string,
+  newTabId: string
+): Promise<void> {
+  await invoke('release_chat', { chatId, owner: tabChatOwner(oldTabId) }).catch(() => undefined);
+  await claimOpenChat(chatId, tabChatOwner(newTabId));
+}
+
+/** Give up every conversation a tab was holding — called when the tab closes,
+ *  since nothing else will. */
+export function releaseChatsForTab(tabId: string): void {
+  void invoke('release_owner_chats', { owner: tabChatOwner(tabId) }).catch(() => undefined);
 }
 
 /** Delete every chat, or every chat in one scope. */

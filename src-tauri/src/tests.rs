@@ -4639,6 +4639,27 @@ mod chat_claim_tests {
     }
 
     #[tokio::test]
+    async fn closing_a_tab_frees_everything_that_tab_held() {
+        // Panels do not release on unmount — an inactive tab is unmounted and
+        // still owns its conversation — so the tab closing is where it ends.
+        use crate::chats::release_owner_chats;
+        claim_chat("c9".into(), "main#tab-7".into()).await.unwrap();
+        claim_chat("c10".into(), "main#tab-7".into()).await.unwrap();
+        claim_chat("c11".into(), "main#tab-8".into()).await.unwrap();
+
+        release_owner_chats("main#tab-7".into()).await.unwrap();
+
+        assert!(claim_chat("c9".into(), "main#other".into()).await.unwrap());
+        assert!(claim_chat("c10".into(), "main#other".into()).await.unwrap());
+        assert!(
+            !claim_chat("c11".into(), "main#other".into()).await.unwrap(),
+            "another tab's claim was collateral"
+        );
+        release_owner_chats("main#other".into()).await.unwrap();
+        release_owner_chats("main#tab-8".into()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn closing_a_window_frees_every_chat_its_panels_held() {
         // Those panels get no chance to release anything themselves.
         claim_chat("c3".into(), "win-9#1".into()).await.unwrap();
@@ -4737,6 +4758,82 @@ mod chat_store_tests {
             out[0].messages.last().unwrap().id,
             format!("m{}", MAX_MESSAGES + 9)
         );
+    }
+
+    #[test]
+    fn appending_assigns_an_id_the_transcript_does_not_already_use() {
+        use crate::chats::next_message_id;
+        let msg = |id: &str| ChatMessage {
+            id: id.to_string(),
+            role: "user".to_string(),
+            text: "x".to_string(),
+            query: None,
+            error: None,
+        };
+
+        assert_eq!(next_message_id(&[]), "m0");
+        // Past the HIGHEST, not the count — a transcript is not always dense.
+        assert_eq!(next_message_id(&[msg("m0"), msg("m7")]), "m8");
+        // Ids that are not `m<N>` at all are ignored rather than crashing.
+        assert_eq!(next_message_id(&[msg("weird"), msg("m2")]), "m3");
+        assert_eq!(next_message_id(&[msg("weird")]), "m0");
+    }
+
+    #[test]
+    fn saving_a_snapshot_keeps_messages_appended_since_it_was_taken() {
+        // A panel saves the whole conversation from a copy it loaded earlier.
+        // A reply parked for a tab that moved windows can land in between, and
+        // a blind replace would drop it.
+        use crate::chats::merge_appended;
+        let msg = |id: &str| ChatMessage {
+            id: id.to_string(),
+            role: "assistant".to_string(),
+            text: id.to_string(),
+            query: None,
+            error: None,
+        };
+        let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
+        stored.messages = vec![msg("m0"), msg("m1"), msg("m2")];
+        let mut incoming = chat("c1", "users", "2026-01-02T00:00:00Z");
+        incoming.messages = vec![msg("m0"), msg("m1")]; // taken before m2 landed
+
+        let merged = merge_appended(&[stored], incoming);
+
+        assert_eq!(
+            merged.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m0", "m1", "m2"]
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_is_already_current_is_left_alone() {
+        use crate::chats::merge_appended;
+        let msg = |id: &str| ChatMessage {
+            id: id.to_string(),
+            role: "user".to_string(),
+            text: "x".to_string(),
+            query: None,
+            error: None,
+        };
+        let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
+        stored.messages = vec![msg("m0")];
+        let mut incoming = chat("c1", "users", "2026-01-02T00:00:00Z");
+        incoming.messages = vec![msg("m0"), msg("m1")];
+
+        let merged = merge_appended(&[stored], incoming);
+
+        assert_eq!(
+            merged.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m0", "m1"],
+            "a longer snapshot must not gain duplicates"
+        );
+    }
+
+    #[test]
+    fn a_conversation_the_store_has_never_seen_merges_to_itself() {
+        use crate::chats::merge_appended;
+        let incoming = chat("brand-new", "users", "2026-01-01T00:00:00Z");
+        assert_eq!(merge_appended(&[], incoming.clone()), incoming);
     }
 
     #[test]

@@ -1,9 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  appendReplyToChat,
   claimOpenChat,
   isHeldLocally,
   newPanelOwner,
+  releaseChatsForTab,
+  retargetChatScope,
+  tabChatOwner,
+  transferChatClaim,
   listChats,
+  loadChat,
   newChatId,
   releaseOpenChat,
   resetOpenChats,
@@ -78,15 +84,72 @@ describe('AI chat store', () => {
       });
     });
 
-    it('gives each panel its own owner token, since two tabs share a window', () => {
+    it('keys the owner on the TAB, so a remount can re-take its own chat', () => {
+      // Inactive tabs unmount. A per-mount token would leave the tab locked out
+      // of the conversation it never stopped pointing at.
+      expect(tabChatOwner('tab-1')).toBe(tabChatOwner('tab-1'));
+      expect(tabChatOwner('tab-1')).not.toBe(tabChatOwner('tab-2'));
+      expect(tabChatOwner('tab-1').startsWith('main#')).toBe(true);
+      // A panel outside the tab system owns nothing shared.
       expect(newPanelOwner()).not.toBe(newPanelOwner());
-      expect(newPanelOwner().startsWith('main#')).toBe(true);
+    });
+
+    it('releases everything a closed tab held, without needing to know the ids', () => {
+      releaseChatsForTab('tab-1');
+      expect(invokeMock).toHaveBeenCalledWith('release_owner_chats', {
+        owner: tabChatOwner('tab-1'),
+      });
     });
 
     it('keeps working if the backend cannot answer', async () => {
       // Degrades to the pre-existing behaviour rather than blocking the panel.
       invokeMock.mockRejectedValue(new Error('nope'));
       expect(await claimOpenChat('c1', 'main#1')).toBe(true);
+    });
+  });
+
+  it('parks a reply through one backend call, not load-then-save', async () => {
+    // Two round trips release the store lock in between: a panel saving in that
+    // window is either lost or loses this message. The id is assigned backend
+    // side for the same reason.
+    await appendReplyToChat('c1', { text: 'the answer' });
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      'append_chat_message',
+      expect.objectContaining({ chatId: 'c1', role: 'assistant', text: 'the answer' }),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith('load_chat', expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith('save_chat', expect.anything());
+  });
+
+  it('moves conversations to a renamed namespace', async () => {
+    await retargetChatScope(
+      { connectionName: 'Local', database: 'sales', collection: 'users', variant: 'editor' },
+      { database: 'sales', collection: 'people' },
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith('retarget_chat_scope', {
+      connectionName: 'Local',
+      database: 'sales',
+      collection: 'users',
+      variant: 'editor',
+      newDatabase: 'sales',
+      newCollection: 'people',
+    });
+  });
+
+  it('moves a whole database without naming its collections', async () => {
+    // A database rename has to move conversations about collections with no
+    // open tab, which this renderer cannot enumerate.
+    await retargetChatScope({ connectionName: 'Local', database: 'sales' }, { database: 'revenue' });
+
+    expect(invokeMock).toHaveBeenCalledWith('retarget_chat_scope', {
+      connectionName: 'Local',
+      database: 'sales',
+      collection: null,
+      variant: null,
+      newDatabase: 'revenue',
+      newCollection: null,
     });
   });
 
@@ -133,6 +196,30 @@ describe('AI chat store', () => {
       const call = invokeMock.mock.calls.find((c) => c[0] === cmd);
       expect(call?.[1]?.cutoffIso, `${cmd} carried no cutoff`).toBeTruthy();
     }
+  });
+
+  it('ignores a load result that is not a chat', async () => {
+    // Crosses IPC, so anything merely truthy would otherwise be read for fields
+    // it does not have — and a bogus scope silently puts the panel read-only.
+    for (const bogus of [[], 'nope', { title: 'no id' }]) {
+      invokeMock.mockResolvedValue(bogus);
+      expect(await loadChat('c1')).toBeUndefined();
+    }
+  });
+
+  it('moves a claim when a rename mints a new tab id', async () => {
+    invokeMock.mockResolvedValue(true);
+
+    await transferChatClaim('c1', 'old-tab', 'new-tab');
+
+    expect(invokeMock).toHaveBeenCalledWith('release_chat', {
+      chatId: 'c1',
+      owner: tabChatOwner('old-tab'),
+    });
+    expect(invokeMock).toHaveBeenCalledWith('claim_chat', {
+      chatId: 'c1',
+      owner: tabChatOwner('new-tab'),
+    });
   });
 
   it('reads a backend failure as no history rather than throwing', async () => {

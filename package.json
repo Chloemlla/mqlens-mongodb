@@ -1,7 +1,7 @@
 {
   "name": "mqlens",
   "private": true,
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "A native desktop GUI for MongoDB, built with Tauri and React.",
   "homepage": "https://mqlens.com",
   "author": "Devesh Kumar <vrshu112@gmail.com>",
@@ -79,7 +79,7 @@
     "vitest": "^4.1.7"
   },
   "overrides": {
-    "dompurify": "3.4.12",
+    "dompurify": "3.4.13",
     "undici": "7.29.0",
     "@babel/core": "7.29.6",
     "esbuild": "0.28.1",
