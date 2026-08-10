@@ -4600,6 +4600,7 @@ mod shell_tab_state_tests {
         rename_shell_tab_state_impl(&st, "missing", "new").unwrap();
         assert_eq!(get_shell_tab_state_impl(&st, "new").unwrap(), None);
     }
+}
 
 
 mod chat_claim_tests {
@@ -4937,4 +4938,729 @@ mod chat_store_tests {
     }
 }
 
+
+mod change_stream_tests {
+    use crate::change_streams::{
+        build_pipeline, describe_stream_error, events_after, push_event, push_event_bounded,
+        await_handover, carry_over, claim_by_poller, fail_stream, find_and_claim, install_stream,
+        install_stream_with, measure_event, publish_status,
+        record_resume_token, stop_change_streams_for_window,
+        retire_reader, HANDOVER_GRACE, ChangeEvent, LiveStream, ResumePoint, StreamBuffer,
+        StreamStatus, BUFFER_CAP,
+    };
+    use mongodb::bson::{doc, Bson};
+    use mongodb::change_stream::event::ResumeToken;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    fn token(data: &str) -> ResumeToken {
+        mongodb::bson::from_bson(Bson::Document(doc! { "_data": data }))
+            .expect("a resume token is just its `_data`")
+    }
+
+    fn live_stream() -> Arc<LiveStream> {
+        Arc::new(LiveStream {
+            window: Mutex::new("main".to_string()),
+            buffer: Mutex::new(StreamBuffer::default()),
+            status: Mutex::new(StreamStatus::Running),
+            error: Mutex::new(None),
+            generation: Arc::new(AtomicU64::new(0)),
+            retired: Arc::new(tokio::sync::Notify::new()),
+            settled: Arc::new(AtomicU64::new(0)),
+            spawned: Arc::new(AtomicU64::new(0)),
+            resume_token: Arc::new(Mutex::new(ResumePoint::default())),
+            connection_id: "c1".to_string(),
+            database: Some("sales".to_string()),
+            collection: Some("orders".to_string()),
+            operation_types: vec![],
+        })
+    }
+
+    fn event(op: &str) -> ChangeEvent {
+        ChangeEvent {
+            seq: 0,
+            operation_type: op.to_string(),
+            database: "sales".to_string(),
+            collection: Some("orders".to_string()),
+            document_key: None,
+            full_document: None,
+            updated_fields: None,
+            removed_fields: None,
+            renamed_to: None,
+            at_ms: 0,
+            bytes: 0,
+        }
+    }
+
+    fn heavy(op: &str, bytes: usize) -> ChangeEvent {
+        ChangeEvent { bytes, ..event(op) }
+    }
+
+    #[test]
+    fn the_buffer_stays_bounded_and_says_what_it_dropped() {
+        // A tail viewer's whole job is to stay bounded under load. Silently
+        // skipping would make a busy collection look like a quiet one.
+        let mut buffer = StreamBuffer::default();
+        for _ in 0..(BUFFER_CAP + 5) {
+            push_event(&mut buffer, event("insert"), BUFFER_CAP);
+        }
+
+        assert_eq!(buffer.events.len(), BUFFER_CAP);
+        assert_eq!(buffer.dropped, 5);
+        // The OLDEST go, so the tail keeps the newest.
+        assert_eq!(buffer.events.front().unwrap().seq, 5);
+        assert_eq!(
+            buffer.events.back().unwrap().seq,
+            (BUFFER_CAP + 4) as u64
+        );
+    }
+
+    #[test]
+    fn a_few_large_documents_evict_before_the_count_does() {
+        // A count is not a memory bound: a MongoDB document can approach 16
+        // MiB, so a thousand large inserts is gigabytes held in a desktop
+        // process — and polling clones them again on the way out.
+        let mut buffer = StreamBuffer::default();
+        for _ in 0..4 {
+            let mut e = heavy("insert", 400);
+            push_event_bounded(&mut buffer, &mut e, 1_000, 1_000);
+        }
+
+        assert!(buffer.events.len() < 4, "the byte budget never bit");
+        assert!(buffer.buffered_bytes <= 1_000, "over budget: {}", buffer.buffered_bytes);
+        assert!(buffer.dropped > 0, "an eviction was not reported");
+    }
+
+    #[test]
+    fn the_newest_event_survives_even_if_it_alone_is_over_budget() {
+        // Dropping what just arrived would make a collection of large
+        // documents look idle, which is worse than briefly exceeding the cap.
+        let mut buffer = StreamBuffer::default();
+        let mut huge = heavy("insert", 5_000);
+        push_event_bounded(&mut buffer, &mut huge, 1_000, 1_000);
+
+        assert_eq!(buffer.events.len(), 1);
+    }
+
+    #[test]
+    fn sequences_keep_climbing_past_an_eviction() {
+        // The frontend polls for "everything after N". Reusing a sequence after
+        // an eviction would make it skip events or replay them forever.
+        let mut buffer = StreamBuffer::default();
+        for _ in 0..3 {
+            push_event(&mut buffer, event("insert"), 2);
+        }
+
+        assert_eq!(
+            buffer.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(buffer.next_seq, 3);
+    }
+
+    #[test]
+    fn a_poll_gets_only_what_it_has_not_seen() {
+        let mut buffer = StreamBuffer::default();
+        for _ in 0..4 {
+            push_event(&mut buffer, event("insert"), BUFFER_CAP);
+        }
+
+        assert_eq!(events_after(&buffer, None).len(), 4, "a first poll takes all");
+        assert_eq!(
+            events_after(&buffer, Some(1))
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(events_after(&buffer, Some(3)).is_empty());
+        // Ahead of the buffer — a duplicated or reordered poll must not panic
+        // or replay.
+        assert!(events_after(&buffer, Some(99)).is_empty());
+    }
+
+    #[test]
+    fn a_caller_that_fell_behind_gets_what_is_left_rather_than_an_error() {
+        let mut buffer = StreamBuffer::default();
+        for _ in 0..5 {
+            push_event(&mut buffer, event("insert"), 2);
+        }
+
+        // It last saw seq 0, which has long been evicted.
+        let caught_up = events_after(&buffer, Some(0));
+        assert_eq!(
+            caught_up.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(buffer.dropped, 3, "the gap is reported, not hidden");
+    }
+
+    #[test]
+    fn an_empty_namespace_is_no_namespace() {
+        // A deployment-level tab spells "no database" as an empty string.
+        // Taken literally it becomes `client.database("")`, and the server
+        // answers `Invalid namespace specified: .$cmd.aggregate`.
+        let blank = |s: &str| Some(s.to_string()).filter(|d| !d.trim().is_empty());
+
+        assert_eq!(blank(""), None);
+        assert_eq!(blank("   "), None);
+        assert_eq!(blank("sales"), Some("sales".to_string()));
+    }
+
+    #[test]
+    fn a_retired_reader_is_told_apart_from_the_live_one() {
+        // A paused reader can stay parked in `next().await` long after its
+        // replacement is running. Whatever it eventually returns — an event or
+        // an error — belongs to a cursor nobody is watching.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let generation = AtomicU64::new(0);
+
+        let mine = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(generation.load(Ordering::SeqCst), mine, "the live reader matches");
+
+        // A pause and a resume, each bumping past it.
+        generation.fetch_add(1, Ordering::SeqCst);
+        let replacement = generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        assert_ne!(generation.load(Ordering::SeqCst), mine, "the retired reader must notice");
+        assert_eq!(generation.load(Ordering::SeqCst), replacement);
+    }
+
+    #[test]
+    fn no_operation_filter_means_everything_not_nothing() {
+        // A filter that matched nothing would be indistinguishable from an idle
+        // collection — the worst possible failure for a live tail.
+        assert!(build_pipeline(&[]).is_empty());
+        assert!(build_pipeline(&["".to_string(), "  ".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_chosen_operation_filter_becomes_a_match_stage() {
+        let pipeline = build_pipeline(&["insert".to_string(), "delete".to_string()]);
+
+        assert_eq!(pipeline.len(), 1);
+        let json = serde_json::to_string(&pipeline[0]).unwrap();
+        assert!(json.contains("operationType"), "{json}");
+        assert!(json.contains("insert") && json.contains("delete"), "{json}");
+    }
+
+    #[test]
+    fn a_standalone_server_is_explained_rather_than_reported_raw() {
+        // The server says this as an ordinary command failure; the text is the
+        // only clue, and "$changeStream stage is only supported on replica
+        // sets" means nothing to someone who just wanted to watch a collection.
+        let (status, message) = describe_stream_error(
+            "Error: The $changeStream stage is only supported on replica sets",
+        );
+
+        assert_eq!(status, StreamStatus::Unsupported);
+        assert!(message.contains("replica set"), "{message}");
+        assert!(!message.contains("$changeStream"), "raw driver text leaked");
+    }
+
+    #[test]
+    fn any_other_failure_keeps_its_own_words() {
+        // Guessing at an unknown error helps nobody; the driver's text is what
+        // the user can search for.
+        let (status, message) = describe_stream_error("connection refused");
+
+        assert_eq!(status, StreamStatus::Error);
+        assert_eq!(message, "connection refused");
+    }
+
+    #[test]
+    fn a_stream_gets_a_resume_point_before_its_first_event() {
+        // Pausing a watch that has not seen a change yet used to leave it with
+        // no token, so resuming opened at the current time and every change
+        // made during the pause was skipped — silently, which is worse than
+        // showing nothing at all. The cursor has a position from the moment it
+        // opens, whether or not anything has come through it.
+        let mut point = ResumePoint::default();
+        record_resume_token(&mut point, 1, Some(token("opened")));
+        assert_eq!(point.token, Some(token("opened")));
+    }
+
+    #[test]
+    fn a_resume_point_follows_the_cursor_forward() {
+        // A cursor advances through batches carrying nothing this stream was
+        // watching for. Recording only event tokens left the resume point
+        // drifting further behind the oplog until resuming failed outright.
+        let mut point = ResumePoint::default();
+        record_resume_token(&mut point, 1, Some(token("opened")));
+        record_resume_token(&mut point, 1, Some(token("after an empty batch")));
+        assert_eq!(point.token, Some(token("after an empty batch")));
+    }
+
+    #[test]
+    fn a_straggler_cannot_drag_the_resume_point_backwards() {
+        // A retired reader can surface minutes later still holding a cursor
+        // whose position predates its replacement's. Taking it would replay
+        // changes the view has already shown, under fresh sequence numbers
+        // that no deduplication can match up.
+        let mut point = ResumePoint::default();
+        record_resume_token(&mut point, 2, Some(token("replacement")));
+        record_resume_token(&mut point, 1, Some(token("straggler")));
+        assert_eq!(point.token, Some(token("replacement")));
+    }
+
+    #[test]
+    fn a_cursor_with_no_position_yet_does_not_erase_one() {
+        let mut point = ResumePoint::default();
+        record_resume_token(&mut point, 1, Some(token("somewhere")));
+        record_resume_token(&mut point, 2, None);
+        assert_eq!(point.token, Some(token("somewhere")));
+    }
+
+    #[test]
+    fn an_unset_heavy_update_is_measured_by_what_it_removes() {
+        // Its whole change is the list of field names — no document, no
+        // updated fields. Measuring only the bodies reported nearly zero, so a
+        // thousand of them sat in a buffer that believed it was empty.
+        let unset = ChangeEvent {
+            operation_type: "update".to_string(),
+            removed_fields: Some(vec!["a".repeat(200), "b".repeat(200)]),
+            ..event("update")
+        };
+        assert!(
+            measure_event(&unset) > 400,
+            "removed fields should count towards the byte bound, got {}",
+            measure_event(&unset)
+        );
+    }
+
+    #[test]
+    fn a_filter_change_keeps_the_resume_slot_it_is_replacing() {
+        // Shared, not copied. Retiring a reader does not stop it instantly: it
+        // wakes, records where its cursor actually reached, and only then lets
+        // go — so a copy taken while building the replacement is the position
+        // BEFORE that last word, and on a narrowly filtered stream it can be
+        // far enough behind to have aged out of the oplog by the time anyone
+        // resumes from it.
+        let old = live_stream();
+        let carried = carry_over(Some(&old), "c1", &Some("sales".to_string()));
+        assert!(Arc::ptr_eq(&carried.resume_token, &old.resume_token));
+        assert!(Arc::ptr_eq(&carried.generation, &old.generation));
+        assert!(Arc::ptr_eq(&carried.retired, &old.retired));
+    }
+
+    #[test]
+    fn a_watch_on_another_target_starts_from_nothing() {
+        // A different database has no resume point to inherit, and sharing a
+        // generation counter would retire readers with nothing to do with each
+        // other.
+        let old = live_stream();
+        let carried = carry_over(Some(&old), "c1", &Some("other".to_string()));
+        assert!(!Arc::ptr_eq(&carried.resume_token, &old.resume_token));
+        assert!(!Arc::ptr_eq(&carried.generation, &old.generation));
+    }
+
+    #[test]
+    fn a_retired_reader_cannot_report_a_failure_over_a_healthy_stream() {
+        // A cursor retired a microsecond ago can fail long after its
+        // replacement is happily running. Writing that into the shared stream
+        // would show the user a dead tail that is in fact fine — and the
+        // replacement cannot clear it, because it only promotes a stream still
+        // marked Starting.
+        let stream = live_stream();
+        let straggler = retire_reader(&stream);
+        let live = retire_reader(&stream);
+        publish_status(&stream, live, StreamStatus::Running, None);
+
+        publish_status(
+            &stream,
+            straggler,
+            StreamStatus::Error,
+            Some("cursor died".to_string()),
+        );
+
+        assert_eq!(*stream.status.lock().unwrap(), StreamStatus::Running);
+        assert_eq!(*stream.error.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_stream_paused_while_its_cursor_opened_does_not_come_back_running() {
+        // Pause is answered immediately, but the reader only learns of it when
+        // its `watch()` finishes. Announcing Running then would leave the panel
+        // offering Pause on something already stopped.
+        let stream = live_stream();
+        let generation = retire_reader(&stream);
+        *stream.status.lock().unwrap() = StreamStatus::Paused;
+
+        publish_status(&stream, generation, StreamStatus::Running, None);
+
+        assert_eq!(*stream.status.lock().unwrap(), StreamStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn a_reader_whose_predecessor_has_settled_starts_at_once() {
+        let stream = live_stream();
+        stream.settled.store(4, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_millis(100), await_handover(&stream, 4, HANDOVER_GRACE))
+            .await
+            .expect("nothing left to wait for");
+    }
+
+    #[tokio::test]
+    async fn a_reader_waits_for_its_predecessor_to_say_where_it_got_to() {
+        // Retiring a reader does not stop it: it wakes, records its final
+        // cursor position and only then lets go. A replacement that read the
+        // shared point before that starts from the position before the last
+        // word — which on a stream idle for hours is the point most likely to
+        // have aged out of the oplog.
+        let stream = live_stream();
+        let handing_over = Arc::clone(&stream);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            handing_over.settled.store(7, Ordering::SeqCst);
+            handing_over.retired.notify_waiters();
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), await_handover(&stream, 7, HANDOVER_GRACE))
+            .await
+            .expect("the handover should complete once the predecessor settles");
+        assert!(stream.settled.load(Ordering::SeqCst) >= 7);
+    }
+
+    #[tokio::test]
+    async fn a_predecessor_that_never_settles_does_not_wedge_the_watch() {
+        // A stale resume point is a bad start; no stream at all is worse. This
+        // one really does wait out `HANDOVER_GRACE` — the generous outer
+        // timeout is there so a slow machine reports "still bounded" rather
+        // than a spurious failure.
+        let stream = live_stream();
+        // Its own grace, because the real one is a 30-second backstop against
+        // a task that was never polled — waiting that out here would say
+        // nothing extra and cost the suite half a minute.
+        let grace = Duration::from_millis(20);
+        tokio::time::timeout(grace * 50, await_handover(&stream, 9, grace))
+            .await
+            .expect("the wait for a predecessor must be bounded");
+        assert!(stream.settled.load(Ordering::SeqCst) < 9);
+    }
+
+    #[test]
+    fn closing_a_window_stops_the_watches_it_owned() {
+        // Closing a secondary window with the OS button runs no frontend code
+        // at all, so nothing tells these tails to stop. Left behind they hold a
+        // server-side cursor and go on buffering for as long as the app lives.
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        let here = live_stream();
+        let elsewhere = live_stream();
+        *elsewhere.window.lock().unwrap() = "win-2".to_string();
+        {
+            let mut streams = state.change_streams.lock_safe().unwrap();
+            streams.insert("watch.c.c1.sales.orders".to_string(), here);
+            streams.insert("watch.c.c1.sales.invoices".to_string(), elsewhere);
+        }
+
+        // A window that owns none takes none with it.
+        assert!(stop_change_streams_for_window(&state, "win-9")
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.change_streams.lock_safe().unwrap().len(), 2);
+
+        assert_eq!(
+            stop_change_streams_for_window(&state, "main").unwrap(),
+            vec!["watch.c.c1.sales.orders".to_string()]
+        );
+        // Gone from the map, and its reader retired — the whole point is that
+        // it stops holding a cursor.
+        let left = state.change_streams.lock_safe().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left.contains_key("watch.c.c1.sales.invoices"));
+    }
+
+    #[test]
+    fn a_watch_claimed_by_another_window_survives_the_sweep() {
+        // A tab moved out of a window that is closing has already been claimed
+        // by the window it moved to. Sweeping it anyway takes the buffer and
+        // the resume point the move was supposed to carry.
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        let moved = live_stream();
+        state
+            .change_streams
+            .lock_safe()
+            .unwrap()
+            .insert("watch.c.c1.sales.orders".to_string(), Arc::clone(&moved));
+
+        *moved.window.lock().unwrap() = "win-2".to_string();
+        assert!(stop_change_streams_for_window(&state, "main")
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.change_streams.lock_safe().unwrap().len(), 1);
+        assert_eq!(moved.generation.load(Ordering::SeqCst), 0, "not retired");
+    }
+
+    #[test]
+    fn a_failing_cursor_keeps_the_ground_it_gained() {
+        // A long-lived cursor advances through batches carrying nothing this
+        // stream watches for. Throwing that away when it finally fails leaves
+        // the resume point at the startup token, and retrying then asks the
+        // server for history the oplog no longer holds.
+        let stream = live_stream();
+        let generation = retire_reader(&stream);
+
+        fail_stream(&stream, generation, "cursor died", Some(token("reached")));
+
+        assert_eq!(stream.resume_token.lock().unwrap().token, Some(token("reached")));
+        assert_eq!(*stream.status.lock().unwrap(), StreamStatus::Error);
+    }
+
+    #[test]
+    fn a_retired_cursors_failure_moves_nothing() {
+        // Same guard as everywhere else: a straggler must not drag the resume
+        // point backwards, nor report over a healthy replacement.
+        let stream = live_stream();
+        let straggler = retire_reader(&stream);
+        let live = retire_reader(&stream);
+        publish_status(&stream, live, StreamStatus::Running, None);
+        record_resume_token(
+            &mut stream.resume_token.lock().unwrap(),
+            live,
+            Some(token("current")),
+        );
+
+        fail_stream(&stream, straggler, "cursor died", Some(token("stale")));
+
+        assert_eq!(stream.resume_token.lock().unwrap().token, Some(token("current")));
+        assert_eq!(*stream.status.lock().unwrap(), StreamStatus::Running);
+    }
+
+    #[test]
+    fn a_stream_is_not_installed_for_a_window_that_has_gone() {
+        // Closing a window destroys the renderer that would have stopped this,
+        // and the sweep has already run over a map that did not yet hold it —
+        // so an install here would leak a cursor until the app exits.
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        state
+            .closed_windows
+            .lock_safe()
+            .unwrap()
+            .insert("win-2".to_string());
+        let stream = live_stream();
+        *stream.window.lock().unwrap() = "win-2".to_string();
+
+        assert!(!install_stream(&state, "watch.c.c1.sales.orders", stream, "win-2").unwrap());
+        assert!(state.change_streams.lock_safe().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stream_is_installed_for_a_window_that_is_still_there() {
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        assert!(install_stream(&state, "watch.c.c1.sales.orders", live_stream(), "main").unwrap());
+        assert!(state
+            .change_streams
+            .lock_safe()
+            .unwrap()
+            .contains_key("watch.c.c1.sales.orders"));
+    }
+
+    #[test]
+    fn the_window_that_polls_is_the_one_that_owns_it() {
+        // Ownership follows the poll rather than the start, because a start can
+        // be stale: a panel unmounted by a tab moving to another window may
+        // already have one in flight, and letting it claim would hand the
+        // stream back to the window the tab just left — where closing it would
+        // sweep a tail the other window is actively watching.
+        let stream = live_stream();
+        assert_eq!(*stream.window.lock().unwrap(), "main");
+
+        claim_by_poller(&stream, "win-2");
+
+        assert_eq!(*stream.window.lock().unwrap(), "win-2");
+    }
+
+    #[test]
+    fn a_poll_from_nowhere_claims_nothing() {
+        let stream = live_stream();
+        claim_by_poller(&stream, "");
+        assert_eq!(*stream.window.lock().unwrap(), "main");
+    }
+
+    #[test]
+    fn a_reader_starts_before_the_stream_can_be_swept() {
+        // The start runs inside the map lock the close sweep also takes.
+        // Spawning after the lock was released left a gap: the sweep could
+        // remove and retire the stream in between, and the spawn that followed
+        // would start a live reader on an `Arc` no longer in the map — a
+        // cursor with nothing left that could ever stop it.
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        let stream = live_stream();
+        let mut started_while_mapped = None;
+
+        let installed = install_stream_with(
+            &state,
+            "watch.c.c1.sales.orders",
+            Arc::clone(&stream),
+            "main",
+            |_| {
+                // Anything the sweep could do would need this lock, which the
+                // install is holding.
+                started_while_mapped = Some(state.change_streams.try_lock().is_err());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(installed);
+        assert_eq!(started_while_mapped, Some(true), "started under the map lock");
+        assert!(state
+            .change_streams
+            .lock_safe()
+            .unwrap()
+            .contains_key("watch.c.c1.sales.orders"));
+    }
+
+    #[test]
+    fn a_reader_is_not_started_for_a_window_that_has_gone() {
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        state
+            .closed_windows
+            .lock_safe()
+            .unwrap()
+            .insert("win-2".to_string());
+        let mut started = false;
+
+        let installed = install_stream_with(
+            &state,
+            "watch.c.c1.sales.orders",
+            live_stream(),
+            "win-2",
+            |_| {
+                started = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!installed);
+        assert!(!started, "nothing should be started for a window that is gone");
+        assert!(state.change_streams.lock_safe().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_poll_claims_its_stream_without_letting_go_of_the_map() {
+        // The lookup and the claim cannot be split: a close sweep landing
+        // between them would see the old owner, remove the stream, and leave
+        // the poll holding a detached `Arc` it claims for nothing.
+        use crate::state::LockExt;
+        let state = crate::AppState::new();
+        state
+            .change_streams
+            .lock_safe()
+            .unwrap()
+            .insert("watch.c.c1.sales.orders".to_string(), live_stream());
+
+        let found = find_and_claim(&state, "watch.c.c1.sales.orders", "win-2")
+            .unwrap()
+            .expect("the stream is installed");
+
+        assert_eq!(*found.window.lock().unwrap(), "win-2");
+        // Whatever the sweep does next, it now sees the new owner: the claim
+        // landed while the map was locked against it.
+        assert!(stop_change_streams_for_window(&state, "main")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_poll_waits_for_the_map_while_a_sweep_is_deciding() {
+        // A poll goes through the same map lock the close sweep holds while it
+        // decides what to remove, so the two are serialized rather than
+        // interleaved. That the lookup and the claim share ONE guard is
+        // structural — five lines, one `streams` binding — and not something a
+        // single-threaded test can distinguish; this covers the half that is
+        // observable. A thread slow to start reads the same way as a blocked
+        // one, so it can only miss, never fail spuriously.
+        use crate::state::LockExt;
+        let state = Arc::new(crate::AppState::new());
+        state
+            .change_streams
+            .lock_safe()
+            .unwrap()
+            .insert("watch.c.c1.sales.orders".to_string(), live_stream());
+
+        let sweeping = state.change_streams.lock().expect("fresh lock");
+        let (tx, rx) = mpsc::channel();
+        let polling = Arc::clone(&state);
+        let claimer = std::thread::spawn(move || {
+            let found = find_and_claim(&polling, "watch.c.c1.sales.orders", "win-2").unwrap();
+            let _ = tx.send(found.is_some());
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(sweeping);
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        claimer.join().expect("claiming thread");
+        assert_eq!(
+            *state
+                .change_streams
+                .lock_safe()
+                .unwrap()
+                .get("watch.c.c1.sales.orders")
+                .unwrap()
+                .window
+                .lock()
+                .unwrap(),
+            "win-2"
+        );
+    }
+
+    #[test]
+    fn a_poll_for_a_stream_that_is_gone_claims_nothing() {
+        let state = crate::AppState::new();
+        assert!(find_and_claim(&state, "watch.c.c1.sales.orders", "win-2")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn retiring_a_reader_claims_the_next_generation() {
+        let stream = live_stream();
+        assert_eq!(retire_reader(&stream), 1);
+        assert_eq!(retire_reader(&stream), 2);
+        assert_eq!(stream.generation.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retirement_waits_for_a_reader_that_is_publishing() {
+        // The race this closes: a reader checks its generation, is retired,
+        // and still appends its event — which the replacement then reads again
+        // from the older resume token, buffering the same change twice under
+        // two sequence numbers that nothing downstream can reconcile.
+        //
+        // Retirement takes the buffer lock, so it cannot land in the middle of
+        // a publish. Holding that lock here stands in for a reader mid-publish.
+        let stream = live_stream();
+        let publishing = stream.buffer.lock().expect("fresh lock");
+        let (tx, rx) = mpsc::channel();
+        let other = Arc::clone(&stream);
+        let retiring = std::thread::spawn(move || {
+            let generation = retire_reader(&other);
+            let _ = tx.send(generation);
+        });
+
+        // Still mid-publish, so the generation must not have moved. A thread
+        // slow to start reads the same way, which is why this cannot fail
+        // spuriously — only miss.
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(stream.generation.load(Ordering::SeqCst), 0);
+
+        drop(publishing);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(1),
+            "retirement should proceed once the publish releases the buffer"
+        );
+        retiring.join().expect("retiring thread");
+    }
 }
+
