@@ -66,6 +66,12 @@ describe('matchesFor — what a device tag could match', () => {
     expect(matchesFor('zh-Hans-CN')).toEqual(['zh-hans', 'zh']);
   });
 
+  it('sends a bare zh to simplified rather than to English', () => {
+    // Neither shipped Chinese catalog answers to `zh` alone, so a device set
+    // to plain Chinese would otherwise fall through to English entirely.
+    expect(matchesFor('zh')).toEqual(['zh-hans', 'zh']);
+  });
+
   it('reads the script off the region when the tag omits it', () => {
     // A device that says `zh-TW` has still said which script it wants.
     expect(matchesFor('zh-TW')).toEqual(['zh-hant', 'zh']);

@@ -89,9 +89,14 @@ export function matchesFor(tag: string): string[] {
   const candidates: string[] = [];
   if (script) {
     candidates.push(`${language}-${script}`);
-  } else if (language === 'zh' && region) {
+  } else if (language === 'zh') {
+    // A bare `zh`, or one with only a region, still has to reach a catalog:
+    // neither `zh-Hans` nor `zh-Hant` answers to `zh` alone, so without this a
+    // device set to plain Chinese would fall through to English. Simplified is
+    // the default the region tags point at when they say nothing else, which
+    // is what CLDR's likely-subtags resolve `zh` to as well.
     candidates.push(
-      `${language}-${TRADITIONAL_CHINESE_REGIONS.has(region) ? 'hant' : 'hans'}`
+      `${language}-${region && TRADITIONAL_CHINESE_REGIONS.has(region) ? 'hant' : 'hans'}`
     );
   }
   candidates.push(language);

@@ -284,6 +284,51 @@ function expectedKeys(englishKeys: string[], code: string): string[] {
   return [...expected].sort();
 }
 
+/**
+ * The English value a locale's key should be measured against.
+ *
+ * A locale carries the plural forms ITS language has, so French's `_many` has
+ * no English counterpart of its own. Looking the key up in English and giving
+ * up would quietly exempt exactly those forms from the checks below — the
+ * forms that exist only because this suite started allowing them — and a
+ * `_many` string could drop its `{{count}}`, or stay in English, for the
+ * million-scale counts it is there to serve.
+ */
+function englishFor(
+  en: Record<string, unknown>,
+  key: string
+): { key: string; value: string } | null {
+  const direct = valueAt(en, key);
+  if (typeof direct === 'string') return { key, value: direct };
+  const match = /^(.*)_(zero|one|two|few|many|other)$/.exec(key);
+  if (!match) return null;
+  for (const sibling of ['other', 'one', 'many', 'few', 'two', 'zero']) {
+    const siblingKey = `${match[1]}_${sibling}`;
+    const value = valueAt(en, siblingKey);
+    if (typeof value === 'string') return { key: siblingKey, value };
+  }
+  return null;
+}
+
+describe('englishFor — what a locale-only plural form is measured against', () => {
+  const en = { a: { plain: 'x', count_one: '{{count}} thing', count_other: '{{count}} things' } };
+
+  it('maps a form English does not have onto an English sibling', () => {
+    expect(englishFor(en, 'a.count_many')).toEqual({
+      key: 'a.count_other',
+      value: '{{count}} things',
+    });
+  });
+
+  it('uses the key itself when English has it', () => {
+    expect(englishFor(en, 'a.plain')).toEqual({ key: 'a.plain', value: 'x' });
+  });
+
+  it('gives up on a key that is not a plural form at all', () => {
+    expect(englishFor(en, 'a.unknown')).toBeNull();
+  });
+});
+
 describe('expectedKeys — the plural forms a language actually has', () => {
   const en = ['a.plain', 'a.count_one', 'a.count_other'];
 
@@ -343,13 +388,16 @@ describe('locale catalogs', () => {
       const en = await load('en', ns);
       for (const { code } of OTHER_LOCALES) {
         const other = await load(code, ns);
-        const suspicious = keysOf(en).filter((k) => {
-          const enVal = valueAt(en, k);
+        // The LOCALE's keys, not English's: a plural form only this language
+        // has would otherwise never be looked at.
+        const suspicious = keysOf(other).filter((k) => {
+          const source = englishFor(en, k);
           const otherVal = valueAt(other, k);
           return (
-            typeof enVal === 'string' &&
-            enVal === otherVal &&
-            !ALLOWED_IDENTICAL_VALUES.has(`${ns}:${k}`)
+            source !== null &&
+            source.value === otherVal &&
+            !ALLOWED_IDENTICAL_VALUES.has(`${ns}:${k}`) &&
+            !ALLOWED_IDENTICAL_VALUES.has(`${ns}:${source.key}`)
           );
         });
         expect(
@@ -439,14 +487,14 @@ describe('locale catalogs', () => {
       const en = await load('en', ns);
       for (const { code } of OTHER_LOCALES) {
         const other = await load(code, ns);
-        for (const key of keysOf(en)) {
-          const enVal = valueAt(en, key);
+        for (const key of keysOf(other)) {
+          const source = englishFor(en, key);
           const otherVal = valueAt(other, key);
-          if (typeof enVal !== 'string' || typeof otherVal !== 'string') continue;
+          if (source === null || typeof otherVal !== 'string') continue;
           expect(
             tokensOf(otherVal),
-            `${code}/${ns}.json:${key} interpolation placeholders don't match en ("${enVal}" vs "${otherVal}")`,
-          ).toEqual(tokensOf(enVal));
+            `${code}/${ns}.json:${key} interpolation placeholders don't match en:${source.key} ("${source.value}" vs "${otherVal}")`,
+          ).toEqual(tokensOf(source.value));
         }
       }
     }
