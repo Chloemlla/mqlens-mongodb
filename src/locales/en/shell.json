@@ -470,6 +470,55 @@
       "unlock": "Unlock MQLens"
     }
   },
+  "watch": {
+    "actions": {
+      "clear": "Clear the list",
+      "closeDetail": "Close the detail pane",
+      "pause": "Pause the stream",
+      "resume": "Resume from where it paused",
+      "retry": "Try the stream again"
+    },
+    "allCollections": "All collections",
+    "columns": {
+      "collection": "Collection",
+      "database": "Database",
+      "document": "Document",
+      "operation": "Op",
+      "time": "Time"
+    },
+    "deployment": "Whole deployment",
+    "dropped_one": "{{count}} earlier event dropped to stay within the buffer",
+    "dropped_other": "{{count}} earlier events dropped to stay within the buffer",
+    "eventCount_one": "{{count}} event",
+    "eventCount_other": "{{count}} events",
+    "fieldsChanged_one": "{{count}} field",
+    "fieldsChanged_other": "{{count}} fields",
+    "filterAll": "All",
+    "filterCollection": "Filter by collection",
+    "filterLabel": "Show",
+    "noCollectionMatch": "No collection matches",
+    "noneInCollection": "No events for this collection yet",
+    "operations": {
+      "delete": "Delete",
+      "drop": "Drop",
+      "insert": "Insert",
+      "invalidate": "Invalidate",
+      "rename": "Rename",
+      "replace": "Replace",
+      "update": "Update"
+    },
+    "searchCollections": "Search collections…",
+    "status": {
+      "ended": "ended",
+      "error": "error",
+      "paused": "paused",
+      "running": "live",
+      "starting": "starting",
+      "unsupported": "unavailable"
+    },
+    "unsupported": "Change streams need a replica set or a sharded cluster. This server is a standalone.",
+    "waiting": "Watching for changes…"
+  },
   "workspaceTabBar": {
     "closeTab": "Close {{label}}",
     "closeTooltip": "Close tab",

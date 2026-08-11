@@ -16,6 +16,7 @@ import {
   resetChatRequests,
   takeSettledChatRequest,
 } from './lib/aiChatRequest';
+import { stopChangeStream } from './lib/changeStream';
 import {
   appendReplyToChat,
   releaseChatsForTab,
@@ -31,6 +32,7 @@ import {
 } from './lib/mongoshSession';
 import { DataGrid, type ViewMode } from './components/DataGrid';
 import { ConnectionManager } from './components/ConnectionManager';
+import { WatchPanel } from './components/WatchPanel';
 import { SettingsView, type SettingsTabId, MONGO_TOOLS_DIR_KEY } from './components/SettingsModal';
 import { IndexViewer } from './components/IndexViewer';
 import { IndexModal } from './components/IndexModal';
@@ -119,12 +121,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { FolderCode, KeyRound, X, ChevronsRight, XSquare, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
+import { FolderCode, KeyRound, Radio, X, ChevronsRight, XSquare, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
 import logoMark from './assets/logo-mark.svg';
 
 export interface QueryTab {
   id: string;
-  type: 'collection' | 'index' | 'shell' | 'settings' | 'quickstart' | 'export' | 'import' | 'tasks' | 'schema' | 'create-view' | 'gridfs' | 'monitoring' | 'users' | 'dump' | 'restore' | 'validation' | 'generate';
+  type: 'collection' | 'index' | 'shell' | 'settings' | 'quickstart' | 'export' | 'import' | 'tasks' | 'schema' | 'create-view' | 'gridfs' | 'monitoring' | 'users' | 'dump' | 'restore' | 'validation' | 'generate' | 'watch';
   connectionId: string;
   db: string;
   collection: string;
@@ -273,6 +275,21 @@ const createTasksTab = (): QueryTab => ({
   explainResult: null,
 });
 
+/**
+ * The id of the tab that watches a namespace.
+ *
+ * The scope is encoded, not spelled with sentinel words: `database` and
+ * `deployment` are legal MongoDB names, so a collection called `database` used
+ * to produce the same tab id as its database-wide watch and the second target
+ * could never be opened. Shared with the rename handlers, which have to mint
+ * the same id — the generic tab id they would otherwise fall through to is the
+ * ordinary collection tab's, and two tabs cannot share one.
+ */
+const watchTabId = (connectionId: string, dbName = '', collName = '') => {
+  const scope = collName ? 'c' : dbName ? 'd' : 'x';
+  return `watch.${scope}.${connectionId}.${dbName}.${collName}`;
+};
+
 const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
   const className = isActive ? 'text-primary' : 'text-muted-foreground';
   const size = 11;
@@ -281,6 +298,8 @@ const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
       return <KeyRound size={size} className={className} />;
     case 'shell':
       return <Terminal size={size} className={className} />;
+    case 'watch':
+      return <Radio size={size} className={className} />;
     case 'settings':
       return <Settings size={size} className={className} />;
     case 'quickstart':
@@ -324,6 +343,13 @@ export const tabLabelFor = (
       return `${tab.collection}.${tab.indexName}`;
     case 'shell':
       return `mongosh: ${tab.collection || tab.db}`;
+    case 'watch':
+      // Both are empty for a deployment-wide watch, which rendered as
+      // "Watch: " — and several of them, one per connection, were
+      // indistinguishable.
+      return t('tabs.watch', {
+        target: tab.collection || tab.db || connectionName(tab.connectionId),
+      });
     case 'settings':
       return t('tabs.settings');
     case 'quickstart':
@@ -1428,6 +1454,30 @@ function Workspace() {
     }
   };
 
+  /** Open a live tail. One tab per target, so re-opening focuses rather than
+   *  starting a second cursor on the same collection. */
+  const handleOpenWatch = (connectionId: string, dbName = '', collName = '') => {
+    if (!connectionId) return;
+    const tabId = watchTabId(connectionId, dbName, collName);
+    if (!tabs.some((t) => t.id === tabId)) {
+      const newTab: QueryTab = {
+        id: tabId,
+        type: 'watch',
+        connectionId,
+        db: dbName,
+        collection: collName,
+        results: [],
+        loading: false,
+        error: null,
+        explainResult: null,
+      };
+      setTabs((prev) => [...prev, newTab]);
+      dispatchWorkspace({ type: 'open_tab', tabId }, { tab: newTab });
+      return;
+    }
+    dispatchWorkspace({ type: 'open_tab', tabId });
+  };
+
   const handleOpenShell = (connectionId: string, dbName: string, collName = '', initialCommand?: string) => {
     if (!connectionId || !dbName) return;
 
@@ -2015,14 +2065,28 @@ function Workspace() {
       if (tab.type === 'export') {
         return { ...tab, id: `export.${connectionId}.${dbName}.${newName}`, collection: newName };
       }
+      if (tab.type === 'watch') {
+        // Its own id scheme, and not optional: the generic form below is the
+        // ordinary collection tab's id, so a renamed watch would collide with
+        // an open query tab on the same namespace.
+        return {
+          ...tab,
+          id: watchTabId(connectionId, dbName, newName),
+          collection: newName,
+        };
+      }
       return { ...tab, id: `${connectionId}.${dbName}.${newName}`, collection: newName };
     };
 
     const renamedPairs = tabs
-      .map(t => ({ oldId: t.id, newId: renameTab(t).id }))
+      .map(t => ({ oldId: t.id, newId: renameTab(t).id, isWatch: t.type === 'watch' }))
       .filter(p => p.oldId !== p.newId);
     setTabs(prev => prev.map(renameTab));
-    renamedPairs.forEach(({ oldId, newId }) => {
+    renamedPairs.forEach(({ oldId, newId, isWatch }) => {
+      // The tail was watching a namespace that no longer exists. Left alone it
+      // would sit under the dead tab id for as long as the app runs, holding a
+      // cursor nothing polls, while the renamed tab opens a second one.
+      if (isWatch) void stopChangeStream(oldId);
       // A rename mints a new tab id, so the shell session has to follow it —
       // otherwise the live mongosh child is stranded under the dead id and the
       // renamed tab starts a second one.
@@ -2080,6 +2144,13 @@ function Workspace() {
           db: newName,
         };
       }
+      if (tab.type === 'watch') {
+        return {
+          ...tab,
+          id: watchTabId(connectionId, newName, tab.collection),
+          db: newName,
+        };
+      }
       return {
         ...tab,
         id: `${connectionId}.${newName}.${tab.collection}`,
@@ -2088,10 +2159,17 @@ function Workspace() {
     };
 
     const renamedPairs = tabs
-      .map(t => ({ oldId: t.id, newId: renameTab(t).id, isShell: t.type === 'shell' }))
+      .map(t => ({
+        oldId: t.id,
+        newId: renameTab(t).id,
+        isShell: t.type === 'shell',
+        isWatch: t.type === 'watch',
+      }))
       .filter(p => p.oldId !== p.newId);
     setTabs(prev => prev.map(renameTab));
-    renamedPairs.forEach(({ oldId, newId, isShell }) => {
+    renamedPairs.forEach(({ oldId, newId, isShell, isWatch }) => {
+      // Watching a database that no longer exists. See the collection rename.
+      if (isWatch) void stopChangeStream(oldId);
       // A rename mints a new tab id, so the shell session has to follow it —
       // otherwise the live mongosh child is stranded under the dead id and the
       // renamed tab starts a second one.
@@ -2315,6 +2393,10 @@ function Workspace() {
       // release on unmount, because an inactive tab is unmounted and still owns
       // its chat. Closing is where that ends.
       releaseChatsForTab(action.tabId);
+      // A watch cursor is a server-side resource that deliberately outlives an
+      // unmount — inactive tabs are unmounted while still open. Closing the
+      // tab is where it ends.
+      void stopChangeStream(action.tabId);
       void disposeShellSession(action.tabId);
       // #91: forget this tab's generate-task tracking on close (running or
       // finished) — otherwise reopening "Generate Data…" on the same
@@ -2345,6 +2427,7 @@ function Workspace() {
         tabChatCache.current.delete(id);
         clearChatRequest(id);
         releaseChatsForTab(id);
+        void stopChangeStream(id);
         void disposeShellSession(id);
       });
       // Prune `tabs[]` here rather than leaving it to the caller. Every
@@ -3110,8 +3193,17 @@ function Workspace() {
             // would seed it from a snapshot predating everything the other
             // window did, and a command still in flight here would mirror its
             // stale transcript over the newer one.
+            // The tail is keyed globally by tab id and belongs to the tab, not
+            // to this window. Stopping it on a move would either strand the
+            // destination — which then starts from the current oplog position
+            // and loses the buffered history — or, if it has already adopted
+            // the stream, tear the adopted one out from under it and leave it
+            // polling an id nothing is filling.
             if (stillInWorkspace.has(id)) forgetShellSession(id);
-            else void disposeShellSession(id);
+            else {
+              void disposeShellSession(id);
+              void stopChangeStream(id);
+            }
             unmirroredTabIdsRef.current.delete(id);
           });
           setTabs((prev) => prev.filter((t) => !leavingIds.has(t.id)));
@@ -3259,6 +3351,7 @@ function Workspace() {
             // stay claimed by tabs that no longer exist and read as open
             // elsewhere until the window closes.
             releaseChatsForTab(id);
+            void stopChangeStream(id);
             void disposeShellSession(id);
             unmirroredTabIdsRef.current.delete(id);
           });
@@ -4165,6 +4258,18 @@ function Workspace() {
             />
           </div>
         )}
+        {tab.type === 'watch' && (
+          <WatchPanel
+            connectionId={tab.connectionId}
+            // `|| undefined`, not the raw value: a deployment watch stores an
+            // empty db on the tab, and an empty NAME is not the same as no
+            // name — it reaches the driver as `client.database("")` and the
+            // server rejects the namespace `.$cmd.aggregate`.
+            databaseName={tab.db || undefined}
+            collectionName={tab.collection || undefined}
+            streamId={tab.id}
+          />
+        )}
         {tab.type === 'shell' && (() => {
           const activeConnection = activeConnections.find(c => c.id === tab.connectionId);
           const connectionName = activeConnection ? activeConnection.name : tab.connectionId;
@@ -4265,6 +4370,7 @@ function Workspace() {
           onCreateIndex={handleOpenIndexModalForCreate}
           onDeleteIndex={handleDeleteIndex}
           onOpenShell={handleOpenShell}
+          onWatchCollection={handleOpenWatch}
           onOpenMonitoring={handleOpenMonitoringTab}
           onOpenUsers={handleOpenUsersTab}
           onAnalyzeSchema={handleOpenSchemaTab}

@@ -53,7 +53,10 @@
     "settings": "Einstellungen",
     "unpin": "Anheftung aufheben",
     "unpinFromSidebar": "Anheftung aufheben",
-    "validationRules": "Validierungsregeln"
+    "validationRules": "Validierungsregeln",
+    "watchCollection": "Änderungen beobachten…",
+    "watchDatabase": "Datenbankänderungen beobachten…",
+    "watchDeployment": "Deployment-Änderungen beobachten…"
   },
   "dialogs": {
     "dropCollection": {
