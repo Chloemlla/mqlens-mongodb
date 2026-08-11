@@ -257,15 +257,71 @@ const ALLOWED_IDENTICAL_VALUES = new Set([
   'shell:connectionCard.topology.standalone', // Standalone
 ]);
 
+/**
+ * The key set a locale is expected to carry, given English.
+ *
+ * Not simply English's own keys. A plural key exists once per plural category,
+ * and the categories are a property of the LANGUAGE: English has `one` and
+ * `other`, Japanese and Chinese have only `other`, French additionally has
+ * `many` for counts of a million and up — a count a document total reaches
+ * easily. Demanding English's exact set would force Japanese to carry an
+ * `_one` form its grammar never selects, and would reject the `_many` French
+ * needs, so each locale is asked for its own forms and nothing else.
+ */
+function expectedKeys(englishKeys: string[], code: string): string[] {
+  const categories = new Intl.PluralRules(code).resolvedOptions().pluralCategories;
+  const PLURAL_SUFFIXES = ['zero', 'one', 'two', 'few', 'many', 'other'];
+  const expected = new Set<string>();
+  for (const key of englishKeys) {
+    const suffix = PLURAL_SUFFIXES.find((s) => key.endsWith(`_${s}`));
+    if (!suffix) {
+      expected.add(key);
+      continue;
+    }
+    const base = key.slice(0, -(suffix.length + 1));
+    for (const category of categories) expected.add(`${base}_${category}`);
+  }
+  return [...expected].sort();
+}
+
+describe('expectedKeys — the plural forms a language actually has', () => {
+  const en = ['a.plain', 'a.count_one', 'a.count_other'];
+
+  it('asks a language with one form for one form', () => {
+    // Japanese and Chinese do not inflect for number. An `_one` entry there is
+    // a form the grammar never selects, so demanding it only invents work.
+    expect(expectedKeys(en, 'ja')).toEqual(['a.count_other', 'a.plain']);
+    expect(expectedKeys(en, 'zh-Hans')).toEqual(['a.count_other', 'a.plain']);
+  });
+
+  it('asks French for the many form it needs', () => {
+    // French selects `many` from a million up — a count a document total
+    // reaches easily. Without the form the string falls back to English.
+    expect(expectedKeys(en, 'fr')).toEqual([
+      'a.count_many',
+      'a.count_one',
+      'a.count_other',
+      'a.plain',
+    ]);
+  });
+
+  it('leaves a language shaped like English alone', () => {
+    expect(expectedKeys(en, 'de')).toEqual(['a.count_one', 'a.count_other', 'a.plain']);
+  });
+});
+
 describe('locale catalogs', () => {
-  it('every locale has every namespace with identical key sets', async () => {
+  it('every locale has every namespace with the key set its grammar needs', async () => {
     for (const ns of NAMESPACES) {
       const en = keysOf(await load('en', ns)).sort();
       for (const { code } of OTHER_LOCALES) {
         const other = keysOf(await load(code, ns)).sort();
         // Both directions: a missing key means untranslated copy; an extra key
-        // means a stale entry left behind by a rename.
-        expect(other, `${code}/${ns}.json is missing keys present in en`).toEqual(en);
+        // means a stale entry left behind by a rename — or a plural form the
+        // language does not have.
+        expect(other, `${code}/${ns}.json does not match the keys en requires`).toEqual(
+          expectedKeys(en, code)
+        );
       }
     }
   });

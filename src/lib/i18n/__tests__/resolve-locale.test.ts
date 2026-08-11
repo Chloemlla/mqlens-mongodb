@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isLocaleSetting, resolveLocale } from '../locales';
+import { isLocaleSetting, matchesFor, resolveLocale } from '../locales';
 
 describe('resolveLocale', () => {
   it('honours an explicit choice regardless of the device language', () => {
@@ -55,5 +55,34 @@ describe('isLocaleSetting', () => {
     expect(isLocaleSetting(undefined)).toBe(false);
     expect(isLocaleSetting(null)).toBe(false);
     expect(isLocaleSetting(42)).toBe(false);
+  });
+});
+
+describe('matchesFor — what a device tag could match', () => {
+  it('prefers the script over the language', () => {
+    // `zh-Hans` and `zh-Hant` are different catalogs that both start `zh`.
+    // Matching on the language alone would hand a reader of one the other.
+    expect(matchesFor('zh-Hant-HK')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-Hans-CN')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('reads the script off the region when the tag omits it', () => {
+    // A device that says `zh-TW` has still said which script it wants.
+    expect(matchesFor('zh-TW')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-HK')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-MO')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-CN')).toEqual(['zh-hans', 'zh']);
+    expect(matchesFor('zh-SG')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('leaves a language with one script alone', () => {
+    expect(matchesFor('de-AT')).toEqual(['de']);
+    expect(matchesFor('fr-CA')).toEqual(['fr']);
+    expect(matchesFor('ja')).toEqual(['ja']);
+  });
+
+  it('is not confused by casing or an empty tag', () => {
+    expect(matchesFor('ZH-HANT-tw')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('')).toEqual([]);
   });
 });

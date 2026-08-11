@@ -48,11 +48,54 @@ export function resolveLocale(
 ): Locale {
   if (isSupportedLocale(setting)) return setting;
   for (const tag of languages ?? []) {
-    const primary = String(tag).split('-')[0]?.toLowerCase();
-    const hit = SUPPORTED_LOCALES.find((l) => l.code === primary);
-    if (hit) return hit.code;
+    for (const candidate of matchesFor(tag)) {
+      const hit = SUPPORTED_LOCALES.find((l) => l.code.toLowerCase() === candidate);
+      if (hit) return hit.code;
+    }
   }
   return DEFAULT_LOCALE;
+}
+
+/**
+ * Where Chinese is written in traditional characters.
+ *
+ * A device that says `zh-TW` rather than `zh-Hant-TW` has still told us which
+ * script it wants; the region is the only place that information is.
+ */
+const TRADITIONAL_CHINESE_REGIONS = new Set(['TW', 'HK', 'MO']);
+
+/**
+ * What a device language tag could match, most specific first.
+ *
+ * The primary subtag alone is not enough once a language ships in more than one
+ * script: `zh-Hans` and `zh-Hant` are different catalogs and both start `zh`,
+ * so matching on `zh` would hand a Taiwanese user whichever happened to be
+ * registered first. Script beats language, and for Chinese a region implies a
+ * script when the tag omits one.
+ *
+ * Lowercased throughout so the caller can compare without worrying about the
+ * casing conventions of a tag (`zh-Hant-HK`).
+ *
+ * Exported for its tests: the mapping is the whole substance of picking a
+ * locale, and it cannot be exercised through {@link resolveLocale} until the
+ * catalogs it points at exist.
+ */
+export function matchesFor(tag: string): string[] {
+  const parts = String(tag).split('-').filter(Boolean);
+  const language = parts[0]?.toLowerCase();
+  if (!language) return [];
+  const script = parts.slice(1).find((p) => p.length === 4)?.toLowerCase();
+  const region = parts.slice(1).find((p) => p.length === 2)?.toUpperCase();
+  const candidates: string[] = [];
+  if (script) {
+    candidates.push(`${language}-${script}`);
+  } else if (language === 'zh' && region) {
+    candidates.push(
+      `${language}-${TRADITIONAL_CHINESE_REGIONS.has(region) ? 'hant' : 'hans'}`
+    );
+  }
+  candidates.push(language);
+  return candidates;
 }
 
 /** The device's preferred languages, most-preferred first. */
