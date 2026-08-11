@@ -97,13 +97,24 @@ describe('matchesFor — what a device tag could match', () => {
     expect(matchesFor('ja')).toEqual(['ja-jpan', 'ja']);
   });
 
-  it('survives a tag with no language at all', () => {
+  it('guesses nothing from a tag with no language at all', () => {
     // `und` is well-formed and its language is absent, so anything that
     // assumes one throws — out of a function that runs while the app is
     // deciding what language to start in.
     expect(() => matchesFor('und')).not.toThrow();
-    expect(matchesFor('und-TW')).toEqual(['zh-hant', 'zh']);
+
+    // And nothing is inferred from what remains. CLDR will maximize any of
+    // these, but every answer is a pick among many: `und-Latn` becomes English
+    // out of the hundreds of languages written in Latin, `und-CH` becomes
+    // German out of Switzerland's four. Matching on that would discard the
+    // real preference sitting behind it.
+    expect(matchesFor('und')).toEqual([]);
+    expect(matchesFor('und-Latn')).toEqual([]);
+    expect(matchesFor('und-CH')).toEqual([]);
+    expect(matchesFor('und-TW')).toEqual([]);
     expect(resolveLocale('system', ['und', 'de-DE'])).toBe('de');
+    expect(resolveLocale('system', ['und-Latn', 'de-DE'])).toBe('de');
+    expect(resolveLocale('system', ['und-CH', 'de-DE'])).toBe('de');
   });
 
   it('is not confused by casing or an empty tag', () => {

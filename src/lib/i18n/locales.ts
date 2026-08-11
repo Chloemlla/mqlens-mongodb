@@ -88,20 +88,16 @@ export function matchesFor(tag: string): string[] {
     const language = String(tag).split('-')[0]?.toLowerCase();
     return language ? [language] : [];
   }
-  // `und` — "undetermined" — is a well-formed tag whose language is absent, so
-  // this cannot assume there is one to lower-case. Reading it off the
-  // maximized locale answers it where CLDR can (`und-TW` is Chinese) and
-  // leaves nothing to match where it cannot, rather than throwing out of a
-  // function that runs while the app is deciding what language to start in.
-  const maximized = maximize(locale);
-  // Only where the tag says something else. A bare `und` maximizes to English,
-  // and letting it match would answer "I don't know" with a language and
-  // swallow the preference listed after it; `und-TW` genuinely does point
-  // somewhere, so its region is allowed to speak.
-  const impliedLanguage = locale.region || locale.script ? maximized?.language : undefined;
-  const language = (locale.language ?? impliedLanguage)?.toLowerCase();
+  // `und` — "undetermined" — is a well-formed tag whose language is absent.
+  // Nothing is guessed from it: CLDR will happily maximize one, but every
+  // answer it gives is a pick among many. `und-Latn` becomes English out of the
+  // hundreds of languages written in Latin, and `und-CH` becomes German out of
+  // Switzerland's four. Either would match here and discard the real
+  // preference listed after it, so an undetermined tag contributes no
+  // candidates and resolution moves on to the next one.
+  const language = locale.language?.toLowerCase();
   if (!language) return [];
-  const script = locale.script ?? maximized?.script;
+  const script = locale.script ?? maximize(locale)?.script;
   const candidates: string[] = [];
   if (script) candidates.push(`${language}-${script.toLowerCase()}`);
   candidates.push(language);
