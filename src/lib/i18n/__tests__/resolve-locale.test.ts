@@ -97,6 +97,15 @@ describe('matchesFor — what a device tag could match', () => {
     expect(matchesFor('ja')).toEqual(['ja-jpan', 'ja']);
   });
 
+  it('survives a tag with no language at all', () => {
+    // `und` is well-formed and its language is absent, so anything that
+    // assumes one throws — out of a function that runs while the app is
+    // deciding what language to start in.
+    expect(() => matchesFor('und')).not.toThrow();
+    expect(matchesFor('und-TW')).toEqual(['zh-hant', 'zh']);
+    expect(resolveLocale('system', ['und', 'de-DE'])).toBe('de');
+  });
+
   it('is not confused by casing or an empty tag', () => {
     expect(matchesFor('ZH-HANT-tw')).toEqual(['zh-hant', 'zh']);
     expect(matchesFor('')).toEqual([]);

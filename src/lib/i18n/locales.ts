@@ -88,21 +88,33 @@ export function matchesFor(tag: string): string[] {
     const language = String(tag).split('-')[0]?.toLowerCase();
     return language ? [language] : [];
   }
-  const language = locale.language.toLowerCase();
-  const script = locale.script ?? maximizedScript(locale);
+  // `und` — "undetermined" — is a well-formed tag whose language is absent, so
+  // this cannot assume there is one to lower-case. Reading it off the
+  // maximized locale answers it where CLDR can (`und-TW` is Chinese) and
+  // leaves nothing to match where it cannot, rather than throwing out of a
+  // function that runs while the app is deciding what language to start in.
+  const maximized = maximize(locale);
+  // Only where the tag says something else. A bare `und` maximizes to English,
+  // and letting it match would answer "I don't know" with a language and
+  // swallow the preference listed after it; `und-TW` genuinely does point
+  // somewhere, so its region is allowed to speak.
+  const impliedLanguage = locale.region || locale.script ? maximized?.language : undefined;
+  const language = (locale.language ?? impliedLanguage)?.toLowerCase();
+  if (!language) return [];
+  const script = locale.script ?? maximized?.script;
   const candidates: string[] = [];
   if (script) candidates.push(`${language}-${script.toLowerCase()}`);
   candidates.push(language);
   return candidates;
 }
 
-/** CLDR's likely script for a tag that omits one. Absent where the runtime
- *  ships no likely-subtags data, in which case the language alone has to do. */
-function maximizedScript(locale: Intl.Locale): string | undefined {
+/** The tag with the script and language CLDR considers likely, or null where
+ *  the runtime ships no likely-subtags data. */
+function maximize(locale: Intl.Locale): Intl.Locale | null {
   try {
-    return locale.maximize().script;
+    return locale.maximize();
   } catch {
-    return undefined;
+    return null;
   }
 }
 
