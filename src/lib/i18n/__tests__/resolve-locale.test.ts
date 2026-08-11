@@ -81,10 +81,20 @@ describe('matchesFor — what a device tag could match', () => {
     expect(matchesFor('zh-SG')).toEqual(['zh-hans', 'zh']);
   });
 
-  it('leaves a language with one script alone', () => {
-    expect(matchesFor('de-AT')).toEqual(['de']);
-    expect(matchesFor('fr-CA')).toEqual(['fr']);
-    expect(matchesFor('ja')).toEqual(['ja']);
+  it('ignores extension subtags rather than reading them as a script', () => {
+    // `zh-TW-u-nu-latn` asks for Traditional Chinese with Latin numerals.
+    // Picking subtags out by length reads that `latn` as the script and sends
+    // a valid preference somewhere that does not exist.
+    expect(matchesFor('zh-TW-u-nu-latn')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-Hans-CN-u-ca-chinese')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('still reaches a single-script language', () => {
+    // CLDR fills in the script these tags omit, so a candidate matching no
+    // shipped catalog comes first and simply falls through.
+    expect(matchesFor('de-AT')).toEqual(['de-latn', 'de']);
+    expect(matchesFor('fr-CA')).toEqual(['fr-latn', 'fr']);
+    expect(matchesFor('ja')).toEqual(['ja-jpan', 'ja']);
   });
 
   it('is not confused by casing or an empty tag', () => {

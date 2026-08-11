@@ -57,50 +57,53 @@ export function resolveLocale(
 }
 
 /**
- * Where Chinese is written in traditional characters.
- *
- * A device that says `zh-TW` rather than `zh-Hant-TW` has still told us which
- * script it wants; the region is the only place that information is.
- */
-const TRADITIONAL_CHINESE_REGIONS = new Set(['TW', 'HK', 'MO']);
-
-/**
  * What a device language tag could match, most specific first.
  *
  * The primary subtag alone is not enough once a language ships in more than one
  * script: `zh-Hans` and `zh-Hant` are different catalogs and both start `zh`,
- * so matching on `zh` would hand a Taiwanese user whichever happened to be
- * registered first. Script beats language, and for Chinese a region implies a
- * script when the tag omits one.
+ * so matching on `zh` would hand a reader of one the other.
  *
- * Lowercased throughout so the caller can compare without worrying about the
- * casing conventions of a tag (`zh-Hant-HK`).
+ * Parsed with `Intl.Locale` rather than by splitting on dashes. A tag can carry
+ * extensions — `zh-TW-u-nu-latn` asks for Traditional Chinese with Latin
+ * numerals — and picking subtags out by length reads that `latn` as the script,
+ * sending a valid Chinese preference somewhere that does not exist. `Intl` also
+ * knows which script a language and region imply, so `zh-TW` reaches
+ * traditional and a bare `zh` reaches simplified out of CLDR's own data instead
+ * of a table maintained here.
+ *
+ * A candidate that matches no shipped catalog simply falls through, which is
+ * why a single-script language contributes a harmless `de-latn` before `de`.
  *
  * Exported for its tests: the mapping is the whole substance of picking a
  * locale, and it cannot be exercised through {@link resolveLocale} until the
  * catalogs it points at exist.
  */
 export function matchesFor(tag: string): string[] {
-  const parts = String(tag).split('-').filter(Boolean);
-  const language = parts[0]?.toLowerCase();
-  if (!language) return [];
-  const script = parts.slice(1).find((p) => p.length === 4)?.toLowerCase();
-  const region = parts.slice(1).find((p) => p.length === 2)?.toUpperCase();
-  const candidates: string[] = [];
-  if (script) {
-    candidates.push(`${language}-${script}`);
-  } else if (language === 'zh') {
-    // A bare `zh`, or one with only a region, still has to reach a catalog:
-    // neither `zh-Hans` nor `zh-Hant` answers to `zh` alone, so without this a
-    // device set to plain Chinese would fall through to English. Simplified is
-    // the default the region tags point at when they say nothing else, which
-    // is what CLDR's likely-subtags resolve `zh` to as well.
-    candidates.push(
-      `${language}-${region && TRADITIONAL_CHINESE_REGIONS.has(region) ? 'hant' : 'hans'}`
-    );
+  let locale: Intl.Locale;
+  try {
+    locale = new Intl.Locale(String(tag));
+  } catch {
+    // Not a well-formed tag. The leading subtag is the most that can be
+    // salvaged, and an empty tag yields nothing at all.
+    const language = String(tag).split('-')[0]?.toLowerCase();
+    return language ? [language] : [];
   }
+  const language = locale.language.toLowerCase();
+  const script = locale.script ?? maximizedScript(locale);
+  const candidates: string[] = [];
+  if (script) candidates.push(`${language}-${script.toLowerCase()}`);
   candidates.push(language);
   return candidates;
+}
+
+/** CLDR's likely script for a tag that omits one. Absent where the runtime
+ *  ships no likely-subtags data, in which case the language alone has to do. */
+function maximizedScript(locale: Intl.Locale): string | undefined {
+  try {
+    return locale.maximize().script;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The device's preferred languages, most-preferred first. */
