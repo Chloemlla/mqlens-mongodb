@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isLocaleSetting, resolveLocale } from '../locales';
+import { isLocaleSetting, matchesFor, resolveLocale } from '../locales';
 
 describe('resolveLocale', () => {
   it('honours an explicit choice regardless of the device language', () => {
@@ -55,5 +55,70 @@ describe('isLocaleSetting', () => {
     expect(isLocaleSetting(undefined)).toBe(false);
     expect(isLocaleSetting(null)).toBe(false);
     expect(isLocaleSetting(42)).toBe(false);
+  });
+});
+
+describe('matchesFor — what a device tag could match', () => {
+  it('prefers the script over the language', () => {
+    // `zh-Hans` and `zh-Hant` are different catalogs that both start `zh`.
+    // Matching on the language alone would hand a reader of one the other.
+    expect(matchesFor('zh-Hant-HK')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-Hans-CN')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('sends a bare zh to simplified rather than to English', () => {
+    // Neither shipped Chinese catalog answers to `zh` alone, so a device set
+    // to plain Chinese would otherwise fall through to English entirely.
+    expect(matchesFor('zh')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('reads the script off the region when the tag omits it', () => {
+    // A device that says `zh-TW` has still said which script it wants.
+    expect(matchesFor('zh-TW')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-HK')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-MO')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-CN')).toEqual(['zh-hans', 'zh']);
+    expect(matchesFor('zh-SG')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('ignores extension subtags rather than reading them as a script', () => {
+    // `zh-TW-u-nu-latn` asks for Traditional Chinese with Latin numerals.
+    // Picking subtags out by length reads that `latn` as the script and sends
+    // a valid preference somewhere that does not exist.
+    expect(matchesFor('zh-TW-u-nu-latn')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('zh-Hans-CN-u-ca-chinese')).toEqual(['zh-hans', 'zh']);
+  });
+
+  it('still reaches a single-script language', () => {
+    // CLDR fills in the script these tags omit, so a candidate matching no
+    // shipped catalog comes first and simply falls through.
+    expect(matchesFor('de-AT')).toEqual(['de-latn', 'de']);
+    expect(matchesFor('fr-CA')).toEqual(['fr-latn', 'fr']);
+    expect(matchesFor('ja')).toEqual(['ja-jpan', 'ja']);
+  });
+
+  it('guesses nothing from a tag with no language at all', () => {
+    // `und` is well-formed and its language is absent, so anything that
+    // assumes one throws — out of a function that runs while the app is
+    // deciding what language to start in.
+    expect(() => matchesFor('und')).not.toThrow();
+
+    // And nothing is inferred from what remains. CLDR will maximize any of
+    // these, but every answer is a pick among many: `und-Latn` becomes English
+    // out of the hundreds of languages written in Latin, `und-CH` becomes
+    // German out of Switzerland's four. Matching on that would discard the
+    // real preference sitting behind it.
+    expect(matchesFor('und')).toEqual([]);
+    expect(matchesFor('und-Latn')).toEqual([]);
+    expect(matchesFor('und-CH')).toEqual([]);
+    expect(matchesFor('und-TW')).toEqual([]);
+    expect(resolveLocale('system', ['und', 'de-DE'])).toBe('de');
+    expect(resolveLocale('system', ['und-Latn', 'de-DE'])).toBe('de');
+    expect(resolveLocale('system', ['und-CH', 'de-DE'])).toBe('de');
+  });
+
+  it('is not confused by casing or an empty tag', () => {
+    expect(matchesFor('ZH-HANT-tw')).toEqual(['zh-hant', 'zh']);
+    expect(matchesFor('')).toEqual([]);
   });
 });
