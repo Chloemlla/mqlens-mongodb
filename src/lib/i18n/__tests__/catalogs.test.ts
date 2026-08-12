@@ -278,9 +278,10 @@ const ALLOWED_IDENTICAL_VALUES = new Set([
  * `_one` form its grammar never selects, and would reject the `_many` French
  * needs, so each locale is asked for its own forms and nothing else.
  */
-function expectedKeys(englishKeys: string[], code: string): string[] {
+function expectedKeys(englishKeys: string[], code: string, localeKeys: string[] = []): string[] {
   const categories = new Intl.PluralRules(code).resolvedOptions().pluralCategories;
   const PLURAL_SUFFIXES = ['zero', 'one', 'two', 'few', 'many', 'other'];
+  const present = new Set(localeKeys);
   const expected = new Set<string>();
   for (const key of englishKeys) {
     const suffix = PLURAL_SUFFIXES.find((s) => key.endsWith(`_${s}`));
@@ -290,6 +291,12 @@ function expectedKeys(englishKeys: string[], code: string): string[] {
     }
     const base = key.slice(0, -(suffix.length + 1));
     for (const category of categories) expected.add(`${base}_${category}`);
+    // `_zero` is not a CLDR category for most languages — German and English
+    // have only `one` and `other` — but i18next checks it first for a count of
+    // exactly 0 whatever the language, and the contributing guide invites
+    // translators to add one. Deriving the set from CLDR alone rejected it as
+    // a stale key. Permitted where a catalog supplies it, never required.
+    if (present.has(`${base}_zero`)) expected.add(`${base}_zero`);
   }
   return [...expected].sort();
 }
@@ -363,6 +370,20 @@ describe('expectedKeys — the plural forms a language actually has', () => {
   it('leaves a language shaped like English alone', () => {
     expect(expectedKeys(en, 'de')).toEqual(['a.count_one', 'a.count_other', 'a.plain']);
   });
+
+  it('permits an exact-zero override without requiring one', () => {
+    // `zero` is not a CLDR category for German, but i18next checks `_zero`
+    // first for a count of exactly 0 in any language, and the contributing
+    // guide invites translators to add one. It is allowed where supplied and
+    // never demanded.
+    expect(expectedKeys(en, 'de', ['a.count_zero'])).toEqual([
+      'a.count_one',
+      'a.count_other',
+      'a.count_zero',
+      'a.plain',
+    ]);
+    expect(expectedKeys(en, 'de', [])).not.toContain('a.count_zero');
+  });
 });
 
 describe('locale catalogs', () => {
@@ -375,7 +396,7 @@ describe('locale catalogs', () => {
         // means a stale entry left behind by a rename — or a plural form the
         // language does not have.
         expect(other, `${code}/${ns}.json does not match the keys en requires`).toEqual(
-          expectedKeys(en, code)
+          expectedKeys(en, code, other)
         );
       }
     }
@@ -501,6 +522,18 @@ describe('locale catalogs', () => {
           const source = englishFor(en, key);
           const otherVal = valueAt(other, key);
           if (source === null || typeof otherVal !== 'string') continue;
+          // An exact-zero override measured against a sibling that counts:
+          // "no documents deleted" is the point of the form, so it may drop
+          // the count English needs. It still may not invent a placeholder
+          // nothing will supply.
+          if (key.endsWith('_zero') && source.key !== key) {
+            const unknown = tokensOf(otherVal).filter((t) => !tokensOf(source.value).includes(t));
+            expect(
+              unknown,
+              `${code}/${ns}.json:${key} uses placeholders en:${source.key} does not supply ("${source.value}" vs "${otherVal}")`,
+            ).toEqual([]);
+            continue;
+          }
           expect(
             tokensOf(otherVal),
             `${code}/${ns}.json:${key} interpolation placeholders don't match en:${source.key} ("${source.value}" vs "${otherVal}")`,
