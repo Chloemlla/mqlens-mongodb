@@ -32,6 +32,26 @@ describe('WorkspaceRoot', () => {
     expect(screen.getByText('B')).toBeInTheDocument();
   });
 
+  it('shows a tab tooltip with the full namespace', () => {
+    const layout = createInitialLayout(['rates'], 'rates');
+    render(
+      <WorkspaceRoot
+        layout={layout}
+        dispatch={vi.fn()}
+        tabsFor={(pane) => pane.tabIds.map(id => ({
+          id,
+          label: 'rates',
+          tooltip: 'Primary / main.rates',
+          icon: null,
+        }))}
+        renderTabContent={() => <div />}
+        renderEmptyPane={() => <div />}
+      />,
+    );
+
+    expect(screen.getByText('rates')).toHaveAttribute('title', 'Primary / main.rates');
+  });
+
   it('renders both panes of a split with their own content simultaneously', () => {
     let l = createInitialLayout(['a', 'b'], 'a');
     l = workspaceReducer(l, { type: 'split_pane', paneId: l.root.id, dir: 'row', side: 'end', moveTabId: 'b' });

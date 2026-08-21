@@ -16,6 +16,7 @@ export const TAB_DRAG_MIME = 'application/x-mqlens-tab';
 export interface WorkspaceTab {
   id: string;
   label: string;
+  tooltip?: string;
   icon: React.ReactNode;
   pinned?: boolean;
 }
@@ -88,7 +89,7 @@ export function WorkspaceTabBar({
                   }}
                 >
                   <span className="shrink-0">{tab.icon}</span>
-                  <span className="truncate font-medium">{tab.label}</span>
+                  <span className="truncate font-medium" title={tab.tooltip}>{tab.label}</span>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <button

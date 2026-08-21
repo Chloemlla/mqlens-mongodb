@@ -336,7 +336,8 @@ const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
 export const tabLabelFor = (
   tab: QueryTab,
   connectionName: (connectionId: string) => string,
-  t: TFunction
+  t: TFunction,
+  openTabs: QueryTab[] = [tab]
 ): string => {
   switch (tab.type) {
     case 'index':
@@ -378,10 +379,28 @@ export const tabLabelFor = (
       return t('tabs.validation', { collection: tab.collection });
     case 'generate':
       return t('tabs.generate', { name: tab.collection || tab.db });
-    default:
-      return tab.collection;
+    default: {
+      const collisions = openTabs.filter(
+        candidate => candidate.type === 'collection' && candidate.collection === tab.collection
+      );
+      if (collisions.length < 2) return tab.collection;
+
+      const namespaceCollides = collisions.some(
+        candidate => candidate.id !== tab.id && candidate.db === tab.db
+      );
+      return namespaceCollides
+        ? `${connectionName(tab.connectionId)} / ${tab.db}:${tab.collection}`
+        : `${tab.db}:${tab.collection}`;
+    }
   }
 };
+
+export const tabTooltipFor = (
+  tab: QueryTab,
+  connectionName: (connectionId: string) => string
+): string | undefined => tab.type === 'collection'
+  ? `${connectionName(tab.connectionId)} / ${tab.db}.${tab.collection}`
+  : undefined;
 
 /**
  * Tab types that operate on a live connection — everything except
@@ -4558,7 +4577,12 @@ function Workspace() {
           pane.tabIds
             .map(id => tabs.find(t => t.id === id))
             .filter((t): t is QueryTab => !!t)
-            .map(tab => ({ id: tab.id, label: tabLabelFor(tab, connectionNameFor, t), icon: tabIconFor(tab, tab.id === pane.activeTabId) }))
+            .map(tab => ({
+              id: tab.id,
+              label: tabLabelFor(tab, connectionNameFor, t, tabs),
+              tooltip: tabTooltipFor(tab, connectionNameFor),
+              icon: tabIconFor(tab, tab.id === pane.activeTabId),
+            }))
         }
         renderTabContent={renderTabContent}
         renderEmptyPane={renderEmptyPane}
