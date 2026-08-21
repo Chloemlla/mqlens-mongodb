@@ -1,5 +1,5 @@
-import React, { useEffect, useRef } from 'react';
-import Editor, { type Monaco } from '@monaco-editor/react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import Editor, { type Monaco, type OnMount } from '@monaco-editor/react';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
 import type { Surface } from '../lib/mongoCompletions';
 import type { SchemaMap } from '../lib/useCollectionSchema';
@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils';
 import {
   clampQueryBarHeight,
   EDITOR_FONT_BASELINE_PX,
+  growQueryBarHeight,
   QUERY_BAR_HEIGHT_DEFAULT,
   QUERY_BAR_OPTION_HEIGHT,
 } from '@/lib/themes/ui-scale';
@@ -46,6 +47,8 @@ interface QueryEditorProps {
   /** Roomier single-line field (taller row, larger font) for the primary query
    *  input, which carries almost all of the typing. */
   large?: boolean;
+  /** Wrap and grow this field with its content independently of visual size. */
+  growWithContent?: boolean;
   'data-testid'?: string;
 }
 
@@ -62,6 +65,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   stageOperator,
   shellSyntax,
   large = false,
+  growWithContent = false,
   'data-testid': testid,
 }) => {
   const fieldsRef = useRef(fields); fieldsRef.current = fields;
@@ -110,7 +114,49 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   const singleLineLineHeight = Math.round(singleLineFontSize * 1.4);
   // Centre the single line within the full-height box.
   const singleLinePadTop = Math.max(0, Math.round((singleLineRowPx - singleLineLineHeight) / 2));
-  const editorHeight = height ?? (singleLine ? singleLineRowPx : 120);
+  // Only the primary Query field grows: it carries almost all of the typing,
+  // and the compact option rows beside it should not move when it does.
+  const growable = singleLine && (large || growWithContent);
+  const [grownHeight, setGrownHeight] = useState<number | null>(null);
+  const growthEditorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const growthMetricsRef = useRef({
+    growable,
+    lineHeight: singleLineLineHeight,
+    minHeight: singleLineRowPx,
+    contentPadding: singleLinePadTop,
+  });
+  growthMetricsRef.current = {
+    growable,
+    lineHeight: singleLineLineHeight,
+    minHeight: singleLineRowPx,
+    contentPadding: singleLinePadTop,
+  };
+  const followGrowableContent = useCallback(() => {
+    const metrics = growthMetricsRef.current;
+    const ed = growthEditorRef.current;
+    if (!metrics.growable || !ed) {
+      setGrownHeight(null);
+      return;
+    }
+    setGrownHeight(
+      growQueryBarHeight(
+        ed.getContentHeight(),
+        metrics.lineHeight,
+        metrics.minHeight,
+        metrics.contentPadding
+      )
+    );
+  }, []);
+
+  // Appearance changes do not necessarily produce a Monaco content-size event.
+  // Recompute explicitly so a mounted editor follows query height, zoom and font
+  // scale changes using the current metrics rather than its mount-time values.
+  useEffect(() => {
+    followGrowableContent();
+  }, [followGrowableContent, growable, singleLineLineHeight, singleLinePadTop, singleLineRowPx]);
+
+  const editorHeight =
+    height ?? (singleLine ? (growable ? (grownHeight ?? singleLineRowPx) : singleLineRowPx) : 120);
 
   const overflowWidgetsDomNode = getOverflowNode();
 
@@ -133,12 +179,17 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
     glyphMargin: false,
     lineDecorationsWidth: 0,
     lineNumbersMinChars: 0,
-    wordWrap: 'off' as const,
+    // The Query field wraps; the compact option rows stay on one line. Without
+    // this a long filter ran off the right edge with the horizontal scrollbar
+    // hidden, so the only way to read the rest of it was to move the caret.
+    wordWrap: (growable ? 'on' : 'off') as 'on' | 'off',
     scrollbar: {
-      vertical: 'hidden' as const,
+      // Once it has grown as far as it may, it has to be scrollable — a hidden
+      // scrollbar and a fixed height is what made the query unreachable.
+      vertical: (growable ? 'auto' : 'hidden') as 'auto' | 'hidden',
       horizontal: 'hidden' as const,
-      handleMouseWheel: false,
-      verticalScrollbarSize: 0,
+      handleMouseWheel: growable,
+      verticalScrollbarSize: growable ? 8 : 0,
       horizontalScrollbarSize: 0,
     },
     overviewRulerLanes: 0,
@@ -196,6 +247,13 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
           }
         });
 
+        // `automaticLayout` handles width; height is ours, because the row it
+        // sits in has to grow with wrapped content. The callback reads refs so
+        // settings changed after mount cannot leave it using stale metrics.
+        growthEditorRef.current = ed;
+        const contentSizeSubscription = ed.onDidContentSizeChange(followGrowableContent);
+        followGrowableContent();
+
         if (singleLine) {
           // Let Monaco accept suggestions on Enter when the widget is open; run only when closed.
           ed.addCommand(
@@ -223,8 +281,12 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
             getStageOperator: () => stageOperatorRef.current,
             getShellSyntax: () => shellSyntaxRef.current,
           });
-          ed.onDidDispose(() => { if (uriRef.current) clearModelMeta(uriRef.current); });
         }
+        ed.onDidDispose(() => {
+          contentSizeSubscription.dispose();
+          if (growthEditorRef.current === ed) growthEditorRef.current = null;
+          if (uriRef.current) clearModelMeta(uriRef.current);
+        });
       }}
       options={singleLine ? singleLineOptions : multiLineOptions}
     />
@@ -247,7 +309,11 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
           '[&_.scroll-decoration]:shadow-none [&_.overflow-guard]:bg-transparent',
           className
         )}
-        style={{ height: `${singleLineRowRem}rem` }}
+        style={{
+          height: growable
+            ? (typeof editorHeight === 'number' ? `${editorHeight}px` : editorHeight)
+            : `${singleLineRowRem}rem`,
+        }}
       >
         {editor}
       </div>
