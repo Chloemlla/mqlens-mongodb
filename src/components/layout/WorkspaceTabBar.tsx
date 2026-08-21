@@ -17,6 +17,7 @@ export interface WorkspaceTab {
   id: string;
   label: string;
   tooltip?: string;
+  accentColor?: string;
   icon: React.ReactNode;
   pinned?: boolean;
 }
@@ -88,6 +89,13 @@ export function WorkspaceTabBar({
                     onTabContextMenu(tab.id, e);
                   }}
                 >
+                  {tab.accentColor && (
+                    <span
+                      data-testid={`tab-accent-${tab.id}`}
+                      className="absolute inset-x-1 top-0 h-0.5 rounded-full"
+                      style={{ backgroundColor: tab.accentColor }}
+                    />
+                  )}
                   <span className="shrink-0">{tab.icon}</span>
                   <span className="truncate font-medium" title={tab.tooltip}>{tab.label}</span>
                   <Tooltip>

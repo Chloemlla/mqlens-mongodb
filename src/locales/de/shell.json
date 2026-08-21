@@ -529,6 +529,16 @@
       "detachToNewWindow": "In neues Fenster abdocken",
       "duplicateTab": "Tab duplizieren",
       "moveToWindow": "Verschieben nach {{target}}",
+      "tabColorDefault": "Tab-Farbe: Standard",
+      "tabColors": {
+        "amber": "Tab-Farbe: Bernstein",
+        "blue": "Tab-Farbe: Blau",
+        "green": "Tab-Farbe: Grün",
+        "orange": "Tab-Farbe: Orange",
+        "red": "Tab-Farbe: Rot",
+        "slate": "Tab-Farbe: Schiefergrau",
+        "violet": "Tab-Farbe: Violett"
+      },
       "unmirroredExplanation": "Export-/Import-Tabs bleiben in ihrem Fenster"
     }
   }
