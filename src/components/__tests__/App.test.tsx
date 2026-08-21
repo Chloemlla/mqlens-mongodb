@@ -2,7 +2,39 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '../../test/render-with-providers';
 import { resetUpdateTabStateDebounce } from '../../workspace/workspaceStore';
-import App, { tabLabelFor, type QueryTab } from '../../App';
+import App, { tabLabelFor, tabTooltipFor, type QueryTab } from '../../App';
+
+describe('collection tab labels', () => {
+  const t = ((key: string) => key) as any;
+  const connectionName = (id: string) => ({ primary: 'Primary', reporting: 'Reporting' }[id] ?? id);
+  const collectionTab = (id: string, connectionId: string, db: string, collection: string) => ({
+    id,
+    type: 'collection',
+    connectionId,
+    db,
+    collection,
+  } as QueryTab);
+
+  it('shows only the collection name when it is unique', () => {
+    const tab = collectionTab('one', 'primary', 'main', 'rates');
+    expect(tabLabelFor(tab, connectionName, t, [tab])).toBe('rates');
+    expect(tabTooltipFor(tab, connectionName)).toBe('Primary / main.rates');
+  });
+
+  it('prefixes the database when the same collection name is open from different databases', () => {
+    const main = collectionTab('one', 'primary', 'main', 'rates');
+    const test = collectionTab('two', 'primary', 'test', 'rates');
+    expect(tabLabelFor(main, connectionName, t, [main, test])).toBe('main:rates');
+    expect(tabLabelFor(test, connectionName, t, [main, test])).toBe('test:rates');
+  });
+
+  it('also prefixes the connection when database and collection names collide', () => {
+    const primary = collectionTab('one', 'primary', 'main', 'rates');
+    const reporting = collectionTab('two', 'reporting', 'main', 'rates');
+    expect(tabLabelFor(primary, connectionName, t, [primary, reporting])).toBe('Primary / main:rates');
+    expect(tabLabelFor(reporting, connectionName, t, [primary, reporting])).toBe('Reporting / main:rates');
+  });
+});
 
 vi.mock('../../lib/vault', () => ({
   getVaultStatus: vi.fn().mockResolvedValue('unlocked'),
