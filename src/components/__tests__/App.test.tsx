@@ -4002,6 +4002,21 @@ describe('App Component', () => {
   });
 
   describe('tab context menu — detach/move (Phase 3 Task 5)', () => {
+    it('sets and persists a subdued collection tab color', async () => {
+      const { fireEvent, within } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+      fireEvent.click(screen.getByTestId('select-collection-btn'));
+
+      const tabStrip = screen.getByTestId('workspace-tab-strip');
+      const customersTab = await within(tabStrip).findByText('customers');
+      fireEvent.contextMenu(customersTab.closest('div')!);
+      fireEvent.click(await screen.findByText('Tab color: Blue'));
+
+      expect(within(tabStrip).getByTestId('tab-accent-conn-1.sales_db.customers')).toBeInTheDocument();
+      expect(localStorage.getItem('mqlens-tab-colors')).toContain('"blue"');
+    });
+
     // Seeds lastWorkspaceRef with a second open window (win-1, active tab
     // "orders") via a workspace-changed event — the same seeding technique
     // Task 4's reconciliation tests use. `crossWindow: false` is deliberate:

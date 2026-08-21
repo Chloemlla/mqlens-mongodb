@@ -52,6 +52,23 @@ describe('WorkspaceRoot', () => {
     expect(screen.getByText('rates')).toHaveAttribute('title', 'Primary / main.rates');
   });
 
+  it('renders a selected tab accent color', () => {
+    const layout = createInitialLayout(['rates'], 'rates');
+    render(
+      <WorkspaceRoot
+        layout={layout}
+        dispatch={vi.fn()}
+        tabsFor={(pane) => pane.tabIds.map(id => ({ id, label: id, icon: null, accentColor: 'hsl(210, 45%, 55%)' }))}
+        renderTabContent={() => <div />}
+        renderEmptyPane={() => <div />}
+      />,
+    );
+    expect(screen.getByTestId('tab-accent-rates')).toHaveAttribute(
+      'style',
+      'background-color: rgb(89, 140, 192);',
+    );
+  });
+
   it('renders both panes of a split with their own content simultaneously', () => {
     let l = createInitialLayout(['a', 'b'], 'a');
     l = workspaceReducer(l, { type: 'split_pane', paneId: l.root.id, dir: 'row', side: 'end', moveTabId: 'b' });
