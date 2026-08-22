@@ -529,6 +529,16 @@
       "detachToNewWindow": "Detach to New Window",
       "duplicateTab": "Duplicate Tab",
       "moveToWindow": "Move to {{target}}",
+      "tabColorDefault": "Tab color: Default",
+      "tabColors": {
+        "amber": "Tab color: Amber",
+        "blue": "Tab color: Blue",
+        "green": "Tab color: Green",
+        "orange": "Tab color: Orange",
+        "red": "Tab color: Red",
+        "slate": "Tab color: Slate",
+        "violet": "Tab color: Violet"
+      },
       "unmirroredExplanation": "Export/import tabs stay in their window"
     }
   }

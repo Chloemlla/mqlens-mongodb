@@ -517,6 +517,16 @@
       "detachToNewWindow": "分离到新窗口",
       "duplicateTab": "复制标签页",
       "moveToWindow": "移动到{{target}}",
+      "tabColorDefault": "标签页颜色：默认",
+      "tabColors": {
+        "amber": "标签页颜色：琥珀色",
+        "blue": "标签页颜色：蓝色",
+        "green": "标签页颜色：绿色",
+        "orange": "标签页颜色：橙色",
+        "red": "标签页颜色：红色",
+        "slate": "标签页颜色：灰色",
+        "violet": "标签页颜色：紫色"
+      },
       "unmirroredExplanation": "导出/导入标签页会保留在各自的窗口中"
     }
   }

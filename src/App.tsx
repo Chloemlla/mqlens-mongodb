@@ -123,6 +123,7 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { FolderCode, KeyRound, Radio, X, ChevronsRight, XSquare, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
 import logoMark from './assets/logo-mark.svg';
+import { loadTabColors, saveTabColor, TAB_COLORS, tabColorCss, type TabColorId } from './lib/tabColors';
 
 export interface QueryTab {
   id: string;
@@ -336,7 +337,8 @@ const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
 export const tabLabelFor = (
   tab: QueryTab,
   connectionName: (connectionId: string) => string,
-  t: TFunction
+  t: TFunction,
+  openTabs: QueryTab[] = [tab]
 ): string => {
   switch (tab.type) {
     case 'index':
@@ -378,8 +380,38 @@ export const tabLabelFor = (
       return t('tabs.validation', { collection: tab.collection });
     case 'generate':
       return t('tabs.generate', { name: tab.collection || tab.db });
-    default:
-      return tab.collection;
+    default: {
+      const collisions = openTabs.filter(
+        candidate => candidate.type === 'collection' && candidate.collection === tab.collection
+      );
+      if (collisions.length < 2) return tab.collection;
+
+      const namespaceCollides = collisions.some(
+        candidate => candidate.id !== tab.id && candidate.db === tab.db
+      );
+      return namespaceCollides
+        ? `${connectionName(tab.connectionId)} / ${tab.db}:${tab.collection}`
+        : `${tab.db}:${tab.collection}`;
+    }
+  }
+};
+
+export const tabTooltipFor = (
+  tab: QueryTab,
+  connectionName: (connectionId: string) => string
+): string | undefined => tab.type === 'collection'
+  ? `${connectionName(tab.connectionId)} / ${tab.db}.${tab.collection}`
+  : undefined;
+
+const tabColorLabel = (t: TFunction, color: TabColorId): string => {
+  switch (color) {
+    case 'slate': return t('shell:workspaceTabBar.contextMenu.tabColors.slate');
+    case 'red': return t('shell:workspaceTabBar.contextMenu.tabColors.red');
+    case 'orange': return t('shell:workspaceTabBar.contextMenu.tabColors.orange');
+    case 'amber': return t('shell:workspaceTabBar.contextMenu.tabColors.amber');
+    case 'green': return t('shell:workspaceTabBar.contextMenu.tabColors.green');
+    case 'blue': return t('shell:workspaceTabBar.contextMenu.tabColors.blue');
+    case 'violet': return t('shell:workspaceTabBar.contextMenu.tabColors.violet');
   }
 };
 
@@ -443,6 +475,7 @@ function Workspace() {
   const isMainWindow = windowLabel() === 'main';
   // Open the Quick Start tab by default so the app never starts on a blank canvas.
   const [tabs, setTabs] = useState<QueryTab[]>([createQuickStartTab()]);
+  const [tabColors, setTabColors] = useState(loadTabColors);
   // Foreign-event reconciliation (below) runs inside a `listen` callback
   // captured once at mount — it can never see a fresh `tabs` STATE value
   // from that closure, same staleness problem `activeConnectionsRef` exists
@@ -2599,6 +2632,30 @@ function Workspace() {
       });
     }
 
+    if (dupSource) {
+      const stableTabId = toProfileSpaceId(tabId, activeConnections);
+      const selected = tabColors[stableTabId];
+      items.push({
+        label: tShell('workspaceTabBar.contextMenu.tabColorDefault'),
+        icon: <span className="size-3 rounded-full border border-current" />,
+        separatorBefore: items.length > 0,
+        onClick: () => setTabColors(saveTabColor(stableTabId, undefined)),
+      });
+      TAB_COLORS.forEach(color => {
+        const colorId = color.id as TabColorId;
+        items.push({
+          label: tabColorLabel(tShell, colorId),
+          icon: (
+            <span
+              className={`size-3 rounded-full ${selected === colorId ? 'ring-2 ring-ring ring-offset-1' : ''}`}
+              style={{ backgroundColor: tabColorCss(colorId) }}
+            />
+          ),
+          onClick: () => setTabColors(saveTabColor(stableTabId, colorId)),
+        });
+      });
+    }
+
     if (!isUnmirrored && allTabIds(layout).length > 1) {
       items.push({
         label: tShell('workspaceTabBar.contextMenu.detachToNewWindow'),
@@ -4558,7 +4615,16 @@ function Workspace() {
           pane.tabIds
             .map(id => tabs.find(t => t.id === id))
             .filter((t): t is QueryTab => !!t)
-            .map(tab => ({ id: tab.id, label: tabLabelFor(tab, connectionNameFor, t), icon: tabIconFor(tab, tab.id === pane.activeTabId) }))
+            .map(tab => ({
+              id: tab.id,
+              label: tabLabelFor(tab, connectionNameFor, t, tabs),
+              tooltip: tabTooltipFor(tab, connectionNameFor),
+              accentColor: (() => {
+                const color = tabColors[toProfileSpaceId(tab.id, activeConnections)];
+                return color ? tabColorCss(color) : undefined;
+              })(),
+              icon: tabIconFor(tab, tab.id === pane.activeTabId),
+            }))
         }
         renderTabContent={renderTabContent}
         renderEmptyPane={renderEmptyPane}

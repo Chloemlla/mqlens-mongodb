@@ -13,6 +13,44 @@ export const QUERY_BAR_HEIGHT_DEFAULT = 29;
  *  whatever the query field is set to — like Compass, where only the primary
  *  document editor grows and the small inputs never do. */
 export const QUERY_BAR_OPTION_HEIGHT = 22.75;
+/** How many wrapped rows the Query field grows to before it starts scrolling.
+ *  Enough for a filter that spans a few lines; past that the bar would take
+ *  over the window it sits above. */
+export const QUERY_BAR_GROW_MAX_ROWS = 6;
+
+/**
+ * The height the Query field should take to show what is in it.
+ *
+ * The field wraps, so a long filter occupies several rows; without this it
+ * stayed one row tall and the rest of the query was simply not on screen — no
+ * wrap, no horizontal scrollbar, reachable only by moving the caret. Raising
+ * the height setting could not help, because one line stays one line however
+ * tall the box is.
+ *
+ * Never smaller than the configured row height, so the setting still sets the
+ * floor, and never taller than `QUERY_BAR_GROW_MAX_ROWS` rows.
+ */
+export function growQueryBarHeight(
+  contentHeight: number,
+  lineHeight: number,
+  minHeight: number,
+  contentPadding: number = 0,
+  maxRows: number = QUERY_BAR_GROW_MAX_ROWS
+): number {
+  if (!Number.isFinite(contentHeight) || !Number.isFinite(lineHeight) || lineHeight <= 0) {
+    return minHeight;
+  }
+  // Monaco includes its configured editor padding in getContentHeight(). That
+  // padding positions the text inside the row; it is not another visual line.
+  const paddingInsideContent = Number.isFinite(contentPadding)
+    ? Math.max(0, contentPadding)
+    : 0;
+  const textHeight = Math.max(0, contentHeight - paddingInsideContent);
+  const rows = Math.max(1, Math.min(maxRows, Math.ceil(textHeight / lineHeight)));
+  const padding = Math.max(0, minHeight - lineHeight);
+  return Math.max(minHeight, Math.round(rows * lineHeight + padding));
+}
+
 export function clampQueryBarHeight(px: number): number {
   if (!Number.isFinite(px)) return QUERY_BAR_HEIGHT_DEFAULT;
   return Math.round(Math.min(Math.max(px, QUERY_BAR_HEIGHT_MIN), QUERY_BAR_HEIGHT_MAX));
