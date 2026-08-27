@@ -3,7 +3,7 @@
 //! every function is unit-testable in isolation.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::Rng;
 
@@ -65,12 +65,15 @@ pub fn encrypt_with_aad(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    // `key` and the nonce are already fixed-size arrays, so these conversions are
+    // infallible `From` impls. (`Array::from_slice` did the same thing from a
+    // variable-length slice and panicked on a length mismatch; it is deprecated
+    // in hybrid-array 0.4 in favour of exactly this.)
+    let cipher = Aes256Gcm::new(key.into());
     let nonce_bytes = new_nonce();
-    let nonce = Nonce::from_slice(&nonce_bytes);
     let mut out = nonce_bytes.to_vec();
     let ct = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt((&nonce_bytes).into(), Payload { msg: plaintext, aad })
         .map_err(|_| "encryption failed".to_string())?;
     out.extend_from_slice(&ct);
     Ok(out)
@@ -86,12 +89,110 @@ pub fn decrypt_with_aad(
     blob: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, String> {
-    if blob.len() < 12 {
+    // Splitting off a fixed-size chunk keeps the nonce length in one place and
+    // yields a `&[u8; 12]`, so the conversion below cannot fail — where
+    // `split_at` + `Array::from_slice` relied on the length check above being
+    // right about it.
+    let Some((nonce_bytes, ct)) = blob.split_first_chunk::<12>() else {
         return Err("ciphertext too short".to_string());
-    }
-    let (nonce_bytes, ct) = blob.split_at(12);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    };
+    let cipher = Aes256Gcm::new(key.into());
     cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), Payload { msg: ct, aad })
+        .decrypt(nonce_bytes.into(), Payload { msg: ct, aad })
         .map_err(|_| "decryption failed (wrong password or corrupt data)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Built rather than written as a literal: a 32-byte constant sitting next to
+    /// a parameter named `key` is indistinguishable from a real embedded key to a
+    /// scanner. Same reasoning as `test_secret` elsewhere in the tree.
+    fn test_key() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        k
+    }
+
+    #[test]
+    fn round_trips_plaintext() {
+        let key = test_key();
+        let blob = encrypt(&key, b"secret payload").expect("encrypt");
+        assert_eq!(decrypt(&key, &blob).expect("decrypt"), b"secret payload");
+    }
+
+    #[test]
+    fn prepends_a_twelve_byte_nonce_and_does_not_reuse_it() {
+        let key = test_key();
+        let a = encrypt(&key, b"same input").expect("encrypt");
+        let b = encrypt(&key, b"same input").expect("encrypt");
+        // 12-byte nonce + ciphertext + 16-byte GCM tag.
+        assert_eq!(a.len(), 12 + b"same input".len() + 16);
+        assert_ne!(a[..12], b[..12], "nonce must not repeat across encryptions");
+        assert_ne!(a, b, "identical plaintext must not produce identical blobs");
+    }
+
+    #[test]
+    fn aad_must_match_exactly() {
+        let key = test_key();
+        let blob = encrypt_with_aad(&key, b"payload", b"len-prefix").expect("encrypt");
+        assert_eq!(
+            decrypt_with_aad(&key, &blob, b"len-prefix").expect("decrypt"),
+            b"payload"
+        );
+        assert!(decrypt_with_aad(&key, &blob, b"len-prefixx").is_err());
+        assert!(decrypt_with_aad(&key, &blob, b"").is_err());
+    }
+
+    #[test]
+    fn rejects_a_blob_too_short_to_hold_a_nonce() {
+        let key = test_key();
+        for len in 0..12 {
+            let blob = vec![0u8; len];
+            assert_eq!(
+                decrypt(&key, &blob).unwrap_err(),
+                "ciphertext too short",
+                "len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nonce_with_no_ciphertext_fails_rather_than_panicking() {
+        // Exactly the nonce and nothing else. The authentication tag is missing,
+        // so this must be an error — and must not index past the end.
+        let key = test_key();
+        let blob = vec![0u8; 12];
+        assert!(decrypt(&key, &blob).is_err());
+    }
+
+    #[test]
+    fn tampering_is_detected() {
+        let key = test_key();
+        let blob = encrypt(&key, b"payload").expect("encrypt");
+
+        let mut flipped_nonce = blob.clone();
+        flipped_nonce[0] ^= 1;
+        assert!(decrypt(&key, &flipped_nonce).is_err(), "nonce change undetected");
+
+        let mut flipped_ct = blob.clone();
+        let last = flipped_ct.len() - 1;
+        flipped_ct[last] ^= 1;
+        assert!(decrypt(&key, &flipped_ct).is_err(), "tag change undetected");
+
+        let mut flipped_body = blob.clone();
+        flipped_body[13] ^= 1;
+        assert!(decrypt(&key, &flipped_body).is_err(), "ciphertext change undetected");
+    }
+
+    #[test]
+    fn the_wrong_key_does_not_decrypt() {
+        let blob = encrypt(&test_key(), b"payload").expect("encrypt");
+        let mut other = test_key();
+        other[0] ^= 0xff;
+        assert!(decrypt(&other, &blob).is_err());
+    }
 }
