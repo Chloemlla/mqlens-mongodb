@@ -2173,15 +2173,38 @@ async fn start_generate_task(
 }
 
 #[tauri::command]
+/// Save an edited document as a field-level update (#275).
+///
+/// Takes the document as it was loaded *and* as it was edited, rather than one
+/// replacement: the grid may be showing a projection, and replacing the stored
+/// document with a partial view deleted every field the projection left out.
+#[allow(clippy::too_many_arguments)]
 async fn update_document(
     state: tauri::State<'_, AppState>,
     id: String,
     database: String,
     collection: String,
     filter: String,
-    replacement: String,
+    original: String,
+    edited: String,
+    // The find projection the row came back under, so the backend knows which
+    // parts of `original` are complete: `{"address": 1}` includes the whole
+    // sub-document while `{"address.city": 1}` does not, and a removal has to
+    // tell those apart. `None` means the shape cannot be known — the rows came
+    // from an aggregation — and nothing is then assumed complete.
+    projection: Option<String>,
 ) -> Result<u64, String> {
-    update_document_impl(&state, &id, &database, &collection, &filter, &replacement).await
+    update_document_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &filter,
+        &original,
+        &edited,
+        projection.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]

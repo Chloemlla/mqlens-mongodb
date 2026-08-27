@@ -110,7 +110,7 @@ import { DialogProvider, useDialogs } from './components/dialogs/DialogProvider'
 import { formatBytes } from './lib/format';
 import type { QueryCodeSpec } from './lib/queryCodeGen';
 import type { IndexSuggestion } from './lib/indexSuggestions';
-import { docToShell } from './lib/shellDoc';
+import { docToShell, shellToEjson } from './lib/shellDoc';
 import { recordHistory, loadCollectionQueries, type SavedQueryBody } from './lib/queryStore';
 import { clearNamespaceIndex, loadNamespaceIndex, matchesNamespaceScope } from './lib/paletteIndex';
 import { CHECK_UPDATE_EVENT } from './components/UpdatePrompt';
@@ -154,6 +154,58 @@ export interface QueryTab {
   totalCount?: number;
   countLoading?: boolean;
   estimated?: boolean;
+}
+
+/// Stages that pass documents through unchanged, so the rows are still whole
+/// stored documents with their real `_id`s and can be edited.
+///
+/// Anything else — `$group`, `$project`, `$replaceRoot`, `$unwind`, `$lookup`,
+/// `$addFields` — reshapes the row or replaces its identity, so its `_id` may be
+/// a group key rather than a document id and saving could hit an unrelated
+/// document.
+const DOCUMENT_PRESERVING_STAGES = new Set(['$match', '$sort', '$limit', '$skip']);
+
+/** True when every stage of `pipeline` leaves documents intact. */
+export function pipelineYieldsWholeDocuments(pipeline?: Record<string, unknown>[]): boolean {
+  if (!pipeline || pipeline.length === 0) return true;
+  return pipeline.every((stage) => {
+    const keys = Object.keys(stage ?? {});
+    return keys.length === 1 && DOCUMENT_PRESERVING_STAGES.has(keys[0]);
+  });
+}
+
+/// True when a find projection replaces `_id` with a computed value, e.g.
+/// `{"_id": "$email"}`. The row's `_id` is then not the document's, so a filter
+/// built from it targets whatever happens to match. Only `1`/`0`/`true`/`false`
+/// keep `_id` as the stored id; any other value is an aggregation expression.
+export function projectionComputesId(projection?: string): boolean {
+  const trimmed = (projection ?? '').trim();
+  if (trimmed === '' || trimmed === '{}') return false;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed !== 'object' || parsed === null || !('_id' in parsed)) return false;
+    const value = (parsed as Record<string, unknown>)._id;
+    return !(typeof value === 'number' || typeof value === 'boolean');
+  } catch {
+    // Unparseable: the backend refuses anyway, so withhold the action.
+    return true;
+  }
+}
+
+/// Whether a tab's rows are stored documents that row actions may target by
+/// `_id`. False for reshaping pipelines, where `_id` may be a group key, and for
+/// a find projection that computes `_id` — both make the row's id something other
+/// than the stored document's, so editing or deleting would hit an unrelated one.
+///
+/// `DataGrid` offers the edit and delete actions only when the callbacks are
+/// provided, so passing `undefined` withholds them rather than showing something
+/// that would be refused.
+function rowsAreStoredDocuments(tab: {
+  lastAggregate?: Record<string, unknown>[];
+  lastQuery?: { projection: string };
+}): boolean {
+  if (tab.lastAggregate) return pipelineYieldsWholeDocuments(tab.lastAggregate);
+  return !projectionComputesId(tab.lastQuery?.projection);
 }
 
 const DEFAULT_QUERY = { filter: '{}', sort: '{}', projection: '{}', limit: 50, skip: 0 };
@@ -3936,12 +3988,36 @@ function Workspace() {
       // its error banner, so the text is user-facing copy, not a dev invariant.
       throw new Error(t('documents:editModal.errors.noId'));
     }
+    // Send the document as loaded *and* as edited so the backend can apply only
+    // the fields that changed. The grid may be showing a projection, and saving
+    // that partial view as a replacement deleted everything else (#275).
+    // `docToShell` on both sides means they go through the identical parse path.
     await invoke('update_document', {
       id: tab.connectionId,
       database: tab.db,
       collection,
       filter: JSON.stringify({ _id: target._id }),
-      replacement: json,
+      // Must be EJSON, not shell text: the backend parses both sides with strict
+      // `serde_json`, and DocumentEditModal already converts the editor contents
+      // with `shellToEjson` before calling onSave — so sending shell here failed
+      // on any document with an ObjectId `_id`. Running the original through the
+      // same docToShell → shellToEjson pipeline also makes an unedited save
+      // produce byte-identical sides, so the diff cannot report a change that came
+      // from serialization rather than from the user.
+      original: shellToEjson(docToShell(target)),
+      edited: json,
+      // The projection the row came back under, so the backend knows which parts
+      // of `original` are complete: `{"address": 1}` includes the whole
+      // sub-document, `{"address.city": 1}` does not (see ProjectionShape).
+      //
+      // `null` when the rows came from a pipeline that reshapes them: `lastQuery`
+      // is left intact by handleExecuteAggregate and would be stale, and a row's
+      // `_id` may be a group key rather than a document id. The backend refuses
+      // to write in that case. A pipeline of only $match/$sort/$limit/$skip
+      // passes documents through untouched, so those rows are whole documents.
+      projection: tab.lastAggregate
+        ? (pipelineYieldsWholeDocuments(tab.lastAggregate) ? '{}' : null)
+        : (tab.lastQuery?.projection ?? '{}'),
     });
     setDocumentModal(null);
     await refreshTabResults(tab);
@@ -4100,9 +4176,9 @@ function Workspace() {
                     explainResult={tab.explainResult}
                     querySpec={buildTabQuerySpec(tab)}
                     onInsertDocument={() => handleInsertDocument(tab)}
-                    onEditDocument={doc => handleEditDocument(tab, doc)}
+                    onEditDocument={rowsAreStoredDocuments(tab) ? (doc => handleEditDocument(tab, doc)) : undefined}
                     onDuplicateDocument={doc => handleDuplicateDocument(tab, doc)}
-                    onDeleteDocument={doc => handleDeleteDocument(tab, doc)}
+                    onDeleteDocument={rowsAreStoredDocuments(tab) ? (doc => handleDeleteDocument(tab, doc)) : undefined}
                     onAnalyzeSchema={() => handleOpenSchemaTab(tab.connectionId, tab.db, tab.collection)}
                     onUpdateMany={() => handleUpdateMany(tab)}
                     onDeleteMany={() => handleDeleteMany(tab)}

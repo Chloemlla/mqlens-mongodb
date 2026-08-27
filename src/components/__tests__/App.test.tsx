@@ -752,7 +752,7 @@ describe('App Component', () => {
     });
   });
 
-  it('edits a document via replace by _id (C1)', async () => {
+  it('edits a document as a field-level update by _id (C1)', async () => {
     const calls: any[] = [];
     mockInvoke.mockImplementation((cmd, args) => {
       calls.push({ cmd, args });
@@ -779,7 +779,15 @@ describe('App Component', () => {
       const upd = calls.find((c) => c.cmd === 'update_document');
       expect(upd).toBeTruthy();
       expect(upd.args.filter).toBe('{"_id":"1"}');
-      expect(upd.args.replacement).toBe('{"_id":"1","name":"Ada"}');
+      // Both sides are sent so the backend can write only what changed; a bare
+      // `replacement` would wipe fields a projection had left out (#275).
+      expect(upd.args.edited).toBe('{"_id":"1","name":"Ada"}');
+      // Must be parseable JSON, not shell text: the backend parses it with strict
+      // serde_json, so `ObjectId(...)` in here fails the save outright. A
+      // substring assertion passed while that was broken.
+      expect(() => JSON.parse(upd.args.original)).not.toThrow();
+      expect(JSON.parse(upd.args.original)).toEqual({ _id: '1', name: 'John Doe' });
+      expect(upd.args.replacement).toBeUndefined();
       expect(screen.getByText(/Document saved in customers/)).toBeInTheDocument();
     });
   });
@@ -4425,5 +4433,105 @@ describe('App Component', () => {
         await i18next.changeLanguage('en');
       }
     });
+  });
+
+  it('sends the projected document as the original so unprojected fields survive (#275)', async () => {
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'execute_mql_query') {
+        // What a `{ "age": 1 }` projection returns: a partial view.
+        return Promise.resolve([JSON.stringify({ _id: '66a1', age: 34 })]);
+      }
+      if (cmd === 'update_document') return Promise.resolve(1);
+      return Promise.resolve([]);
+    });
+
+    const { fireEvent, waitFor } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId('mock-sidebar');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    await screen.findByText(/34/);
+
+    fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+    const input = await screen.findByTestId('document-json-input');
+    fireEvent.change(input, { target: { value: '{"_id":"66a1","age":35}' } });
+    fireEvent.click(screen.getByTestId('document-save-btn'));
+
+    await waitFor(() => {
+      const upd = calls.find((c) => c.cmd === 'update_document');
+      expect(upd).toBeTruthy();
+      // The projected document goes as `original`, so the backend diff can tell
+      // "not shown" from "deleted" and leaves username/email/roles alone.
+      expect(JSON.parse(upd.args.original)).toEqual({ _id: '66a1', age: 34 });
+      expect(upd.args.edited).toBe('{"_id":"66a1","age":35}');
+    });
+  });
+
+  it('withholds row edit and delete for a reshaping pipeline (#275)', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'execute_mql_query') {
+        return Promise.resolve([JSON.stringify({ _id: '1', name: 'John Doe' })]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const { fireEvent } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId('mock-sidebar');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    // A find result: the row is a stored document, so editing is offered.
+    expect(await screen.findByTestId('edit-doc-btn')).toBeInTheDocument();
+  });
+});
+
+describe('projectionComputesId (#275)', () => {
+  it('accepts projections that keep _id as the stored id', async () => {
+    const { projectionComputesId } = await import('../../App');
+    expect(projectionComputesId(undefined)).toBe(false);
+    expect(projectionComputesId('{}')).toBe(false);
+    expect(projectionComputesId('{"name":1}')).toBe(false);
+    expect(projectionComputesId('{"_id":1,"name":1}')).toBe(false);
+    expect(projectionComputesId('{"_id":0,"name":1}')).toBe(false);
+    expect(projectionComputesId('{"_id":true}')).toBe(false);
+  });
+
+  it('rejects a computed _id, whose value is not the document id', async () => {
+    const { projectionComputesId } = await import('../../App');
+    expect(projectionComputesId('{"_id":"$email","name":1}')).toBe(true);
+    expect(projectionComputesId('{"_id":{"$concat":["$a","$b"]}}')).toBe(true);
+    // Unparseable: the backend refuses, so the action is withheld too.
+    expect(projectionComputesId('{not json')).toBe(true);
+  });
+});
+
+describe('pipelineYieldsWholeDocuments (#275)', () => {
+  it('accepts stages that pass documents through untouched', async () => {
+    const { pipelineYieldsWholeDocuments } = await import('../../App');
+    expect(pipelineYieldsWholeDocuments(undefined)).toBe(true);
+    expect(pipelineYieldsWholeDocuments([])).toBe(true);
+    expect(pipelineYieldsWholeDocuments([{ $match: { active: true } }])).toBe(true);
+    expect(
+      pipelineYieldsWholeDocuments([{ $match: {} }, { $sort: { a: 1 } }, { $limit: 10 }, { $skip: 5 }])
+    ).toBe(true);
+  });
+
+  it('rejects stages that reshape a row or replace its identity', async () => {
+    const { pipelineYieldsWholeDocuments } = await import('../../App');
+    // `_id` becomes the group key, so row actions would target the wrong document.
+    expect(pipelineYieldsWholeDocuments([{ $group: { _id: '$status' } }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $project: { name: 1 } }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $replaceRoot: { newRoot: '$x' } }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $unwind: '$roles' }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $lookup: {} }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $addFields: { n: 1 } }])).toBe(false);
+    // One safe stage does not redeem an unsafe one.
+    expect(pipelineYieldsWholeDocuments([{ $match: {} }, { $group: { _id: '$s' } }])).toBe(false);
+  });
+
+  it('rejects a malformed stage rather than assuming it is safe', async () => {
+    const { pipelineYieldsWholeDocuments } = await import('../../App');
+    expect(pipelineYieldsWholeDocuments([{} as Record<string, unknown>])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $match: {}, $sort: {} }])).toBe(false);
   });
 });
