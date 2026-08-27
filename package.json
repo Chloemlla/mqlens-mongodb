@@ -51,7 +51,7 @@
     "cmdk": "^1.1.1",
     "i18next": "^26.3.6",
     "lucide-react": "^1.18.0",
-    "mongodb-query-parser": "^4.7.15",
+    "mongodb-query-parser": "^5.0.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-i18next": "^17.0.11",
