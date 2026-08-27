@@ -11,12 +11,14 @@ use uuid::Uuid;
 
 pub mod limits;
 pub mod ai;
+pub mod audit;
 #[cfg(test)]
 mod command_coverage;
 pub mod change_streams;
 pub mod chats;
 pub mod connections;
 mod db;
+pub mod durable;
 pub mod mcp;
 pub mod mcp_tools;
 pub(crate) mod mock_db;
@@ -715,8 +717,24 @@ pub async fn run_mongosh_command_impl(
     session_id: &str,
     command: &str,
 ) -> Result<MongoshCommandOutput, String> {
+    let started = std::time::Instant::now();
     let session = get_mongosh_session(state, session_id)?;
-    run_mongosh_command_on_session(&session, command).await
+    let connection_id = session.connection_id.clone();
+    let result = run_mongosh_command_on_session(&session, command).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(&connection_id),
+        None,
+        None,
+        "run_mongosh_command",
+        crate::audit::OpClass::Shell,
+        Some("shell"),
+        started,
+        "mongosh",
+        Some(command),
+        &result,
+    );
+    result
 }
 
 /// Per-tab shell state, held backend-side so a frontend hot reload or window
@@ -2155,15 +2173,38 @@ async fn start_generate_task(
 }
 
 #[tauri::command]
+/// Save an edited document as a field-level update (#275).
+///
+/// Takes the document as it was loaded *and* as it was edited, rather than one
+/// replacement: the grid may be showing a projection, and replacing the stored
+/// document with a partial view deleted every field the projection left out.
+#[allow(clippy::too_many_arguments)]
 async fn update_document(
     state: tauri::State<'_, AppState>,
     id: String,
     database: String,
     collection: String,
     filter: String,
-    replacement: String,
+    original: String,
+    edited: String,
+    // The find projection the row came back under, so the backend knows which
+    // parts of `original` are complete: `{"address": 1}` includes the whole
+    // sub-document while `{"address.city": 1}` does not, and a removal has to
+    // tell those apart. `None` means the shape cannot be known — the rows came
+    // from an aggregation — and nothing is then assumed complete.
+    projection: Option<String>,
 ) -> Result<u64, String> {
-    update_document_impl(&state, &id, &database, &collection, &filter, &replacement).await
+    update_document_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &filter,
+        &original,
+        &edited,
+        projection.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2181,14 +2222,39 @@ async fn save_connection_profile(
     state: tauri::State<'_, AppState>,
     mut profile: connections::ConnectionProfile,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    let profile_id = profile.id.clone();
+    let profile_name = profile.name.clone();
+    let result = save_connection_profile_inner(&app_handle, &state, &mut profile).await;
+    audit::maybe_record_result(
+        &state,
+        Some(&profile_id),
+        None,
+        None,
+        "save_connection_profile",
+        audit::OpClass::Write,
+        Some("ui"),
+        started,
+        &format!("save connection profile {profile_name}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn save_connection_profile_inner(
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    profile: &mut connections::ConnectionProfile,
+) -> Result<(), String> {
     let key = state.require_key()?;
-    let path = connections::get_profiles_enc_path(&app_handle);
+    let path = connections::get_profiles_enc_path(app_handle);
     let mut profiles = connections::load_profiles_encrypted(&path, &key)?;
     profile.uri = connections::normalize_mongodb_uri_options(&profile.uri);
     if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
-        profiles[pos] = profile;
+        profiles[pos] = profile.clone();
     } else {
-        profiles.push(profile);
+        profiles.push(profile.clone());
     }
     connections::save_profiles_encrypted(&path, &key, &profiles)
 }
@@ -2226,7 +2292,9 @@ async fn save_app_settings(
         &connections::get_settings_enc_path(&app_handle),
         &key,
         &settings,
-    )
+    )?;
+    audit::refresh_policy_from_settings(&state, &settings);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2273,6 +2341,7 @@ async fn vault_initialize(
     )?;
 
     *state.vault_key.lock_safe()? = Some(key);
+    let _ = audit::open_on_unlock(&app_handle, &state, key);
     Ok(())
 }
 
@@ -2287,11 +2356,13 @@ async fn vault_unlock(
         .ok_or_else(|| "vault is not initialized".to_string())?;
     let key = connections::unlock_key(&meta, &password)?;
     *state.vault_key.lock_safe()? = Some(key);
+    let _ = audit::open_on_unlock(&app_handle, &state, key);
     Ok(connections::VaultStatus::Unlocked)
 }
 
 #[tauri::command]
 async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _ = audit::close_on_lock(&state);
     *state.vault_key.lock_safe()? = None;
     // A locked vault must never leave the embedded MCP server listening —
     // it reads through `require_key`-gated seams, same precondition as
@@ -2305,6 +2376,10 @@ async fn vault_reset(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // Before any core vault file is removed: if the audit log cannot be deleted,
+    // a replacement vault would start with a log its new key cannot authenticate,
+    // so auditing would be sealed from the first unlock. Abort instead.
+    audit::reset_store(&app_handle, &state)?;
     for p in [
         connections::get_vault_meta_path(&app_handle),
         connections::get_profiles_enc_path(&app_handle),
@@ -2341,17 +2416,164 @@ async fn vault_change_password(
     let new_meta = connections::build_vault_meta(&new_password, params)?;
     let new_key = connections::unlock_key(&new_meta, &new_password)?;
 
-    connections::reencrypt_data_files(
-        &old_key,
-        &new_key,
-        &connections::get_profiles_enc_path(&app_handle),
-        &connections::get_settings_enc_path(&app_handle),
-    )?;
-    connections::write_vault_meta(&meta_path, &new_meta)?;
+    let profiles_path = connections::get_profiles_enc_path(&app_handle);
+    let settings_path = connections::get_settings_enc_path(&app_handle);
+    let audit_log_path = connections::get_audit_log_path(&app_handle);
+
+    // Close the audit session so the log is not being appended to while it is
+    // re-encrypted, but keep its cross-process lock: releasing it would let a
+    // second instance take the log and append under the old key mid-rotation.
+    // Everything fallible after this point runs inside `rotate`, so a failure
+    // can reopen the session instead of leaving the app running unaudited.
+    let retained_audit_lock = audit::suspend_for_rotation(&state);
+
+    let rotate = || -> Result<(), String> {
+        // Prepare every re-encrypted payload before overwriting any vault file:
+        // a failure here must not leave the files and the metadata disagreeing.
+        let new_profiles =
+            connections::prepare_reencrypt_file(&old_key, &new_key, &profiles_path)?;
+        let new_settings =
+            connections::prepare_reencrypt_file(&old_key, &new_key, &settings_path)?;
+        // Returns the log *and* its state sidecar; both are keyed and must land
+        // together or the new-key log would be checked against an old-key count.
+        let new_audit_files =
+            connections::prepare_reencrypt_audit_log(&old_key, &new_key, &audit_log_path)?;
+
+        // Commit all four files together: a partial rotation leaves data under
+        // the new key while the metadata still derives the old one, which no
+        // password can then open.
+        let mut files = vec![
+            (profiles_path.clone(), new_profiles),
+            (settings_path.clone(), new_settings),
+        ];
+        files.extend(new_audit_files.into_iter().map(|(p, b)| (p, Some(b))));
+        connections::commit_vault_rotation(files, &meta_path, &new_meta)
+    };
+
+    let rotated = rotate();
+    // Reopen with the retained lock either way — on failure under `old_key`,
+    // which is still the live vault key because it is only swapped below.
+    let reopen_key = if rotated.is_ok() { new_key } else { old_key };
+    match retained_audit_lock {
+        Some(lock) => {
+            let _ = audit::resume_after_rotation(&app_handle, &state, reopen_key, lock);
+        }
+        None => {
+            let _ = audit::open_on_unlock(&app_handle, &state, reopen_key);
+        }
+    }
+    rotated?;
+
     *state.vault_key.lock_safe()? = Some(new_key);
     // Approach A: a password change derives a new key; keep biometrics working transparently.
     biometric::restore_key_if_enrolled(&app_handle, &new_key);
     Ok(())
+}
+
+#[tauri::command]
+async fn audit_list(
+    state: tauri::State<'_, AppState>,
+    filter: audit::AuditFilter,
+) -> Result<Vec<audit::AuditEvent>, String> {
+    let guard = state.audit.lock_safe()?;
+    match guard.as_ref() {
+        Some(session) => session.query(&filter),
+        None => Err("vault is locked".into()),
+    }
+}
+
+#[tauri::command]
+async fn audit_export(
+    state: tauri::State<'_, AppState>,
+    filter: audit::AuditFilter,
+    path: String,
+) -> Result<u64, String> {
+    use std::io::Write;
+    let events = {
+        let guard = state.audit.lock_safe()?;
+        match guard.as_ref() {
+            Some(session) => session.query(&filter)?,
+            None => return Err("vault is locked".into()),
+        }
+    };
+    let mut file = std::fs::File::create(&path).map_err(|e| format!("create {path}: {e}"))?;
+    for ev in &events {
+        let line = serde_json::to_string(ev).map_err(|e| e.to_string())?;
+        writeln!(file, "{line}").map_err(|e| format!("write {path}: {e}"))?;
+    }
+    Ok(events.len() as u64)
+}
+
+#[tauri::command]
+async fn audit_open_folder(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let path = connections::get_audit_log_path(&app_handle);
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.clone());
+    tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Discard a log that failed verification, so recording can resume (#272).
+///
+/// There is deliberately no command to clear an intact log: retention is the
+/// only thing that removes events. See `AuditSession::discard_damaged_log`.
+#[tauri::command]
+async fn audit_discard_damaged_log(state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    let guard = state.audit.lock_safe()?;
+    match guard.as_ref() {
+        Some(session) => session.discard_damaged_log(),
+        None => Err("vault is locked".into()),
+    }
+}
+
+#[tauri::command]
+async fn audit_reset(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let key = state.require_key()?;
+    audit::reset_store(&app_handle, &state)?;
+    audit::open_on_unlock(&app_handle, &state, key)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn audit_dropped_count(state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    let guard = state.audit.lock_safe()?;
+    Ok(guard.as_ref().map(|s| s.dropped_count()).unwrap_or(0))
+}
+
+/// Whether auditing is actually recording, and why not when it isn't (#272).
+///
+/// A corrupt or unreadable `audit.log.enc` leaves the vault unlocked and the app
+/// fully usable but unaudited; the UI needs to say so rather than let the user
+/// assume destructive operations are being logged.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditStatusUi {
+    active: bool,
+    degraded_reason: Option<String>,
+    /// Set when the on-disk log failed verification: recording has stopped and
+    /// the file is being preserved as evidence.
+    integrity_error: Option<String>,
+    dropped_count: u64,
+}
+
+#[tauri::command]
+async fn audit_status(state: tauri::State<'_, AppState>) -> Result<AuditStatusUi, String> {
+    let guard = state.audit.lock_safe()?;
+    let session = guard.as_ref();
+    let integrity_error = session.and_then(|s| s.integrity_error());
+    Ok(AuditStatusUi {
+        // A sealed log is open for reading but no longer recording, so it must
+        // not report itself as active auditing.
+        active: session.is_some_and(|s| s.is_open()) && integrity_error.is_none(),
+        degraded_reason: audit::degraded_reason(&state),
+        integrity_error,
+        dropped_count: session.map(|s| s.dropped_count()).unwrap_or(0),
+    })
 }
 
 /// Thin wrappers over `mcp.rs`'s testable impl fns (the established
@@ -2518,6 +2740,13 @@ pub fn run() {
             connections::test_connection_uri,
             load_app_settings,
             save_app_settings,
+            audit_list,
+            audit_export,
+            audit_open_folder,
+            audit_discard_damaged_log,
+            audit_reset,
+            audit_dropped_count,
+            audit_status,
             connections::test_mongosh_path,
             change_streams::start_change_stream,
             change_streams::poll_change_stream,
@@ -2562,6 +2791,19 @@ pub fn run() {
             updater::update_check,
             updater::update_install
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            use tauri::Manager;
+            // `AppHandle::exit` ends in process teardown that may skip Drop.
+            // Seal on both exit events so the in-memory store reaches disk.
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    let _ = audit::close_on_lock(&state);
+                }
+            }
+        });
 }

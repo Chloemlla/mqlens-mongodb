@@ -1051,14 +1051,16 @@ mod tests {
         .expect("insert should succeed in mock mode");
         assert!(!inserted_id.is_empty());
 
-        // replace_one
+        // field-level update
         let modified = update_document_impl(
             &state,
             &conn_id,
             "sales_db",
             "customers",
             r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"}}"#,
+            r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"},"name":"Original"}"#,
             r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"},"name":"Edited"}"#,
+            Some("{}"),
         )
         .await
         .expect("update should succeed in mock mode");
@@ -2676,6 +2678,10 @@ mod tests {
         assert_eq!(legacy.gemini_model, "gemini-1.5-flash");
         assert_eq!(legacy.ai_custom_instructions, "");
         assert_eq!(legacy.ai_history_retention_months, 3);
+        assert!(legacy.audit_enabled);
+        assert_eq!(legacy.audit_level, "A");
+        assert_eq!(legacy.audit_retention_days, 30);
+        assert!(!legacy.audit_include_payloads);
 
         // resolve_local_command falls back to built-in defaults when unset.
         assert_eq!(

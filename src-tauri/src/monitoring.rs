@@ -375,6 +375,25 @@ fn mock_repl_set_status() -> ReplSetStatus {
 // ── Async command impls ───────────────────────────────────────────────────────
 
 pub async fn server_status_impl(state: &AppState, id: &str) -> Result<ServerStatus, String> {
+    let started = std::time::Instant::now();
+    let result = server_status_impl_inner(state, id).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        None,
+        None,
+        "server_status",
+        crate::audit::OpClass::ReadOther,
+        None,
+        started,
+        &"serverStatus".to_string(),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn server_status_impl_inner(state: &AppState, id: &str) -> Result<ServerStatus, String> {
     if connection_is_mock(state, id)? {
         return Ok(mock_server_status());
     }
@@ -388,6 +407,25 @@ pub async fn server_status_impl(state: &AppState, id: &str) -> Result<ServerStat
 }
 
 pub async fn current_ops_impl(state: &AppState, id: &str) -> Result<Vec<CurrentOp>, String> {
+    let started = std::time::Instant::now();
+    let result = current_ops_impl_inner(state, id).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        None,
+        None,
+        "current_ops",
+        crate::audit::OpClass::ReadOther,
+        None,
+        started,
+        &"currentOp".to_string(),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn current_ops_impl_inner(state: &AppState, id: &str) -> Result<Vec<CurrentOp>, String> {
     if connection_is_mock(state, id)? {
         return Ok(vec![CurrentOp {
             opid: 10241,
@@ -421,6 +459,25 @@ pub async fn current_ops_impl(state: &AppState, id: &str) -> Result<Vec<CurrentO
 }
 
 pub async fn kill_op_impl(state: &AppState, id: &str, opid: i64) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let result = kill_op_inner(state, id, opid).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        None,
+        None,
+        "kill_op",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("killOp {opid}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn kill_op_inner(state: &AppState, id: &str, opid: i64) -> Result<(), String> {
     guard_writable(state, id, WriteOp::ServerAdmin, false)?;
 
     if connection_is_mock(state, id)? {
@@ -436,6 +493,25 @@ pub async fn kill_op_impl(state: &AppState, id: &str, opid: i64) -> Result<(), S
 }
 
 pub async fn profiling_status_impl(state: &AppState, id: &str, database: &str) -> Result<ProfilingStatus, String> {
+    let started = std::time::Instant::now();
+    let result = profiling_status_impl_inner(state, id, database).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        None,
+        "get_profiling_status",
+        crate::audit::OpClass::ReadOther,
+        None,
+        started,
+        &format!("getProfilingStatus {database}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn profiling_status_impl_inner(state: &AppState, id: &str, database: &str) -> Result<ProfilingStatus, String> {
     if connection_is_mock(state, id)? {
         return Ok(ProfilingStatus { level: 0, slow_ms: 100 });
     }
@@ -449,6 +525,32 @@ pub async fn profiling_status_impl(state: &AppState, id: &str, database: &str) -
 }
 
 pub async fn set_profiling_level_impl(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    level: i32,
+    slow_ms: i32,
+) -> Result<ProfilingStatus, String> {
+    let started = std::time::Instant::now();
+    let args = format!("{{\"level\":{level},\"slowMs\":{slow_ms}}}");
+    let result = set_profiling_level_inner(state, id, database, level, slow_ms).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        None,
+        "set_profiling_level",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("profile {database} level={level}"),
+        Some(&args),
+        &result,
+    );
+    result
+}
+
+async fn set_profiling_level_inner(
     state: &AppState,
     id: &str,
     database: &str,
@@ -470,6 +572,30 @@ pub async fn set_profiling_level_impl(
 }
 
 pub async fn read_profile_impl(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    limit: i64,
+) -> Result<Vec<ProfileEntry>, String> {
+    let started = std::time::Instant::now();
+    let result = read_profile_impl_inner(state, id, database, limit).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        None,
+        "read_profile",
+        crate::audit::OpClass::ReadOther,
+        None,
+        started,
+        &format!("readProfile {database}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn read_profile_impl_inner(
     state: &AppState,
     id: &str,
     database: &str,
@@ -506,6 +632,25 @@ pub async fn read_profile_impl(
 }
 
 pub async fn repl_set_status_impl(state: &AppState, id: &str) -> Result<ReplSetStatus, String> {
+    let started = std::time::Instant::now();
+    let result = repl_set_status_impl_inner(state, id).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        None,
+        None,
+        "repl_set_status",
+        crate::audit::OpClass::ReadOther,
+        None,
+        started,
+        &"replSetGetStatus".to_string(),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn repl_set_status_impl_inner(state: &AppState, id: &str) -> Result<ReplSetStatus, String> {
     if connection_is_mock(state, id)? {
         return Ok(mock_repl_set_status());
     }

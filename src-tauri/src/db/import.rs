@@ -376,6 +376,44 @@ pub async fn start_import_task_impl(
     csv_options: Option<CsvImportOptions>,
     mode: &str,
 ) -> Result<TaskInfo, String> {
+    let started = std::time::Instant::now();
+    let audit_summary = format!("import {database}.{collection} ({format}, {mode})");
+    let result = start_import_task_inner(
+        state,
+        id,
+        database,
+        collection,
+        source,
+        format,
+        csv_options,
+        mode,
+    )
+    .await;
+    crate::audit::maybe_record_task_start(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "start_import_task",
+        started,
+        &audit_summary,
+        None,
+        &result,
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_import_task_inner(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    source: ImportSourceArg,
+    format: &str,
+    csv_options: Option<CsvImportOptions>,
+    mode: &str,
+) -> Result<TaskInfo, String> {
     guard_writable(state, id, WriteOp::Import, false)?;
 
     if !matches!(mode, "skip" | "update" | "abort") {
@@ -427,6 +465,15 @@ pub async fn start_import_task_impl(
     state.tasks.lock_safe()?.insert(task_id.clone(), task.clone());
 
     let tasks = state.tasks.clone();
+    let audit_ctx = crate::audit::TaskAuditContext::capture(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "start_import_task",
+        &format!("import {database}.{collection} ({format}, {mode})"),
+    );
+    let audit_started = std::time::Instant::now();
     let database = database.to_string();
     let collection = collection.to_string();
     let format = format.to_string();
@@ -456,6 +503,12 @@ pub async fn start_import_task_impl(
             }
             Err(err) => fail_task(&tasks, &task_id, err),
         }
+        let (outcome, error) = crate::db::tasks::terminal_state(&tasks, &task_id, "failed");
+        audit_ctx.record_terminal(
+            &outcome,
+            error.as_deref(),
+            Some(audit_started.elapsed().as_millis() as i64),
+        );
     });
     Ok(task)
 }
