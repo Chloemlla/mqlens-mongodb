@@ -752,7 +752,6 @@ mod integration {
 
     #[tokio::test]
     async fn it_gridfs_list_upload_download_and_delete_real() {
-        use futures::AsyncWriteExt;
         let Some((state, id, db)) = connect().await else {
             return;
         };
