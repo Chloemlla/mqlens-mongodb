@@ -2882,9 +2882,11 @@ mod tests {
     fn test_gemini_request_and_extract() {
         use crate::ai::{build_gemini_request, extract_gemini_text, gemini_url};
 
-        let url = gemini_url("gemini-1.5-flash", "KEY123");
+        let url = gemini_url("gemini-1.5-flash");
         assert!(url.contains("/models/gemini-1.5-flash:generateContent"));
-        assert!(url.contains("key=KEY123"));
+        // The credential must not be in the URL: a URL is recorded in cleartext
+        // by logs, crash reports and proxies, and is echoed in transport errors.
+        assert!(!url.contains("key="), "credential in URL: {url}");
 
         let body = build_gemini_request("SYS", &[], "active users");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
