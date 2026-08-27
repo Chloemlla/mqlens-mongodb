@@ -277,10 +277,19 @@ pub async fn generate_openai(
     extract_json_object(&extract_openai_text(&json))
 }
 
-pub fn gemini_url(model: &str, api_key: &str) -> String {
+/// Endpoint for a Gemini model.
+///
+/// Deliberately carries no credential. The key used to travel here as a `?key=`
+/// query parameter, which HTTPS encrypts on the wire but which leaks everywhere a
+/// URL is recorded in cleartext: local logs, crash reports, proxy access logs and
+/// the `Failed to reach Gemini API: <url>` text of a transport error. It is sent
+/// as a header instead, matching how the other two providers in this file are
+/// already authenticated (`authorization: Bearer` for OpenAI, `x-api-key` for
+/// Anthropic).
+pub fn gemini_url(model: &str) -> String {
     format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        model
     )
 }
 
@@ -335,7 +344,8 @@ pub async fn generate_gemini(
     let body = build_gemini_request(system, history, user_prompt);
     let client = reqwest::Client::new();
     let resp = client
-        .post(gemini_url(model, api_key))
+        .post(gemini_url(model))
+        .header("x-goog-api-key", api_key)
         .header("content-type", "application/json")
         .json(&body)
         .send()
