@@ -423,6 +423,51 @@ pub async fn start_collection_copy_impl(
     include_indexes: bool,
     conflict_mode: String,
 ) -> Result<TaskInfo, String> {
+    let started = std::time::Instant::now();
+    let audit_summary = format!(
+        "copy {}.{} → {}.{}",
+        source_db, source_collection, target_db, target_collection
+    );
+    let result = start_collection_copy_inner(
+        state,
+        source_id,
+        source_db,
+        source_collection,
+        target_id,
+        target_db,
+        target_collection,
+        filter.clone(),
+        include_indexes,
+        conflict_mode,
+    )
+    .await;
+    crate::audit::maybe_record_task_start(
+        state,
+        Some(target_id),
+        Some(target_db),
+        Some(target_collection),
+        "start_collection_copy",
+        started,
+        &audit_summary,
+        filter.as_deref(),
+        &result,
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_collection_copy_inner(
+    state: &AppState,
+    source_id: &str,
+    source_db: &str,
+    source_collection: &str,
+    target_id: &str,
+    target_db: &str,
+    target_collection: &str,
+    filter: Option<String>,
+    include_indexes: bool,
+    conflict_mode: String,
+) -> Result<TaskInfo, String> {
     // Copy commands guard the TARGET connection, not the source — a copy
     // writes into the target.
     guard_writable(state, target_id, WriteOp::CopyWrite, false)?;
@@ -477,6 +522,18 @@ pub async fn start_collection_copy_impl(
     let target = require_real_client(state, target_id)?;
     let tasks = state.tasks.clone();
     let cancels = state.cancels.clone(); // Arc<Mutex<..>> — clone the Arc
+    let audit_ctx = crate::audit::TaskAuditContext::capture(
+        state,
+        Some(target_id),
+        Some(target_db),
+        Some(target_collection),
+        "start_collection_copy",
+        &format!(
+            "copy {}.{} → {}.{}",
+            source_db, source_collection, target_db, target_collection
+        ),
+    );
+    let audit_started = std::time::Instant::now();
     let (sdb, scoll) = (source_db.to_string(), source_collection.to_string());
     let (tdb, tcoll) = (target_db.to_string(), target_collection.to_string());
     let task_id2 = task_id.clone();
@@ -513,6 +570,12 @@ pub async fn start_collection_copy_impl(
             }
             Err(err) => fail_task(&tasks, &task_id2, err),
         }
+        let (outcome, error) = crate::db::tasks::terminal_state(&tasks, &task_id2, "failed");
+        audit_ctx.record_terminal(
+            &outcome,
+            error.as_deref(),
+            Some(audit_started.elapsed().as_millis() as i64),
+        );
         clear_cancel_flag(&cancels, &task_id2);
     });
 
@@ -521,6 +584,47 @@ pub async fn start_collection_copy_impl(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn start_database_copy_impl(
+    state: &AppState,
+    source_id: &str,
+    source_db: &str,
+    target_id: &str,
+    target_db: &str,
+    collections: Option<Vec<String>>,
+    include_indexes: bool,
+    include_views: bool,
+    conflict_mode: String,
+) -> Result<TaskInfo, String> {
+    let started = std::time::Instant::now();
+    let audit_summary = format!("copy database {} → {}", source_db, target_db);
+    let collections_arg = collections.as_ref().map(|names| names.join(","));
+    let result = start_database_copy_inner(
+        state,
+        source_id,
+        source_db,
+        target_id,
+        target_db,
+        collections.clone(),
+        include_indexes,
+        include_views,
+        conflict_mode,
+    )
+    .await;
+    crate::audit::maybe_record_task_start(
+        state,
+        Some(target_id),
+        Some(target_db),
+        None,
+        "start_database_copy",
+        started,
+        &audit_summary,
+        collections_arg.as_deref(),
+        &result,
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_database_copy_inner(
     state: &AppState,
     source_id: &str,
     source_db: &str,
@@ -586,6 +690,15 @@ pub async fn start_database_copy_impl(
     let target = require_real_client(state, target_id)?;
     let tasks = state.tasks.clone();
     let cancels = state.cancels.clone();
+    let audit_ctx = crate::audit::TaskAuditContext::capture(
+        state,
+        Some(target_id),
+        Some(target_db),
+        None,
+        "start_database_copy",
+        &format!("copy database {} → {}", source_db, target_db),
+    );
+    let audit_started = std::time::Instant::now();
     let (sdb, tdb) = (source_db.to_string(), target_db.to_string());
     let task_id2 = task_id.clone();
 
@@ -665,6 +778,12 @@ pub async fn start_database_copy_impl(
         let status = if cancel.load(Ordering::SeqCst) { "cancelled" } else { "completed" };
         update_task(&tasks, &task_id2, |t| t.items_processed = t.items_total);
         finish_copy_task(&tasks, &task_id2, status, summary);
+        let (outcome, error) = crate::db::tasks::terminal_state(&tasks, &task_id2, "completed");
+        audit_ctx.record_terminal(
+            &outcome,
+            error.as_deref(),
+            Some(audit_started.elapsed().as_millis() as i64),
+        );
         clear_cancel_flag(&cancels, &task_id2);
     });
 

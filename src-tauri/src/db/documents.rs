@@ -181,6 +181,31 @@ pub async fn delete_document_impl(
     collection: &str,
     filter: &str,
 ) -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    let result = delete_document_inner(state, id, database, collection, filter).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "delete_document",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("deleteOne {database}.{collection}"),
+        Some(filter),
+        &result,
+    );
+    result
+}
+
+async fn delete_document_inner(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    filter: &str,
+) -> Result<u64, String> {
     guard_writable(state, id, WriteOp::DeleteOne, false)?;
 
     // Parse/validate up front so bad input fails the same way for mock & real.
@@ -209,6 +234,32 @@ pub async fn delete_many_impl(
     filter: &str,
     confirmed: bool,
 ) -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    let result = delete_many_inner(state, id, database, collection, filter, confirmed).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "delete_many",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("deleteMany {database}.{collection}"),
+        Some(filter),
+        &result,
+    );
+    result
+}
+
+async fn delete_many_inner(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    filter: &str,
+    confirmed: bool,
+) -> Result<u64, String> {
     guard_writable(state, id, WriteOp::DeleteMany, confirmed)?;
 
     let filter_doc = json_to_bson_document(filter)?;
@@ -226,6 +277,35 @@ pub async fn delete_many_impl(
 }
 
 pub async fn update_many_impl(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    filter: &str,
+    update: &str,
+    confirmed: bool,
+) -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    let args = format!("{{\"filter\":{filter},\"update\":{update}}}");
+    let result =
+        update_many_inner(state, id, database, collection, filter, update, confirmed).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "update_many",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("updateMany {database}.{collection}"),
+        Some(&args),
+        &result,
+    );
+    result
+}
+
+async fn update_many_inner(
     state: &AppState,
     id: &str,
     database: &str,
@@ -263,6 +343,31 @@ pub async fn insert_document_impl(
     collection: &str,
     document: &str,
 ) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let result = insert_document_inner(state, id, database, collection, document).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "insert_document",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("insertOne {database}.{collection}"),
+        Some(document),
+        &result,
+    );
+    result
+}
+
+async fn insert_document_inner(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    document: &str,
+) -> Result<String, String> {
     guard_writable(state, id, WriteOp::Insert, false)?;
 
     let doc = json_to_bson_document(document)?;
@@ -284,6 +389,34 @@ pub async fn insert_document_impl(
 }
 
 pub async fn update_document_impl(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    filter: &str,
+    replacement: &str,
+) -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    let args = format!("{{\"filter\":{filter},\"replacement\":{replacement}}}");
+    let result =
+        update_document_inner(state, id, database, collection, filter, replacement).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "update_document",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("replaceOne {database}.{collection}"),
+        Some(&args),
+        &result,
+    );
+    result
+}
+
+async fn update_document_inner(
     state: &AppState,
     id: &str,
     database: &str,
@@ -325,6 +458,33 @@ pub struct ImportResult {
 // Documents are already-validated JSON values from the frontend codec; each is
 // converted to BSON here as a safety net.
 pub async fn import_documents_impl(
+    state: &AppState,
+    id: &str,
+    database: &str,
+    collection: &str,
+    docs: Vec<serde_json::Value>,
+    mode: &str,
+) -> Result<ImportResult, String> {
+    let started = std::time::Instant::now();
+    let summary = format!("import {database}.{collection} ({mode}, {} docs)", docs.len());
+    let result = import_documents_inner(state, id, database, collection, docs, mode).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(database),
+        Some(collection),
+        "import_documents",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &summary,
+        None,
+        &result,
+    );
+    result
+}
+
+async fn import_documents_inner(
     state: &AppState,
     id: &str,
     database: &str,
