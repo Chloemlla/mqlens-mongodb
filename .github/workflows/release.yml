@@ -46,10 +46,10 @@ jobs:
       release: ${{ steps.compute.outputs.release }}
       notes: ${{ steps.compute.outputs.notes }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
       - name: Compute + commit next version
@@ -181,7 +181,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # On main, the version job already pushed the bump commit — build it.
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
@@ -205,7 +205,7 @@ jobs:
             build-essential \
             curl wget file
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: npm
@@ -276,7 +276,7 @@ jobs:
           echo "REL_NAME=MQLens v${{ needs.version.outputs.version }}" >> "$GITHUB_ENV"
 
       - name: Build app & publish release
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing — produces signed update artifacts + latest.json so
@@ -321,7 +321,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
@@ -374,7 +374,7 @@ jobs:
     env:
       ENABLE_GPG: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
       - name: Import GPG key
@@ -413,7 +413,7 @@ jobs:
     env:
       ENABLE_WIN_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.ENABLE_WIN_SIGNING == 'true'
         with:
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
@@ -433,7 +433,7 @@ jobs:
 
       - name: Azure Trusted Signing
         if: env.ENABLE_WIN_SIGNING == 'true'
-        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -467,7 +467,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
       - name: Compose and publish updater manifest
