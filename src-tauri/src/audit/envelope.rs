@@ -321,6 +321,11 @@ impl AuditSession {
     }
 
     /// Reopen using a lock handed over by [`Self::close_retaining_lock`].
+    /// Take the log's cross-process lock without opening this session.
+    pub fn acquire_retained_lock(&self) -> Result<RetainedLock, String> {
+        self.log.acquire_retained_lock()
+    }
+
     pub fn open_retaining(&self, key: [u8; 32], lock: RetainedLock) -> Result<LoadReport, String> {
         let (events, report) = self.log.open_retaining(&key, lock)?;
         self.seed_index(key, events, &report)?;

@@ -144,6 +144,36 @@ fn open_on_unlock_inner(
 /// Releasing it would let a second instance take the log and append under the
 /// old key while rotation swaps in the new-key file — on Unix that second
 /// process keeps writing to the unlinked old inode, so those events vanish.
+/// What a key rotation is holding on the audit log while it runs.
+pub enum AuditRotationGuard {
+    /// A session was suspended; its lock is carried through and the session is
+    /// reopened afterwards.
+    Session(RetainedLock),
+    /// There was no session to suspend, so the lock was taken purely to keep
+    /// other instances off the files. Released afterwards, and whether auditing
+    /// then reopens is decided by the settings as usual.
+    LockOnly(RetainedLock),
+}
+
+/// Hold the audit log for the duration of a key rotation.
+///
+/// Rotation rewrites `audit.log.enc` and its state sidecar, so it must exclude
+/// other instances whether or not *this* one is recording. When another instance
+/// owns the log this fails, and rotation must abort: rewriting the vault metadata
+/// while that instance keeps appending under the old key leaves activity history
+/// no password can open.
+pub fn hold_for_rotation(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<AuditRotationGuard, String> {
+    if let Some(lock) = suspend_for_rotation(state) {
+        return Ok(AuditRotationGuard::Session(lock));
+    }
+    AuditSession::new(connections::get_audit_log_path(app))
+        .acquire_retained_lock()
+        .map(AuditRotationGuard::LockOnly)
+}
+
 pub fn suspend_for_rotation(state: &AppState) -> Option<RetainedLock> {
     set_degraded(state, None);
     let mut slot = state.audit.lock_safe().ok()?;
