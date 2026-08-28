@@ -63,6 +63,16 @@ const ALLOWED_IDENTICAL_VALUES = new Set([
   'shell:commandPalette.buckets.collections.label', // Collections
   'transfer:dumpView.labels.collection', // Collection
   'transfer:dumpView.scope.optionCollection', // Collection
+  // Identical in Chinese, where German happened to differ. Proper names,
+  // credential field names from another vendor's API, and format
+  // identifiers — none of them translate.
+  'connections:auth.passLabelAws', // Secret Access Key
+  'connections:auth.userLabelAws', // Access Key ID
+  'connections:filePicker.jsonStudio3tFilter', // JSON / Studio 3T URI
+  'connections:ssh.authAgent', // SSH Agent
+  'shell:mongoShell.toolbar.aiToggleLabel', // AI
+  'sidebar:tree.gridfsBucketsLabel', // GridFS Buckets
+  'transfer:importView.columnTypes.json', // json
   'settings:updates.tabLabel', // Updates
   'connections:connectionMode.normal.label', // Normal
   'connections:filePicker.textFilter', // Text
@@ -257,15 +267,137 @@ const ALLOWED_IDENTICAL_VALUES = new Set([
   'shell:connectionCard.topology.standalone', // Standalone
 ]);
 
+/**
+ * The key set a locale is expected to carry, given English.
+ *
+ * Not simply English's own keys. A plural key exists once per plural category,
+ * and the categories are a property of the LANGUAGE: English has `one` and
+ * `other`, Japanese and Chinese have only `other`, French additionally has
+ * `many` for counts of a million and up — a count a document total reaches
+ * easily. Demanding English's exact set would force Japanese to carry an
+ * `_one` form its grammar never selects, and would reject the `_many` French
+ * needs, so each locale is asked for its own forms and nothing else.
+ */
+function expectedKeys(englishKeys: string[], code: string, localeKeys: string[] = []): string[] {
+  const categories = new Intl.PluralRules(code).resolvedOptions().pluralCategories;
+  const PLURAL_SUFFIXES = ['zero', 'one', 'two', 'few', 'many', 'other'];
+  const present = new Set(localeKeys);
+  const expected = new Set<string>();
+  for (const key of englishKeys) {
+    const suffix = PLURAL_SUFFIXES.find((s) => key.endsWith(`_${s}`));
+    if (!suffix) {
+      expected.add(key);
+      continue;
+    }
+    const base = key.slice(0, -(suffix.length + 1));
+    for (const category of categories) expected.add(`${base}_${category}`);
+    // `_zero` is not a CLDR category for most languages — German and English
+    // have only `one` and `other` — but i18next checks it first for a count of
+    // exactly 0 whatever the language, and the contributing guide invites
+    // translators to add one. Deriving the set from CLDR alone rejected it as
+    // a stale key. Permitted where a catalog supplies it, never required.
+    if (present.has(`${base}_zero`)) expected.add(`${base}_zero`);
+  }
+  return [...expected].sort();
+}
+
+/**
+ * The English value a locale's key should be measured against.
+ *
+ * A locale carries the plural forms ITS language has, so French's `_many` has
+ * no English counterpart of its own. Looking the key up in English and giving
+ * up would quietly exempt exactly those forms from the checks below — the
+ * forms that exist only because this suite started allowing them — and a
+ * `_many` string could drop its `{{count}}`, or stay in English, for the
+ * million-scale counts it is there to serve.
+ */
+function englishFor(
+  en: Record<string, unknown>,
+  key: string
+): { key: string; value: string } | null {
+  const direct = valueAt(en, key);
+  if (typeof direct === 'string') return { key, value: direct };
+  const match = /^(.*)_(zero|one|two|few|many|other)$/.exec(key);
+  if (!match) return null;
+  for (const sibling of ['other', 'one', 'many', 'few', 'two', 'zero']) {
+    const siblingKey = `${match[1]}_${sibling}`;
+    const value = valueAt(en, siblingKey);
+    if (typeof value === 'string') return { key: siblingKey, value };
+  }
+  return null;
+}
+
+describe('englishFor — what a locale-only plural form is measured against', () => {
+  const en = { a: { plain: 'x', count_one: '{{count}} thing', count_other: '{{count}} things' } };
+
+  it('maps a form English does not have onto an English sibling', () => {
+    expect(englishFor(en, 'a.count_many')).toEqual({
+      key: 'a.count_other',
+      value: '{{count}} things',
+    });
+  });
+
+  it('uses the key itself when English has it', () => {
+    expect(englishFor(en, 'a.plain')).toEqual({ key: 'a.plain', value: 'x' });
+  });
+
+  it('gives up on a key that is not a plural form at all', () => {
+    expect(englishFor(en, 'a.unknown')).toBeNull();
+  });
+});
+
+describe('expectedKeys — the plural forms a language actually has', () => {
+  const en = ['a.plain', 'a.count_one', 'a.count_other'];
+
+  it('asks a language with one form for one form', () => {
+    // Japanese and Chinese do not inflect for number. An `_one` entry there is
+    // a form the grammar never selects, so demanding it only invents work.
+    expect(expectedKeys(en, 'ja')).toEqual(['a.count_other', 'a.plain']);
+    expect(expectedKeys(en, 'zh-Hans')).toEqual(['a.count_other', 'a.plain']);
+  });
+
+  it('asks French for the many form it needs', () => {
+    // French selects `many` from a million up — a count a document total
+    // reaches easily. Without the form the string falls back to English.
+    expect(expectedKeys(en, 'fr')).toEqual([
+      'a.count_many',
+      'a.count_one',
+      'a.count_other',
+      'a.plain',
+    ]);
+  });
+
+  it('leaves a language shaped like English alone', () => {
+    expect(expectedKeys(en, 'de')).toEqual(['a.count_one', 'a.count_other', 'a.plain']);
+  });
+
+  it('permits an exact-zero override without requiring one', () => {
+    // `zero` is not a CLDR category for German, but i18next checks `_zero`
+    // first for a count of exactly 0 in any language, and the contributing
+    // guide invites translators to add one. It is allowed where supplied and
+    // never demanded.
+    expect(expectedKeys(en, 'de', ['a.count_zero'])).toEqual([
+      'a.count_one',
+      'a.count_other',
+      'a.count_zero',
+      'a.plain',
+    ]);
+    expect(expectedKeys(en, 'de', [])).not.toContain('a.count_zero');
+  });
+});
+
 describe('locale catalogs', () => {
-  it('every locale has every namespace with identical key sets', async () => {
+  it('every locale has every namespace with the key set its grammar needs', async () => {
     for (const ns of NAMESPACES) {
       const en = keysOf(await load('en', ns)).sort();
       for (const { code } of OTHER_LOCALES) {
         const other = keysOf(await load(code, ns)).sort();
         // Both directions: a missing key means untranslated copy; an extra key
-        // means a stale entry left behind by a rename.
-        expect(other, `${code}/${ns}.json is missing keys present in en`).toEqual(en);
+        // means a stale entry left behind by a rename — or a plural form the
+        // language does not have.
+        expect(other, `${code}/${ns}.json does not match the keys en requires`).toEqual(
+          expectedKeys(en, code, other)
+        );
       }
     }
   });
@@ -287,13 +419,16 @@ describe('locale catalogs', () => {
       const en = await load('en', ns);
       for (const { code } of OTHER_LOCALES) {
         const other = await load(code, ns);
-        const suspicious = keysOf(en).filter((k) => {
-          const enVal = valueAt(en, k);
+        // The LOCALE's keys, not English's: a plural form only this language
+        // has would otherwise never be looked at.
+        const suspicious = keysOf(other).filter((k) => {
+          const source = englishFor(en, k);
           const otherVal = valueAt(other, k);
           return (
-            typeof enVal === 'string' &&
-            enVal === otherVal &&
-            !ALLOWED_IDENTICAL_VALUES.has(`${ns}:${k}`)
+            source !== null &&
+            source.value === otherVal &&
+            !ALLOWED_IDENTICAL_VALUES.has(`${ns}:${k}`) &&
+            !ALLOWED_IDENTICAL_VALUES.has(`${ns}:${source.key}`)
           );
         });
         expect(
@@ -383,14 +518,26 @@ describe('locale catalogs', () => {
       const en = await load('en', ns);
       for (const { code } of OTHER_LOCALES) {
         const other = await load(code, ns);
-        for (const key of keysOf(en)) {
-          const enVal = valueAt(en, key);
+        for (const key of keysOf(other)) {
+          const source = englishFor(en, key);
           const otherVal = valueAt(other, key);
-          if (typeof enVal !== 'string' || typeof otherVal !== 'string') continue;
+          if (source === null || typeof otherVal !== 'string') continue;
+          // An exact-zero override measured against a sibling that counts:
+          // "no documents deleted" is the point of the form, so it may drop
+          // the count English needs. It still may not invent a placeholder
+          // nothing will supply.
+          if (key.endsWith('_zero') && source.key !== key) {
+            const unknown = tokensOf(otherVal).filter((t) => !tokensOf(source.value).includes(t));
+            expect(
+              unknown,
+              `${code}/${ns}.json:${key} uses placeholders en:${source.key} does not supply ("${source.value}" vs "${otherVal}")`,
+            ).toEqual([]);
+            continue;
+          }
           expect(
             tokensOf(otherVal),
-            `${code}/${ns}.json:${key} interpolation placeholders don't match en ("${enVal}" vs "${otherVal}")`,
-          ).toEqual(tokensOf(enVal));
+            `${code}/${ns}.json:${key} interpolation placeholders don't match en:${source.key} ("${source.value}" vs "${otherVal}")`,
+          ).toEqual(tokensOf(source.value));
         }
       }
     }

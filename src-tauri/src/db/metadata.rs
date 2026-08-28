@@ -5,6 +5,25 @@ use crate::write_guard::{guard_writable, WriteOp};
 use crate::{mock_db, AppState, CollectionInfo, IndexInfo};
 
 pub async fn list_databases_impl(state: &AppState, id: &str) -> Result<Vec<String>, String> {
+    let started = std::time::Instant::now();
+    let result = list_databases_impl_inner(state, id).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        None,
+        None,
+        "list_databases",
+        crate::audit::OpClass::ReadHigh,
+        None,
+        started,
+        &"listDatabases".to_string(),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn list_databases_impl_inner(state: &AppState, id: &str) -> Result<Vec<String>, String> {
     let is_mock = {
         let mocks = state.mocks.lock_safe()?;
         *mocks
@@ -39,6 +58,29 @@ pub async fn list_databases_impl(state: &AppState, id: &str) -> Result<Vec<Strin
 }
 
 pub async fn list_collections_impl(
+    state: &AppState,
+    id: &str,
+    db: &str,
+) -> Result<Vec<CollectionInfo>, String> {
+    let started = std::time::Instant::now();
+    let result = list_collections_impl_inner(state, id, db).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(db),
+        None,
+        "list_collections",
+        crate::audit::OpClass::ReadHigh,
+        None,
+        started,
+        &format!("listCollections {db}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn list_collections_impl_inner(
     state: &AppState,
     id: &str,
     db: &str,
@@ -95,6 +137,30 @@ pub async fn list_collections_impl(
 }
 
 pub async fn list_indexes_impl(
+    state: &AppState,
+    id: &str,
+    db: &str,
+    collection: &str,
+) -> Result<Vec<IndexInfo>, String> {
+    let started = std::time::Instant::now();
+    let result = list_indexes_impl_inner(state, id, db, collection).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(db),
+        Some(collection),
+        "list_indexes",
+        crate::audit::OpClass::ReadHigh,
+        None,
+        started,
+        &format!("listIndexes {db}.{collection}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn list_indexes_impl_inner(
     state: &AppState,
     id: &str,
     db: &str,
@@ -175,6 +241,34 @@ pub async fn create_index_impl(
     unique: bool,
     sparse: bool,
 ) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let result = create_index_inner(state, id, db, collection, index_name, keys, unique, sparse).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(db),
+        Some(collection),
+        "create_index",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("createIndex {db}.{collection}.{index_name}"),
+        Some(keys),
+        &result,
+    );
+    result
+}
+
+async fn create_index_inner(
+    state: &AppState,
+    id: &str,
+    db: &str,
+    collection: &str,
+    index_name: &str,
+    keys: &str,
+    unique: bool,
+    sparse: bool,
+) -> Result<(), String> {
     guard_writable(state, id, WriteOp::CreateIndex, false)?;
 
     let is_mock = {
@@ -242,6 +336,31 @@ pub async fn create_index_impl(
 }
 
 pub async fn delete_index_impl(
+    state: &AppState,
+    id: &str,
+    db: &str,
+    collection: &str,
+    index_name: &str,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let result = delete_index_inner(state, id, db, collection, index_name).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(db),
+        Some(collection),
+        "delete_index",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("dropIndex {db}.{collection}.{index_name}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn delete_index_inner(
     state: &AppState,
     id: &str,
     db: &str,

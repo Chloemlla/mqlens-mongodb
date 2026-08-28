@@ -103,13 +103,14 @@ import { GridFsView } from './components/GridFsView';
 import { MonitoringView } from './components/MonitoringView';
 import { UserManagementView } from './components/UserManagementView';
 import { TaskManager, type ExportTaskInfo } from './components/TaskManager';
+import { ActivityPanel } from './components/ActivityPanel';
 import { VaultGate } from './components/VaultGate';
 import { UpdatePrompt } from './components/UpdatePrompt';
 import { DialogProvider, useDialogs } from './components/dialogs/DialogProvider';
 import { formatBytes } from './lib/format';
 import type { QueryCodeSpec } from './lib/queryCodeGen';
 import type { IndexSuggestion } from './lib/indexSuggestions';
-import { docToShell } from './lib/shellDoc';
+import { docToShell, shellToEjson } from './lib/shellDoc';
 import { recordHistory, loadCollectionQueries, type SavedQueryBody } from './lib/queryStore';
 import { clearNamespaceIndex, loadNamespaceIndex, matchesNamespaceScope } from './lib/paletteIndex';
 import { CHECK_UPDATE_EVENT } from './components/UpdatePrompt';
@@ -121,12 +122,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { FolderCode, KeyRound, Radio, X, ChevronsRight, XSquare, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert } from 'lucide-react';
+import { FolderCode, KeyRound, Radio, X, ChevronsRight, XSquare, Play, Settings, Terminal, Rocket, Download, Upload, Table2, Eye, HardDrive, Activity, Copy, Users, ListChecks, DatabaseBackup, DatabaseZap, ShieldCheck, ExternalLink, MoveRight, Wand2, Lock, ShieldAlert, ScrollText } from 'lucide-react';
 import logoMark from './assets/logo-mark.svg';
+import { loadTabColors, saveTabColor, TAB_COLORS, tabColorCss, type TabColorId } from './lib/tabColors';
 
 export interface QueryTab {
   id: string;
-  type: 'collection' | 'index' | 'shell' | 'settings' | 'quickstart' | 'export' | 'import' | 'tasks' | 'schema' | 'create-view' | 'gridfs' | 'monitoring' | 'users' | 'dump' | 'restore' | 'validation' | 'generate' | 'watch';
+  type: 'collection' | 'index' | 'shell' | 'settings' | 'quickstart' | 'export' | 'import' | 'tasks' | 'activity' | 'schema' | 'create-view' | 'gridfs' | 'monitoring' | 'users' | 'dump' | 'restore' | 'validation' | 'generate' | 'watch';
   connectionId: string;
   db: string;
   collection: string;
@@ -152,6 +154,58 @@ export interface QueryTab {
   totalCount?: number;
   countLoading?: boolean;
   estimated?: boolean;
+}
+
+/// Stages that pass documents through unchanged, so the rows are still whole
+/// stored documents with their real `_id`s and can be edited.
+///
+/// Anything else — `$group`, `$project`, `$replaceRoot`, `$unwind`, `$lookup`,
+/// `$addFields` — reshapes the row or replaces its identity, so its `_id` may be
+/// a group key rather than a document id and saving could hit an unrelated
+/// document.
+const DOCUMENT_PRESERVING_STAGES = new Set(['$match', '$sort', '$limit', '$skip']);
+
+/** True when every stage of `pipeline` leaves documents intact. */
+export function pipelineYieldsWholeDocuments(pipeline?: Record<string, unknown>[]): boolean {
+  if (!pipeline || pipeline.length === 0) return true;
+  return pipeline.every((stage) => {
+    const keys = Object.keys(stage ?? {});
+    return keys.length === 1 && DOCUMENT_PRESERVING_STAGES.has(keys[0]);
+  });
+}
+
+/// True when a find projection replaces `_id` with a computed value, e.g.
+/// `{"_id": "$email"}`. The row's `_id` is then not the document's, so a filter
+/// built from it targets whatever happens to match. Only `1`/`0`/`true`/`false`
+/// keep `_id` as the stored id; any other value is an aggregation expression.
+export function projectionComputesId(projection?: string): boolean {
+  const trimmed = (projection ?? '').trim();
+  if (trimmed === '' || trimmed === '{}') return false;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed !== 'object' || parsed === null || !('_id' in parsed)) return false;
+    const value = (parsed as Record<string, unknown>)._id;
+    return !(typeof value === 'number' || typeof value === 'boolean');
+  } catch {
+    // Unparseable: the backend refuses anyway, so withhold the action.
+    return true;
+  }
+}
+
+/// Whether a tab's rows are stored documents that row actions may target by
+/// `_id`. False for reshaping pipelines, where `_id` may be a group key, and for
+/// a find projection that computes `_id` — both make the row's id something other
+/// than the stored document's, so editing or deleting would hit an unrelated one.
+///
+/// `DataGrid` offers the edit and delete actions only when the callbacks are
+/// provided, so passing `undefined` withholds them rather than showing something
+/// that would be refused.
+function rowsAreStoredDocuments(tab: {
+  lastAggregate?: Record<string, unknown>[];
+  lastQuery?: { projection: string };
+}): boolean {
+  if (tab.lastAggregate) return pipelineYieldsWholeDocuments(tab.lastAggregate);
+  return !projectionComputesId(tab.lastQuery?.projection);
 }
 
 const DEFAULT_QUERY = { filter: '{}', sort: '{}', projection: '{}', limit: 50, skip: 0 };
@@ -275,6 +329,20 @@ const createTasksTab = (): QueryTab => ({
   explainResult: null,
 });
 
+const ACTIVITY_TAB_ID = 'activity';
+
+const createActivityTab = (): QueryTab => ({
+  id: ACTIVITY_TAB_ID,
+  type: 'activity',
+  connectionId: '',
+  db: '',
+  collection: '',
+  results: [],
+  loading: false,
+  error: null,
+  explainResult: null,
+});
+
 /**
  * The id of the tab that watches a namespace.
  *
@@ -310,6 +378,8 @@ const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
       return <Upload size={size} className={className} />;
     case 'tasks':
       return <ListChecks size={size} className={className} />;
+    case 'activity':
+      return <ScrollText size={size} className={className} />;
     case 'schema':
       return <Table2 size={size} className={className} />;
     case 'create-view':
@@ -336,7 +406,8 @@ const tabIconFor = (tab: QueryTab, isActive: boolean): React.ReactNode => {
 export const tabLabelFor = (
   tab: QueryTab,
   connectionName: (connectionId: string) => string,
-  t: TFunction
+  t: TFunction,
+  openTabs: QueryTab[] = [tab]
 ): string => {
   switch (tab.type) {
     case 'index':
@@ -360,6 +431,8 @@ export const tabLabelFor = (
       return t('tabs.import', { collection: tab.collection });
     case 'tasks':
       return t('tabs.tasks');
+    case 'activity':
+      return t('tabs.activity');
     case 'schema':
       return t('tabs.schema', { collection: tab.collection });
     case 'create-view':
@@ -378,8 +451,38 @@ export const tabLabelFor = (
       return t('tabs.validation', { collection: tab.collection });
     case 'generate':
       return t('tabs.generate', { name: tab.collection || tab.db });
-    default:
-      return tab.collection;
+    default: {
+      const collisions = openTabs.filter(
+        candidate => candidate.type === 'collection' && candidate.collection === tab.collection
+      );
+      if (collisions.length < 2) return tab.collection;
+
+      const namespaceCollides = collisions.some(
+        candidate => candidate.id !== tab.id && candidate.db === tab.db
+      );
+      return namespaceCollides
+        ? `${connectionName(tab.connectionId)} / ${tab.db}:${tab.collection}`
+        : `${tab.db}:${tab.collection}`;
+    }
+  }
+};
+
+export const tabTooltipFor = (
+  tab: QueryTab,
+  connectionName: (connectionId: string) => string
+): string | undefined => tab.type === 'collection'
+  ? `${connectionName(tab.connectionId)} / ${tab.db}.${tab.collection}`
+  : undefined;
+
+const tabColorLabel = (t: TFunction, color: TabColorId): string => {
+  switch (color) {
+    case 'slate': return t('shell:workspaceTabBar.contextMenu.tabColors.slate');
+    case 'red': return t('shell:workspaceTabBar.contextMenu.tabColors.red');
+    case 'orange': return t('shell:workspaceTabBar.contextMenu.tabColors.orange');
+    case 'amber': return t('shell:workspaceTabBar.contextMenu.tabColors.amber');
+    case 'green': return t('shell:workspaceTabBar.contextMenu.tabColors.green');
+    case 'blue': return t('shell:workspaceTabBar.contextMenu.tabColors.blue');
+    case 'violet': return t('shell:workspaceTabBar.contextMenu.tabColors.violet');
   }
 };
 
@@ -443,6 +546,7 @@ function Workspace() {
   const isMainWindow = windowLabel() === 'main';
   // Open the Quick Start tab by default so the app never starts on a blank canvas.
   const [tabs, setTabs] = useState<QueryTab[]>([createQuickStartTab()]);
+  const [tabColors, setTabColors] = useState(loadTabColors);
   // Foreign-event reconciliation (below) runs inside a `listen` callback
   // captured once at mount — it can never see a fresh `tabs` STATE value
   // from that closure, same staleness problem `activeConnectionsRef` exists
@@ -1546,6 +1650,16 @@ function Workspace() {
     dispatchWorkspace({ type: 'open_tab', tabId: TASKS_TAB_ID });
   };
 
+  const handleOpenActivityTab = () => {
+    if (!tabs.some(t => t.id === ACTIVITY_TAB_ID)) {
+      const activityTab = createActivityTab();
+      setTabs(prev => [...prev, activityTab]);
+      dispatchWorkspace({ type: 'open_tab', tabId: ACTIVITY_TAB_ID }, { tab: activityTab });
+      return;
+    }
+    dispatchWorkspace({ type: 'open_tab', tabId: ACTIVITY_TAB_ID });
+  };
+
   const handleOpenExportTab = (sourceTab: QueryTab) => {
     if (sourceTab.type !== 'collection') return;
     const tabId = `export.${sourceTab.connectionId}.${sourceTab.db}.${sourceTab.collection}`;
@@ -2599,6 +2713,30 @@ function Workspace() {
       });
     }
 
+    if (dupSource) {
+      const stableTabId = toProfileSpaceId(tabId, activeConnections);
+      const selected = tabColors[stableTabId];
+      items.push({
+        label: tShell('workspaceTabBar.contextMenu.tabColorDefault'),
+        icon: <span className="size-3 rounded-full border border-current" />,
+        separatorBefore: items.length > 0,
+        onClick: () => setTabColors(saveTabColor(stableTabId, undefined)),
+      });
+      TAB_COLORS.forEach(color => {
+        const colorId = color.id as TabColorId;
+        items.push({
+          label: tabColorLabel(tShell, colorId),
+          icon: (
+            <span
+              className={`size-3 rounded-full ${selected === colorId ? 'ring-2 ring-ring ring-offset-1' : ''}`}
+              style={{ backgroundColor: tabColorCss(colorId) }}
+            />
+          ),
+          onClick: () => setTabColors(saveTabColor(stableTabId, colorId)),
+        });
+      });
+    }
+
     if (!isUnmirrored && allTabIds(layout).length > 1) {
       items.push({
         label: tShell('workspaceTabBar.contextMenu.detachToNewWindow'),
@@ -2787,6 +2925,7 @@ function Workspace() {
     { id: 'new-connection', title: tShell('commandPalette.paletteActions.newConnection.title'), keywords: tShell('commandPalette.paletteActions.newConnection.keywords'), run: () => setIsConnectionModalOpen(true) },
     { id: 'toggle-theme', title: tShell('commandPalette.paletteActions.toggleTheme.title'), keywords: tShell('commandPalette.paletteActions.toggleTheme.keywords'), run: toggleTheme },
     { id: 'open-settings', title: tShell('commandPalette.paletteActions.openSettings.title'), keywords: tShell('commandPalette.paletteActions.openSettings.keywords'), run: handleOpenSettingsTab },
+    { id: 'open-activity', title: tShell('commandPalette.paletteActions.openActivity.title'), keywords: tShell('commandPalette.paletteActions.openActivity.keywords'), run: handleOpenActivityTab },
     { id: 'open-quickstart', title: tShell('commandPalette.paletteActions.openQuickstart.title'), keywords: tShell('commandPalette.paletteActions.openQuickstart.keywords'), run: openQuickStartTab },
     { id: 'refresh-palette-index', title: tShell('commandPalette.paletteActions.refreshPaletteIndex.title'), keywords: tShell('commandPalette.paletteActions.refreshPaletteIndex.keywords'), run: () => invalidatePaletteNamespaceIndex() },
     { id: 'density-roomy', title: tShell('commandPalette.paletteActions.densityRoomy.title'), keywords: tShell('commandPalette.paletteActions.densityRoomy.keywords'), run: () => setSpacingDensity('roomy') },
@@ -3849,12 +3988,36 @@ function Workspace() {
       // its error banner, so the text is user-facing copy, not a dev invariant.
       throw new Error(t('documents:editModal.errors.noId'));
     }
+    // Send the document as loaded *and* as edited so the backend can apply only
+    // the fields that changed. The grid may be showing a projection, and saving
+    // that partial view as a replacement deleted everything else (#275).
+    // `docToShell` on both sides means they go through the identical parse path.
     await invoke('update_document', {
       id: tab.connectionId,
       database: tab.db,
       collection,
       filter: JSON.stringify({ _id: target._id }),
-      replacement: json,
+      // Must be EJSON, not shell text: the backend parses both sides with strict
+      // `serde_json`, and DocumentEditModal already converts the editor contents
+      // with `shellToEjson` before calling onSave — so sending shell here failed
+      // on any document with an ObjectId `_id`. Running the original through the
+      // same docToShell → shellToEjson pipeline also makes an unedited save
+      // produce byte-identical sides, so the diff cannot report a change that came
+      // from serialization rather than from the user.
+      original: shellToEjson(docToShell(target)),
+      edited: json,
+      // The projection the row came back under, so the backend knows which parts
+      // of `original` are complete: `{"address": 1}` includes the whole
+      // sub-document, `{"address.city": 1}` does not (see ProjectionShape).
+      //
+      // `null` when the rows came from a pipeline that reshapes them: `lastQuery`
+      // is left intact by handleExecuteAggregate and would be stale, and a row's
+      // `_id` may be a group key rather than a document id. The backend refuses
+      // to write in that case. A pipeline of only $match/$sort/$limit/$skip
+      // passes documents through untouched, so those rows are whole documents.
+      projection: tab.lastAggregate
+        ? (pipelineYieldsWholeDocuments(tab.lastAggregate) ? '{}' : null)
+        : (tab.lastQuery?.projection ?? '{}'),
     });
     setDocumentModal(null);
     await refreshTabResults(tab);
@@ -4013,9 +4176,9 @@ function Workspace() {
                     explainResult={tab.explainResult}
                     querySpec={buildTabQuerySpec(tab)}
                     onInsertDocument={() => handleInsertDocument(tab)}
-                    onEditDocument={doc => handleEditDocument(tab, doc)}
+                    onEditDocument={rowsAreStoredDocuments(tab) ? (doc => handleEditDocument(tab, doc)) : undefined}
                     onDuplicateDocument={doc => handleDuplicateDocument(tab, doc)}
-                    onDeleteDocument={doc => handleDeleteDocument(tab, doc)}
+                    onDeleteDocument={rowsAreStoredDocuments(tab) ? (doc => handleDeleteDocument(tab, doc)) : undefined}
                     onAnalyzeSchema={() => handleOpenSchemaTab(tab.connectionId, tab.db, tab.collection)}
                     onUpdateMany={() => handleUpdateMany(tab)}
                     onDeleteMany={() => handleDeleteMany(tab)}
@@ -4258,6 +4421,11 @@ function Workspace() {
             />
           </div>
         )}
+        {tab.type === 'activity' && (
+          <div className="h-full" data-testid="activity-view">
+            <ActivityPanel />
+          </div>
+        )}
         {tab.type === 'watch' && (
           <WatchPanel
             connectionId={tab.connectionId}
@@ -4423,6 +4591,7 @@ function Workspace() {
           zoomPercent={Math.round(config.uiZoom * 100)}
           onZoomReset={resetZoom}
           onOpenTasks={handleOpenTasksTab}
+          onOpenActivity={handleOpenActivityTab}
           runningTasks={exportTasks.filter((t) => t.status === 'running').length}
         />
       }
@@ -4558,7 +4727,16 @@ function Workspace() {
           pane.tabIds
             .map(id => tabs.find(t => t.id === id))
             .filter((t): t is QueryTab => !!t)
-            .map(tab => ({ id: tab.id, label: tabLabelFor(tab, connectionNameFor, t), icon: tabIconFor(tab, tab.id === pane.activeTabId) }))
+            .map(tab => ({
+              id: tab.id,
+              label: tabLabelFor(tab, connectionNameFor, t, tabs),
+              tooltip: tabTooltipFor(tab, connectionNameFor),
+              accentColor: (() => {
+                const color = tabColors[toProfileSpaceId(tab.id, activeConnections)];
+                return color ? tabColorCss(color) : undefined;
+              })(),
+              icon: tabIconFor(tab, tab.id === pane.activeTabId),
+            }))
         }
         renderTabContent={renderTabContent}
         renderEmptyPane={renderEmptyPane}

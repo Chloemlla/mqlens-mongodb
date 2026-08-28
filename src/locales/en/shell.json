@@ -1,4 +1,60 @@
 {
+  "activity": {
+    "actions": {
+      "discardDamaged": "Discard damaged log",
+      "export": "Export…",
+      "refresh": "Refresh"
+    },
+    "columns": {
+      "connection": "Connection",
+      "namespace": "Namespace",
+      "op": "Operation",
+      "source": "Source",
+      "status": "Status",
+      "summary": "Summary",
+      "time": "Time"
+    },
+    "degradedBanner": "Activity logging is not running: {{reason}}. Operations performed now are not being recorded.",
+    "degradedUnknownReason": "the encrypted log could not be opened",
+    "detail": {
+      "args": "Arguments",
+      "duration": "Duration",
+      "error": "Error",
+      "level": "Level at record"
+    },
+    "discardConfirm": "Discard this damaged activity log? Its unverifiable events cannot be recovered. A permanent record that the log was discarded will be kept.",
+    "discardDone_one": "1 unverifiable event discarded. Recording has resumed, and a record of the discard is kept in the log.",
+    "discardDone_other": "{{count}} unverifiable events discarded. Recording has resumed, and a record of the discard is kept in the log.",
+    "droppedBanner_one": "{{count}} event was dropped this session (storage or encryption failures).",
+    "droppedBanner_other": "{{count}} events were dropped this session (storage or encryption failures).",
+    "empty": "No activity recorded yet for the current filters.",
+    "emptyLevelHint": "At audit level A (default), only writes and shell commands are logged — not finds or browsing.",
+    "exportDone_one": "Exported {{count}} event.",
+    "exportDone_other": "Exported {{count}} events.",
+    "exportFileType": "JSONL",
+    "exportPlaintextWarning": "Export writes a plaintext JSONL file outside the vault. Continue?",
+    "filters": {
+      "op": "Operation",
+      "opPlaceholder": "e.g. dropCollection",
+      "status": "Status",
+      "statusAll": "All",
+      "statusError": "Failed",
+      "statusOk": "Succeeded",
+      "summary": "Summary contains",
+      "summaryPlaceholder": "Search summary…"
+    },
+    "header": {
+      "subtitle": "Local vault-encrypted log of database operations.",
+      "title": "Activity"
+    },
+    "integrityBanner": "Activity log integrity check failed: {{reason}}. Recording has stopped and the file is being preserved. Discard the damaged log to resume recording.",
+    "loading": "Loading activity…",
+    "lockedBody": "Unlock the vault to view and export the activity log.",
+    "lockedTitle": "Vault is locked",
+    "retentionNote": "Old events are removed automatically by the retention setting. An intact log cannot be erased.",
+    "statusError": "Failed",
+    "statusOk": "OK"
+  },
   "aiChatPanel": {
     "actions": {
       "copy": "Copy",
@@ -111,6 +167,10 @@
       "nextTab": {
         "keywords": "tab switch",
         "title": "Next Tab"
+      },
+      "openActivity": {
+        "keywords": "audit log history operations wipe drop",
+        "title": "Open Activity"
       },
       "openMonitoring": {
         "keywords": "monitoring metrics server status profiler",
@@ -344,11 +404,13 @@
     "reconnectButton": "Reconnect {{profile}}"
   },
   "statusBar": {
+    "activity": "Activity",
     "appVersion": "MQLens {{version}}",
     "backgroundTasks": "Background tasks",
     "cpu": "CPU {{value}}",
     "engineOnline": "MQLens Engine Online",
     "mongodb": "MongoDB {{value}}",
+    "openActivity": "Open activity log",
     "ram": "RAM {{value}}",
     "resetZoom": "Reset zoom ({{shortcut}})",
     "runningTasks_one": "{{count}} running task",
@@ -529,6 +591,16 @@
       "detachToNewWindow": "Detach to New Window",
       "duplicateTab": "Duplicate Tab",
       "moveToWindow": "Move to {{target}}",
+      "tabColorDefault": "Tab color: Default",
+      "tabColors": {
+        "amber": "Tab color: Amber",
+        "blue": "Tab color: Blue",
+        "green": "Tab color: Green",
+        "orange": "Tab color: Orange",
+        "red": "Tab color: Red",
+        "slate": "Tab color: Slate",
+        "violet": "Tab color: Violet"
+      },
       "unmirroredExplanation": "Export/import tabs stay in their window"
     }
   }

@@ -2,7 +2,39 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '../../test/render-with-providers';
 import { resetUpdateTabStateDebounce } from '../../workspace/workspaceStore';
-import App, { tabLabelFor, type QueryTab } from '../../App';
+import App, { tabLabelFor, tabTooltipFor, type QueryTab } from '../../App';
+
+describe('collection tab labels', () => {
+  const t = ((key: string) => key) as any;
+  const connectionName = (id: string) => ({ primary: 'Primary', reporting: 'Reporting' }[id] ?? id);
+  const collectionTab = (id: string, connectionId: string, db: string, collection: string) => ({
+    id,
+    type: 'collection',
+    connectionId,
+    db,
+    collection,
+  } as QueryTab);
+
+  it('shows only the collection name when it is unique', () => {
+    const tab = collectionTab('one', 'primary', 'main', 'rates');
+    expect(tabLabelFor(tab, connectionName, t, [tab])).toBe('rates');
+    expect(tabTooltipFor(tab, connectionName)).toBe('Primary / main.rates');
+  });
+
+  it('prefixes the database when the same collection name is open from different databases', () => {
+    const main = collectionTab('one', 'primary', 'main', 'rates');
+    const test = collectionTab('two', 'primary', 'test', 'rates');
+    expect(tabLabelFor(main, connectionName, t, [main, test])).toBe('main:rates');
+    expect(tabLabelFor(test, connectionName, t, [main, test])).toBe('test:rates');
+  });
+
+  it('also prefixes the connection when database and collection names collide', () => {
+    const primary = collectionTab('one', 'primary', 'main', 'rates');
+    const reporting = collectionTab('two', 'reporting', 'main', 'rates');
+    expect(tabLabelFor(primary, connectionName, t, [primary, reporting])).toBe('Primary / main:rates');
+    expect(tabLabelFor(reporting, connectionName, t, [primary, reporting])).toBe('Reporting / main:rates');
+  });
+});
 
 vi.mock('../../lib/vault', () => ({
   getVaultStatus: vi.fn().mockResolvedValue('unlocked'),
@@ -720,7 +752,7 @@ describe('App Component', () => {
     });
   });
 
-  it('edits a document via replace by _id (C1)', async () => {
+  it('edits a document as a field-level update by _id (C1)', async () => {
     const calls: any[] = [];
     mockInvoke.mockImplementation((cmd, args) => {
       calls.push({ cmd, args });
@@ -747,7 +779,15 @@ describe('App Component', () => {
       const upd = calls.find((c) => c.cmd === 'update_document');
       expect(upd).toBeTruthy();
       expect(upd.args.filter).toBe('{"_id":"1"}');
-      expect(upd.args.replacement).toBe('{"_id":"1","name":"Ada"}');
+      // Both sides are sent so the backend can write only what changed; a bare
+      // `replacement` would wipe fields a projection had left out (#275).
+      expect(upd.args.edited).toBe('{"_id":"1","name":"Ada"}');
+      // Must be parseable JSON, not shell text: the backend parses it with strict
+      // serde_json, so `ObjectId(...)` in here fails the save outright. A
+      // substring assertion passed while that was broken.
+      expect(() => JSON.parse(upd.args.original)).not.toThrow();
+      expect(JSON.parse(upd.args.original)).toEqual({ _id: '1', name: 'John Doe' });
+      expect(upd.args.replacement).toBeUndefined();
       expect(screen.getByText(/Document saved in customers/)).toBeInTheDocument();
     });
   });
@@ -3970,6 +4010,21 @@ describe('App Component', () => {
   });
 
   describe('tab context menu — detach/move (Phase 3 Task 5)', () => {
+    it('sets and persists a subdued collection tab color', async () => {
+      const { fireEvent, within } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+      fireEvent.click(screen.getByTestId('select-collection-btn'));
+
+      const tabStrip = screen.getByTestId('workspace-tab-strip');
+      const customersTab = await within(tabStrip).findByText('customers');
+      fireEvent.contextMenu(customersTab.closest('div')!);
+      fireEvent.click(await screen.findByText('Tab color: Blue'));
+
+      expect(within(tabStrip).getByTestId('tab-accent-conn-1.sales_db.customers')).toBeInTheDocument();
+      expect(localStorage.getItem('mqlens-tab-colors')).toContain('"blue"');
+    });
+
     // Seeds lastWorkspaceRef with a second open window (win-1, active tab
     // "orders") via a workspace-changed event — the same seeding technique
     // Task 4's reconciliation tests use. `crossWindow: false` is deliberate:
@@ -4378,5 +4433,105 @@ describe('App Component', () => {
         await i18next.changeLanguage('en');
       }
     });
+  });
+
+  it('sends the projected document as the original so unprojected fields survive (#275)', async () => {
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'execute_mql_query') {
+        // What a `{ "age": 1 }` projection returns: a partial view.
+        return Promise.resolve([JSON.stringify({ _id: '66a1', age: 34 })]);
+      }
+      if (cmd === 'update_document') return Promise.resolve(1);
+      return Promise.resolve([]);
+    });
+
+    const { fireEvent, waitFor } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId('mock-sidebar');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    await screen.findByText(/34/);
+
+    fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+    const input = await screen.findByTestId('document-json-input');
+    fireEvent.change(input, { target: { value: '{"_id":"66a1","age":35}' } });
+    fireEvent.click(screen.getByTestId('document-save-btn'));
+
+    await waitFor(() => {
+      const upd = calls.find((c) => c.cmd === 'update_document');
+      expect(upd).toBeTruthy();
+      // The projected document goes as `original`, so the backend diff can tell
+      // "not shown" from "deleted" and leaves username/email/roles alone.
+      expect(JSON.parse(upd.args.original)).toEqual({ _id: '66a1', age: 34 });
+      expect(upd.args.edited).toBe('{"_id":"66a1","age":35}');
+    });
+  });
+
+  it('withholds row edit and delete for a reshaping pipeline (#275)', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'execute_mql_query') {
+        return Promise.resolve([JSON.stringify({ _id: '1', name: 'John Doe' })]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const { fireEvent } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId('mock-sidebar');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    // A find result: the row is a stored document, so editing is offered.
+    expect(await screen.findByTestId('edit-doc-btn')).toBeInTheDocument();
+  });
+});
+
+describe('projectionComputesId (#275)', () => {
+  it('accepts projections that keep _id as the stored id', async () => {
+    const { projectionComputesId } = await import('../../App');
+    expect(projectionComputesId(undefined)).toBe(false);
+    expect(projectionComputesId('{}')).toBe(false);
+    expect(projectionComputesId('{"name":1}')).toBe(false);
+    expect(projectionComputesId('{"_id":1,"name":1}')).toBe(false);
+    expect(projectionComputesId('{"_id":0,"name":1}')).toBe(false);
+    expect(projectionComputesId('{"_id":true}')).toBe(false);
+  });
+
+  it('rejects a computed _id, whose value is not the document id', async () => {
+    const { projectionComputesId } = await import('../../App');
+    expect(projectionComputesId('{"_id":"$email","name":1}')).toBe(true);
+    expect(projectionComputesId('{"_id":{"$concat":["$a","$b"]}}')).toBe(true);
+    // Unparseable: the backend refuses, so the action is withheld too.
+    expect(projectionComputesId('{not json')).toBe(true);
+  });
+});
+
+describe('pipelineYieldsWholeDocuments (#275)', () => {
+  it('accepts stages that pass documents through untouched', async () => {
+    const { pipelineYieldsWholeDocuments } = await import('../../App');
+    expect(pipelineYieldsWholeDocuments(undefined)).toBe(true);
+    expect(pipelineYieldsWholeDocuments([])).toBe(true);
+    expect(pipelineYieldsWholeDocuments([{ $match: { active: true } }])).toBe(true);
+    expect(
+      pipelineYieldsWholeDocuments([{ $match: {} }, { $sort: { a: 1 } }, { $limit: 10 }, { $skip: 5 }])
+    ).toBe(true);
+  });
+
+  it('rejects stages that reshape a row or replace its identity', async () => {
+    const { pipelineYieldsWholeDocuments } = await import('../../App');
+    // `_id` becomes the group key, so row actions would target the wrong document.
+    expect(pipelineYieldsWholeDocuments([{ $group: { _id: '$status' } }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $project: { name: 1 } }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $replaceRoot: { newRoot: '$x' } }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $unwind: '$roles' }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $lookup: {} }])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $addFields: { n: 1 } }])).toBe(false);
+    // One safe stage does not redeem an unsafe one.
+    expect(pipelineYieldsWholeDocuments([{ $match: {} }, { $group: { _id: '$s' } }])).toBe(false);
+  });
+
+  it('rejects a malformed stage rather than assuming it is safe', async () => {
+    const { pipelineYieldsWholeDocuments } = await import('../../App');
+    expect(pipelineYieldsWholeDocuments([{} as Record<string, unknown>])).toBe(false);
+    expect(pipelineYieldsWholeDocuments([{ $match: {}, $sort: {} }])).toBe(false);
   });
 });

@@ -53,6 +53,19 @@ fn default_ai_provider() -> String {
 fn default_ai_history_retention_months() -> u8 {
     3
 }
+
+fn default_audit_enabled() -> bool {
+    true
+}
+fn default_audit_level() -> String {
+    "A".to_string()
+}
+fn default_audit_retention_days() -> u32 {
+    30
+}
+fn default_audit_include_payloads() -> bool {
+    false
+}
 fn default_openai_model() -> String {
     "gpt-4o".to_string()
 }
@@ -157,6 +170,18 @@ pub struct AppSettings {
     /// How long to keep AI Helper chat/prompt history (1–12 months).
     #[serde(default = "default_ai_history_retention_months")]
     pub ai_history_retention_months: u8,
+    /// Master switch for local operation audit logging (#272).
+    #[serde(default = "default_audit_enabled")]
+    pub audit_enabled: bool,
+    /// Audit verbosity: `"A"` (writes+shell), `"B"` (+high reads), `"C"` (all DB ops).
+    #[serde(default = "default_audit_level")]
+    pub audit_level: String,
+    /// How long to keep audit events (days). Default 30; UI presets 7/30/90.
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
+    /// When true, store document bodies / full filters up to the per-event cap.
+    #[serde(default = "default_audit_include_payloads")]
+    pub audit_include_payloads: bool,
     // Auto-update channel: "stable" (default) or "dev".
     #[serde(default = "default_update_channel")]
     pub update_channel: String,
@@ -180,6 +205,10 @@ impl Default for AppSettings {
             local_commands: std::collections::HashMap::new(),
             ai_custom_instructions: String::new(),
             ai_history_retention_months: default_ai_history_retention_months(),
+            audit_enabled: default_audit_enabled(),
+            audit_level: default_audit_level(),
+            audit_retention_days: default_audit_retention_days(),
+            audit_include_payloads: default_audit_include_payloads(),
             update_channel: default_update_channel(),
             appearance: AppearanceSettings::default(),
         }
@@ -431,6 +460,19 @@ pub fn get_settings_enc_path(app_handle: &tauri::AppHandle) -> PathBuf {
     config_dir_file(app_handle, "settings.json.enc")
 }
 
+/// Append-only encrypted audit log (`audit.log.enc`).
+pub fn get_audit_log_path(app_handle: &tauri::AppHandle) -> PathBuf {
+    config_dir_file(app_handle, "audit.log.enc")
+}
+
+/// The superseded whole-image audit envelope (`audit.db.enc`).
+///
+/// Kept only so the pre-append-log file can be found and set aside; nothing
+/// reads its contents any more.
+pub fn get_audit_enc_path(app_handle: &tauri::AppHandle) -> PathBuf {
+    config_dir_file(app_handle, "audit.db.enc")
+}
+
 /// Shared helper: a file inside the app config dir (creating the dir), or CWD fallback.
 fn config_dir_file(app_handle: &tauri::AppHandle, name: &str) -> PathBuf {
     match app_handle.path().app_config_dir() {
@@ -531,6 +573,115 @@ pub fn migrate_plaintext_to_encrypted(
     Ok(())
 }
 
+/// Re-encrypt a vault blob from `old_key` to `new_key` without touching disk.
+pub fn reencrypt_blob(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    blob: &[u8],
+) -> Result<Vec<u8>, String> {
+    if blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plain = crate::vault::decrypt(old_key, blob)?;
+    crate::vault::encrypt(new_key, &plain)
+}
+
+/// Read and prepare a re-encrypted file. Missing/empty files return `None`.
+pub fn prepare_reencrypt_file(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let blob = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if blob.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(reencrypt_blob(old_key, new_key, &blob)?))
+}
+
+/// Write a prepared blob, or no-op when `None`/empty.
+pub fn write_prepared_file(path: &Path, blob: Option<Vec<u8>>) -> Result<(), String> {
+    match blob {
+        None => Ok(()),
+        Some(b) if b.is_empty() => Ok(()),
+        Some(b) => crate::durable::write_atomic(path, &b),
+    }
+}
+
+/// Commit a whole vault key rotation, restoring the previous files if any write
+/// fails.
+///
+/// The rotation spans four files, and partial success bricks the vault: files
+/// re-encrypted under the new key while `vault.json` still derives the old one
+/// leave neither password able to open the complete vault. Preparing the blobs
+/// first (see `prepare_reencrypt_file`) removes the *encryption* failures from
+/// this window, but the writes themselves can still fail — a full disk being the
+/// obvious one — so every original is held in memory and put back on error.
+///
+/// `files` is `(path, Some(new_bytes))` per data file; `None` means "not
+/// present, leave alone".
+pub fn commit_vault_rotation(
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    meta_path: &Path,
+    new_meta: &VaultMeta,
+) -> Result<(), String> {
+    let meta_bytes = serde_json::to_vec_pretty(new_meta)
+        .map_err(|e| format!("serialize vault.json: {e}"))?;
+
+    // Snapshot everything this rotation will overwrite, before touching any of it.
+    let mut planned: Vec<(PathBuf, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    for (path, new_bytes) in files {
+        let Some(new_bytes) = new_bytes.filter(|b| !b.is_empty()) else {
+            continue;
+        };
+        let original = read_backup(&path)?;
+        planned.push((path, new_bytes, original));
+    }
+    let meta_original = read_backup(meta_path)?;
+    planned.push((meta_path.to_path_buf(), meta_bytes, meta_original));
+
+    let mut written: Vec<(&PathBuf, &Option<Vec<u8>>)> = Vec::new();
+    for (path, new_bytes, original) in &planned {
+        if let Err(e) = crate::durable::write_atomic(path, new_bytes) {
+            // Put back only what this call actually replaced.
+            let mut restore_errors = Vec::new();
+            for (done_path, done_original) in written.iter().rev() {
+                let restored = match done_original {
+                    Some(bytes) => crate::durable::write_atomic(done_path, bytes),
+                    None => fs::remove_file(done_path)
+                        .map_err(|e| format!("remove {}: {e}", done_path.display())),
+                };
+                if let Err(re) = restored {
+                    restore_errors.push(re);
+                }
+            }
+            if restore_errors.is_empty() {
+                return Err(format!("{e} (vault left unchanged)"));
+            }
+            return Err(format!(
+                "{e} — and restoring the previous vault files failed: {}. \
+                 The vault may be inconsistent; restore from a backup.",
+                restore_errors.join("; ")
+            ));
+        }
+        written.push((path, original));
+    }
+    Ok(())
+}
+
+/// Current contents of `path`, or `None` when it does not exist.
+fn read_backup(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read(path)
+        .map(Some)
+        .map_err(|e| format!("read {} for rollback: {e}", path.display()))
+}
+
 /// Re-encrypt both data files from `old_key` to `new_key`. Missing files are skipped.
 pub fn reencrypt_data_files(
     old_key: &[u8; 32],
@@ -538,15 +689,26 @@ pub fn reencrypt_data_files(
     enc_profiles: &Path,
     enc_settings: &Path,
 ) -> Result<(), String> {
-    if enc_profiles.exists() {
-        let profiles = load_profiles_encrypted(enc_profiles, old_key)?;
-        save_profiles_encrypted(enc_profiles, new_key, &profiles)?;
-    }
-    if enc_settings.exists() {
-        let settings = load_settings_encrypted(enc_settings, old_key)?;
-        save_settings_encrypted(enc_settings, new_key, &settings)?;
-    }
+    let profiles = prepare_reencrypt_file(old_key, new_key, enc_profiles)?;
+    let settings = prepare_reencrypt_file(old_key, new_key, enc_settings)?;
+    write_prepared_file(enc_profiles, profiles)?;
+    write_prepared_file(enc_settings, settings)?;
     Ok(())
+}
+
+/// Prepare the audit log and its state sidecar, re-encrypted from `old_key` to
+/// `new_key`.
+///
+/// Not `prepare_reencrypt_file`: the log encrypts each record separately, so
+/// rotation has to decrypt every record and rebuild the hash chain rather than
+/// re-wrap one blob. The state sidecar is keyed the same way and must rotate in
+/// the same transaction, so both files come back together.
+pub fn prepare_reencrypt_audit_log(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    log_path: &Path,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    crate::audit::log::prepare_reencrypted(old_key, new_key, log_path)
 }
 
 #[tauri::command]
@@ -743,4 +905,124 @@ pub async fn test_connection_uri(
         let _ = on_phase.send(update);
     };
     run_connection_test(&uri, ssh.as_ref(), &emit).await
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Build a test-only password without a hard-coded string literal, so static
+    /// analysis does not read it as a real credential. Mirrors `test_secret` in
+    /// `tests.rs`; kept local because that helper is private to that module.
+    fn test_secret(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn meta() -> VaultMeta {
+        let password = test_secret(&["rot", "ation", "-test"]);
+        build_vault_meta(&password, crate::vault::KdfParams { m_kib: 8, t: 1, p: 1 })
+            .expect("build meta")
+    }
+
+    #[test]
+    fn a_successful_rotation_writes_every_file() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("connections.json.enc");
+        let b = dir.path().join("settings.json.enc");
+        let meta_path = dir.path().join("vault.json");
+        fs::write(&a, b"old-a").unwrap();
+        fs::write(&b, b"old-b").unwrap();
+
+        commit_vault_rotation(
+            vec![(a.clone(), Some(b"new-a".to_vec())), (b.clone(), Some(b"new-b".to_vec()))],
+            &meta_path,
+            &meta(),
+        )
+        .expect("commit");
+
+        assert_eq!(fs::read(&a).unwrap(), b"new-a");
+        assert_eq!(fs::read(&b).unwrap(), b"new-b");
+        assert!(meta_path.exists(), "metadata must be written last but written");
+    }
+
+    #[test]
+    fn a_failed_write_restores_every_earlier_file() {
+        let dir = tempdir().unwrap();
+        let good = dir.path().join("connections.json.enc");
+        let meta_path = dir.path().join("vault.json");
+        fs::write(&good, b"old-good").unwrap();
+        fs::write(&meta_path, b"old-meta").unwrap();
+
+        // `write_atomic` stages through `<path>.tmp`; a directory there makes the
+        // *write* fail (not the pre-write snapshot), which is the path that has
+        // to roll back what it already committed.
+        let blocked = dir.path().join("blocked.enc");
+        fs::create_dir(dir.path().join("blocked.enc.tmp")).unwrap();
+
+        let err = commit_vault_rotation(
+            vec![
+                (good.clone(), Some(b"new-good".to_vec())),
+                (blocked.clone(), Some(b"new-blocked".to_vec())),
+            ],
+            &meta_path,
+            &meta(),
+        )
+        .expect_err("the blocked write must fail");
+        assert!(err.contains("vault left unchanged"), "{err}");
+
+        assert_eq!(
+            fs::read(&good).unwrap(),
+            b"old-good",
+            "the already-written file must be rolled back, or no password opens the vault"
+        );
+        assert_eq!(
+            fs::read(&meta_path).unwrap(),
+            b"old-meta",
+            "metadata must be untouched"
+        );
+    }
+
+    #[test]
+    fn rollback_removes_files_that_did_not_exist_before() {
+        let dir = tempdir().unwrap();
+        let fresh = dir.path().join("settings.json.enc");
+        let meta_path = dir.path().join("vault.json");
+        let blocked = dir.path().join("blocked.enc");
+        fs::create_dir(dir.path().join("blocked.enc.tmp")).unwrap();
+
+        commit_vault_rotation(
+            vec![
+                (fresh.clone(), Some(b"new".to_vec())),
+                (blocked, Some(b"x".to_vec())),
+            ],
+            &meta_path,
+            &meta(),
+        )
+        .expect_err("must fail");
+
+        assert!(
+            !fresh.exists(),
+            "a file created by the aborted rotation must not survive it"
+        );
+    }
+
+    #[test]
+    fn absent_and_empty_payloads_are_skipped() {
+        let dir = tempdir().unwrap();
+        let skipped = dir.path().join("connections.json.enc");
+        let empty = dir.path().join("settings.json.enc");
+        let meta_path = dir.path().join("vault.json");
+
+        commit_vault_rotation(
+            vec![(skipped.clone(), None), (empty.clone(), Some(Vec::new()))],
+            &meta_path,
+            &meta(),
+        )
+        .expect("commit");
+
+        assert!(!skipped.exists());
+        assert!(!empty.exists());
+        assert!(meta_path.exists());
+    }
 }

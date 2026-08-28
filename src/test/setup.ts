@@ -1,4 +1,23 @@
 import '@testing-library/jest-dom';
+import { configure } from '@testing-library/react';
+
+// `waitFor` defaults to a 1s budget (see @testing-library/dom's config), which
+// is too tight for this suite on a busy machine: 102 test files under jsdom,
+// each `waitFor` waiting on React effects plus promise chains. CI has failed
+// intermittently on assertions *inside* `waitFor` — App's cross-window
+// connection coherence, MongoShell's session survival, App's session restore —
+// each of which passes in isolation and on the next run.
+//
+// Two call sites had already been patched one at a time with `{ timeout: 2000 }`
+// and `{ timeout: 5000 }`, which is the same problem showing through. Raising
+// the default treats the whole class instead.
+//
+// This cannot mask a real failure: `waitFor` polls until the condition holds or
+// the budget runs out, so a longer budget changes only how long a genuinely
+// broken expectation takes to report — not whether it reports. It is kept well
+// under vitest's own `testTimeout` so a failure still surfaces as the
+// assertion error rather than as "test timed out".
+configure({ asyncUtilTimeout: 3000 });
 
 // Mock ResizeObserver for jsdom testing environment
 class MockResizeObserver {

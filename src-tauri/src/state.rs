@@ -148,6 +148,27 @@ pub struct AppState {
     /// full `Arc<AppState>` or a second copy of the token that could drift
     /// out of sync with a `mcp_regenerate_token` call.
     pub mcp: Arc<Mutex<mcp::McpControl>>,
+    /// Open vault-backed audit session (#272). `None` while the vault is locked.
+    ///
+    /// `Arc` for the same reason as `mcp`: a spawned background task (import,
+    /// copy, generate, restore) outlives the command that queued it and must
+    /// record its own terminal outcome without holding an `&AppState`.
+    pub audit: Arc<Mutex<Option<crate::audit::AuditSession>>>,
+    /// Why auditing is inactive despite an unlocked vault (#272) — a corrupt or
+    /// unreadable `audit.log.enc`. `Some` puts the app in an
+    /// explicit degraded state the UI surfaces, so an unlogged destructive
+    /// operation is never mistaken for an audited one.
+    pub audit_degraded: Mutex<Option<String>>,
+    /// Terminal events from background tasks that finished while the vault was
+    /// locked (#272). `vault_lock` does not cancel those tasks, so without this
+    /// their operations would stay recorded as `running` forever. Drained on the
+    /// next unlock.
+    pub audit_pending: Arc<Mutex<Vec<crate::audit::AuditEvent>>>,
+    /// Bumped by a vault reset (#272). A `TaskAuditContext` captures the value
+    /// current when its task was queued and refuses to record or park once it
+    /// no longer matches, so a task outlasting the vault it belonged to cannot
+    /// write into the next vault's history.
+    pub audit_generation: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -172,6 +193,10 @@ impl AppState {
             workspace_write_gen: Arc::new(AtomicU64::new(0)),
             connection_meta: Mutex::new(HashMap::new()),
             mcp: Arc::new(Mutex::new(mcp::McpControl::new())),
+            audit: Arc::new(Mutex::new(None)),
+            audit_degraded: Mutex::new(None),
+            audit_pending: Arc::new(Mutex::new(Vec::new())),
+            audit_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 

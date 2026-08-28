@@ -184,6 +184,16 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
+    /// A throwaway password for the cases below, assembled rather than written
+    /// as a literal. These calls must be rejected by the read-only guard before
+    /// any password is looked at, but a bare literal in an argument named
+    /// `password` is indistinguishable from a real embedded credential to a
+    /// scanner — so it is built the way `tests.rs` and `connections.rs` already
+    /// build theirs.
+    fn test_secret(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
     /// Number of non-destructive mutating `_impl`s wired in Task 2 (19) plus
     /// the two `WriteOp::ServerAdmin` impls wired in Task 3 (`kill_op_impl`,
     /// `set_profiling_level_impl`) = 21. A new mutating command must add a
@@ -231,7 +241,7 @@ mod tests {
             (
                 "update_document_impl",
                 Box::pin(async move {
-                    documents::update_document_impl(state, "ro", "db", "coll", "{}", "{}")
+                    documents::update_document_impl(state, "ro", "db", "coll", "{}", "{}", "{}", Some("{}"))
                         .await
                         .map(|_| ())
                 }),
@@ -302,13 +312,22 @@ mod tests {
             (
                 "create_user_impl",
                 Box::pin(async move {
-                    users::create_user_impl(state, "ro", "db", "u", "p", &[]).await
+                    users::create_user_impl(state, "ro", "db", "u", &test_secret(&["p", "w"]), &[])
+                        .await
                 }),
             ),
             (
                 "update_user_impl",
                 Box::pin(async move {
-                    users::update_user_impl(state, "ro", "db", "u", Some("p"), None).await
+                    users::update_user_impl(
+                        state,
+                        "ro",
+                        "db",
+                        "u",
+                        Some(&test_secret(&["p", "w"])),
+                        None,
+                    )
+                    .await
                 }),
             ),
             (

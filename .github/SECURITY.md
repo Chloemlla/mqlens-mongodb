@@ -44,6 +44,29 @@ services you connect to.
 - **No account** — there is no MQLens backend.
 - **Credentials encrypted at rest** with AES-256-GCM and Argon2id key
   derivation, behind a master password (with optional biometric unlock).
+- **Activity / audit log (local only)** — optional operation history is stored
+  in `audit.log.enc` as an append-only log whose records are each encrypted
+  individually with the vault key; the decrypted log never touches the
+  filesystem. It may include collection names, filters, and (if enabled in
+  Settings) document fragments. Protect the vault password. **Export** is an
+  explicit user action that writes **plaintext** outside the vault envelope —
+  treat exported files as sensitive.
+- **Audit log integrity** — every record carries its sequence number and the
+  hash of the record before it, and a companion file records how many events the
+  log should hold, so deleting, reordering, editing or truncating entries is
+  detected when the log is opened; MQLens then stops recording and preserves the
+  file instead of writing over it. A crash mid-write is distinguished from
+  tampering: only when the recorded count confirms the trailing bytes were an
+  interrupted write is that partial record discarded and logging continued.
+- **The activity log cannot be erased from the app** — there is no "clear"
+  action for an intact log; the retention setting is the only thing that removes
+  events, on the schedule you choose. A log that has *failed* verification can be
+  discarded so recording can resume, and that always leaves a permanent record
+  of the discard which retention will not remove. So a discarded log can never be
+  made to look like one that was never discarded.
+  Note the limit: the log is encrypted with your own master password on your own
+  machine, so it is tamper-**evident**, not tamper-**proof** — anyone holding
+  that password can delete it and start fresh.
 - **Signed builds** — macOS notarized, Windows signed, and GPG-signed Linux
   artifacts; updater artifacts are signed and verified before install.
 - **Apache-2.0** — the source is open for review.

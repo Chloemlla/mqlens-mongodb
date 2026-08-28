@@ -147,6 +147,10 @@
       "toggleTheme": {
         "keywords": "darstellung farbe modus appearance color",
         "title": "Hell-/Dunkelmodus umschalten"
+      },
+      "openActivity": {
+        "title": "Aktivität öffnen",
+        "keywords": "audit protokoll historie operationen löschen drop"
       }
     },
     "results_one": "{{count}} Ergebnis",
@@ -344,11 +348,13 @@
     "reconnectButton": "Erneut mit {{profile}} verbinden"
   },
   "statusBar": {
+    "activity": "Aktivität",
     "appVersion": "MQLens {{version}}",
     "backgroundTasks": "Hintergrundaufgaben",
     "cpu": "CPU {{value}}",
     "engineOnline": "MQLens-Engine online",
     "mongodb": "MongoDB {{value}}",
+    "openActivity": "Aktivitätsprotokoll öffnen",
     "ram": "RAM {{value}}",
     "resetZoom": "Zoom zurücksetzen ({{shortcut}})",
     "runningTasks_one": "{{count}} laufende Aufgabe",
@@ -529,7 +535,73 @@
       "detachToNewWindow": "In neues Fenster abdocken",
       "duplicateTab": "Tab duplizieren",
       "moveToWindow": "Verschieben nach {{target}}",
+      "tabColorDefault": "Tab-Farbe: Standard",
+      "tabColors": {
+        "amber": "Tab-Farbe: Bernstein",
+        "blue": "Tab-Farbe: Blau",
+        "green": "Tab-Farbe: Grün",
+        "orange": "Tab-Farbe: Orange",
+        "red": "Tab-Farbe: Rot",
+        "slate": "Tab-Farbe: Schiefergrau",
+        "violet": "Tab-Farbe: Violett"
+      },
       "unmirroredExplanation": "Export-/Import-Tabs bleiben in ihrem Fenster"
     }
+  },
+  "activity": {
+    "actions": {
+      "discardDamaged": "Beschädigtes Protokoll verwerfen",
+      "export": "Exportieren…",
+      "refresh": "Aktualisieren"
+    },
+    "columns": {
+      "connection": "Verbindung",
+      "namespace": "Namensraum",
+      "op": "Vorgang",
+      "source": "Quelle",
+      "status": "Ergebnis",
+      "summary": "Zusammenfassung",
+      "time": "Zeit"
+    },
+    "degradedBanner": "Die Aktivitätsprotokollierung läuft nicht: {{reason}}. Jetzt ausgeführte Operationen werden nicht aufgezeichnet.",
+    "degradedUnknownReason": "das verschlüsselte Protokoll konnte nicht geöffnet werden",
+    "detail": {
+      "args": "Argumente",
+      "duration": "Dauer",
+      "error": "Fehler",
+      "level": "Stufe bei Aufzeichnung"
+    },
+    "discardConfirm": "Dieses beschädigte Aktivitätsprotokoll verwerfen? Seine nicht überprüfbaren Ereignisse können nicht wiederhergestellt werden. Ein dauerhafter Vermerk über das Verwerfen bleibt erhalten.",
+    "discardDone_one": "1 nicht überprüfbares Ereignis verworfen. Die Aufzeichnung läuft wieder, und ein Vermerk über das Verwerfen bleibt im Protokoll.",
+    "discardDone_other": "{{count}} nicht überprüfbare Ereignisse verworfen. Die Aufzeichnung läuft wieder, und ein Vermerk über das Verwerfen bleibt im Protokoll.",
+    "droppedBanner_one": "{{count}} Ereignis wurde in dieser Sitzung verworfen (Speicher- oder Verschlüsselungsfehler).",
+    "droppedBanner_other": "{{count}} Ereignisse wurden in dieser Sitzung verworfen (Speicher- oder Verschlüsselungsfehler).",
+    "empty": "Noch keine Aktivität für die aktuellen Filter.",
+    "emptyLevelHint": "Bei Audit-Stufe A (Standard) werden nur Schreibvorgänge und Shell-Befehle protokolliert — keine Finds oder Navigation.",
+    "exportDone_one": "{{count}} Ereignis exportiert.",
+    "exportDone_other": "{{count}} Ereignisse exportiert.",
+    "exportFileType": "JSONL-Datei",
+    "exportPlaintextWarning": "Der Export schreibt eine Klartext-JSONL-Datei außerhalb des Tresors. Fortfahren?",
+    "filters": {
+      "op": "Vorgang",
+      "opPlaceholder": "z. B. dropCollection",
+      "status": "Ergebnis",
+      "statusAll": "Alle",
+      "statusError": "Fehlgeschlagen",
+      "statusOk": "Erfolgreich",
+      "summary": "Zusammenfassung enthält",
+      "summaryPlaceholder": "Zusammenfassung suchen…"
+    },
+    "header": {
+      "subtitle": "Lokales, tresorverschlüsseltes Protokoll von Datenbankoperationen.",
+      "title": "Aktivität"
+    },
+    "integrityBanner": "Integritätsprüfung des Aktivitätsprotokolls fehlgeschlagen: {{reason}}. Die Aufzeichnung wurde gestoppt und die Datei bleibt erhalten. Verwirf das beschädigte Protokoll, um die Aufzeichnung fortzusetzen.",
+    "loading": "Aktivität wird geladen…",
+    "lockedBody": "Entsperre den Tresor, um das Aktivitätsprotokoll anzuzeigen und zu exportieren.",
+    "lockedTitle": "Tresor ist gesperrt",
+    "retentionNote": "Alte Ereignisse werden automatisch durch die Aufbewahrungseinstellung entfernt. Ein intaktes Protokoll kann nicht gelöscht werden.",
+    "statusError": "Fehlgeschlagen",
+    "statusOk": "Erfolgreich"
   }
 }
