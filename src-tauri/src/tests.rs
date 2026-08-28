@@ -28,6 +28,458 @@ mod tests {
     }
 
     /// Build test-only passwords without hard-coded string literals for static analysis.
+    #[test]
+    fn model_listing_parses_both_http_shapes() {
+        use crate::ai::parse_models_json;
+        // OpenAI and Anthropic.
+        let openai = serde_json::json!({"object":"list","data":[
+            {"id":"gpt-4o","object":"model"},{"id":"gpt-4o-mini","object":"model"}]});
+        assert_eq!(parse_models_json(&openai).unwrap(), ["gpt-4o", "gpt-4o-mini"]);
+        let anthropic = serde_json::json!({"data":[
+            {"id":"claude-opus-4-8","display_name":"Claude Opus 4.8","type":"model"}]});
+        assert_eq!(parse_models_json(&anthropic).unwrap(), ["claude-opus-4-8"]);
+        // Ollama's native route, for servers that only half-pretend to be OpenAI.
+        let ollama = serde_json::json!({"models":[{"name":"llama3:latest"},{"name":"mistral:7b"}]});
+        assert_eq!(parse_models_json(&ollama).unwrap(), ["llama3:latest", "mistral:7b"]);
+    }
+
+    #[test]
+    fn model_listing_dedupes_and_skips_nameless_entries() {
+        use crate::ai::parse_models_json;
+        let v = serde_json::json!({"data":[{"id":"a"},{"id":"a"},{"object":"model"},{"id":"  "},{"id":"b"}]});
+        assert_eq!(parse_models_json(&v).unwrap(), ["a", "b"]);
+    }
+
+    #[test]
+    fn model_listing_explains_an_unrecognised_shape() {
+        use crate::ai::parse_models_json;
+        let err = parse_models_json(&serde_json::json!({"result":"ok"})).unwrap_err();
+        assert!(err.contains("`data`") && err.contains("`models`"), "{err}");
+        let err = parse_models_json(&serde_json::json!({"data":[]})).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn cli_model_listing_reads_a_table_under_its_header() {
+        use crate::ai::parse_models_cli_output;
+        let ollama = "NAME              ID            SIZE    MODIFIED\n\
+                      llama3:latest     365c0bd3c000  4.7 GB  2 days ago\n\
+                      mistral:7b        f974a74358d6  4.1 GB  3 weeks ago\n";
+        assert_eq!(parse_models_cli_output(ollama), ["llama3:latest", "mistral:7b"]);
+    }
+
+    #[test]
+    fn cli_model_listing_reads_prose_after_the_provider_label() {
+        use crate::ai::parse_models_cli_output;
+        let llm = "OpenAI Chat: gpt-4o (aliases: 4o)\n\
+                   OpenAI Chat: gpt-4o-mini\n\
+                   Anthropic Messages: claude-3-5-sonnet-latest\n";
+        assert_eq!(
+            parse_models_cli_output(llm),
+            ["gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet-latest"]
+        );
+    }
+
+    #[test]
+    fn cli_model_listing_keeps_colons_inside_names() {
+        // `llama3:latest` has a colon and no space after it — that is a name, not a
+        // provider label.
+        use crate::ai::parse_models_cli_output;
+        assert_eq!(parse_models_cli_output("llama3:latest\n"), ["llama3:latest"]);
+    }
+
+    #[test]
+    fn cli_model_listing_ignores_blank_lines_and_duplicates() {
+        use crate::ai::parse_models_cli_output;
+        assert_eq!(parse_models_cli_output("\n  a  \n\na\nb\n\n"), ["a", "b"]);
+        assert!(parse_models_cli_output("").is_empty());
+        assert!(parse_models_cli_output("NAME SIZE\n").is_empty(), "header only = nothing");
+    }
+
+    #[test]
+    fn the_model_placeholder_is_substituted_as_its_own_argument() {
+        use crate::ai::parse_command_template;
+        let (prog, args) =
+            parse_command_template("ollama run {model} {prompt}", "find users", "llama3:latest").unwrap();
+        assert_eq!(prog, "ollama");
+        assert_eq!(args, ["run", "llama3:latest", "find users"]);
+    }
+
+    #[tokio::test]
+    async fn a_pasted_key_is_trimmed_before_it_reaches_the_headers() {
+        // Model loading runs on the uncommitted draft, so the trim on the save
+        // path came too late: a key pasted with a trailing newline went out raw
+        // and came back 401, while the same provider worked after saving.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = br#"{"data":[{"id":"m1"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+            sock.flush().await.unwrap();
+            received
+        });
+
+        let models = crate::ai::list_models_http(
+            crate::ai_providers::ProviderKind::OpenAiCompatible,
+            &format!("http://{addr}/v1/models"),
+            "  sk-padded\n",
+            "Test provider",
+        )
+        .await
+        .expect("the stub answers");
+        assert_eq!(models, ["m1"]);
+
+        let received = served.await.unwrap();
+        assert!(
+            received.contains("Bearer sk-padded\r\n"),
+            "the key must reach the header trimmed on both ends: {received}"
+        );
+    }
+
+    #[test]
+    fn a_custom_provider_aimed_at_a_built_in_cloud_service_still_needs_a_key() {
+        // The presets are what the form offers; OpenAI, Anthropic and Gemini are
+        // reached through their own settings fields and appear in no preset — so
+        // a custom provider pointed at `https://api.openai.com/v1` slipped past
+        // the preset lookup and posted the schema and prompt unauthenticated.
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        let aimed_at = |url: &str| AiProvider {
+            id: "p".into(),
+            name: "My provider".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: url.into(),
+            api_key: String::new(),
+            model: "m".into(),
+            command: String::new(),
+            models_command: String::new(),
+        };
+        for (url, service) in [
+            ("https://api.openai.com/v1", "OpenAI"),
+            ("https://api.anthropic.com/v1", "Anthropic"),
+            ("https://generativelanguage.googleapis.com/v1beta/models", "Google Gemini"),
+        ] {
+            let err = aimed_at(url).validate().unwrap_err();
+            assert!(err.contains("needs an API key"), "{url}: {err}");
+            assert!(err.contains(service), "the reason names the service: {err}");
+            let mut with_key = aimed_at(url);
+            with_key.api_key = "sk-key".into();
+            with_key.validate().unwrap_or_else(|e| panic!("{url} with a key: {e}"));
+        }
+        // The URLs are the built-in constants, not copies, so they cannot drift.
+        assert!(crate::ai::OPENAI_URL.starts_with("https://api.openai.com/"));
+        assert!(crate::ai::ANTHROPIC_URL.starts_with("https://api.anthropic.com/"));
+    }
+
+    #[test]
+    fn a_quoted_path_survives_command_parsing() {
+        // `split_whitespace` kept the quotes and split the path, so Python got
+        // two malformed arguments and listing failed for a valid setup.
+        use crate::ai::split_command_line;
+        assert_eq!(
+            split_command_line(r#"python3 "/Users/me/My Scripts/models.py" --json"#).unwrap(),
+            ["python3", "/Users/me/My Scripts/models.py", "--json"]
+        );
+        assert_eq!(
+            split_command_line("llm 'my model' --n 5").unwrap(),
+            ["llm", "my model", "--n", "5"]
+        );
+        // An escaped space needs no quotes, and a backslash is literal inside
+        // single quotes, as in a shell. Off Windows: see the Windows test below.
+        assert_eq!(
+            crate::ai::split_command_line_for(r"cmd /My\ Path/x", false).unwrap(),
+            ["cmd", "/My Path/x"]
+        );
+        assert_eq!(split_command_line(r"cmd 'a'").unwrap(), ["cmd", r"a"]);
+        // An empty quoted argument is a real argument.
+        assert_eq!(split_command_line(r#"cmd "" x"#).unwrap(), ["cmd", "", "x"]);
+    }
+
+    #[test]
+    fn an_unclosed_quote_or_dangling_backslash_is_refused_rather_than_guessed() {
+        use crate::ai::split_command_line;
+        let err = split_command_line("python3 \"/My Scripts/x.py").unwrap_err();
+        assert!(err.contains("unclosed"), "{err}");
+        // A trailing backslash escapes nothing; guessing what was meant would be
+        // worse than saying so. Off Windows, where a backslash is an escape.
+        let err = crate::ai::split_command_line_for("cmd x\\", false).unwrap_err();
+        assert!(err.contains("dangling"), "{err}");
+        // An escaped backslash is a literal one.
+        assert_eq!(
+            crate::ai::split_command_line_for("cmd x\\\\", false).unwrap(),
+            ["cmd", "x\\"]
+        );
+    }
+
+    #[test]
+    fn a_windows_path_keeps_its_separators_instead_of_being_eaten_as_escapes() {
+        // `C:\tools\ollama.exe list` was reaching the OS as the program
+        // `C:toolsollama.exe`: every unquoted backslash consumed the character
+        // after it, so an ordinary Windows command could not run at all.
+        use crate::ai::split_command_line_for;
+        assert_eq!(
+            split_command_line_for(r"C:\tools\ollama.exe list", true).unwrap(),
+            [r"C:\tools\ollama.exe", "list"]
+        );
+        // Quotes still group, which is what a path with spaces needs...
+        assert_eq!(
+            split_command_line_for(r#""C:\Program Files\Ollama\ollama.exe" list"#, true).unwrap(),
+            [r"C:\Program Files\Ollama\ollama.exe", "list"]
+        );
+        // ...and a trailing separator before the closing quote stays a separator
+        // rather than escaping the quote and swallowing the rest of the line.
+        assert_eq!(
+            split_command_line_for(r#""C:\Program Files\Ollama\" list"#, true).unwrap(),
+            [r"C:\Program Files\Ollama\", "list"]
+        );
+        // A lone trailing backslash is a path separator here, not a dangling
+        // escape, so there is nothing to refuse.
+        assert_eq!(split_command_line_for(r"cmd x\", true).unwrap(), ["cmd", r"x\"]);
+    }
+
+    #[test]
+    fn nothing_is_expanded_the_way_a_shell_would() {
+        // The command is executed directly, never through a shell, so these must
+        // arrive verbatim rather than being interpreted.
+        use crate::ai::split_command_line;
+        assert_eq!(
+            split_command_line("cmd $HOME *.py ~/x `id`").unwrap(),
+            ["cmd", "$HOME", "*.py", "~/x", "`id`"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_template_keeps_its_argument_whole() {
+        use crate::ai::parse_command_template;
+        let (prog, args) =
+            parse_command_template(r#""/opt/My Agents/run" --prompt={prompt}"#, "find users", "").unwrap();
+        assert_eq!(prog, "/opt/My Agents/run");
+        assert_eq!(args, ["--prompt=find users"]);
+    }
+
+    #[test]
+    fn placeholders_are_substituted_inside_a_token_too() {
+        // `agent --prompt={prompt}` passed validation but the old parser only
+        // matched a whole-token `{prompt}`, so the CLI got the literal text plus
+        // the prompt appended as an extra argument.
+        use crate::ai::parse_command_template;
+        let (prog, args) =
+            parse_command_template("agent --model={model} --prompt={prompt}", "find users", "m1").unwrap();
+        assert_eq!(prog, "agent");
+        assert_eq!(args, ["--model=m1", "--prompt=find users"]);
+    }
+
+    #[test]
+    fn the_model_placeholder_without_a_model_is_an_error_not_an_empty_argument() {
+        use crate::ai::parse_command_template;
+        // An empty argument would make the CLI run its default model silently,
+        // which is not what the user configured.
+        let err = parse_command_template("ollama run {model} {prompt}", "p", "").unwrap_err();
+        assert!(err.contains("{model}"), "{err}");
+    }
+
+    #[test]
+    fn templates_without_the_model_placeholder_are_unchanged() {
+        use crate::ai::parse_command_template;
+        let (prog, args) = parse_command_template("claude -p {prompt}", "find users", "ignored").unwrap();
+        assert_eq!(prog, "claude");
+        assert_eq!(args, ["-p", "find users"]);
+    }
+
+    #[test]
+    fn settings_writes_go_through_the_durable_helper() {
+        // Interrupting a write mid-call is not reproducible in-process, so the
+        // guard is at the source level — and this is the claim that was wrong
+        // once: the atomic call had been applied to the *profiles* writer while
+        // the settings writer, which every patch touches, still truncated in
+        // place. A behavioural test could not see the difference, which is why
+        // the first version of it passed.
+        let src = include_str!("connections.rs");
+        for writer in [
+            "pub fn save_settings_encrypted",
+            "pub fn save_profiles_encrypted",
+            "pub fn write_vault_meta",
+        ] {
+            let start = src.find(writer).unwrap_or_else(|| panic!("{writer} not found"));
+            let body = &src[start..start + src[start..].find("\n}").unwrap()];
+            assert!(
+                body.contains("durable::write_atomic"),
+                "{writer} must write atomically; found a bare write"
+            );
+            assert!(!body.contains("fs::write("), "{writer} still calls fs::write directly");
+        }
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_encrypted_file() {
+        use crate::connections::{load_settings_encrypted, save_settings_encrypted, AppSettings};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.enc");
+        let key = [3u8; 32];
+        let mut st = AppSettings::default();
+        st.ai_provider = "deepseek".into();
+        save_settings_encrypted(&path, &key, &st).unwrap();
+        assert!(!dir.path().join("settings.enc.tmp").exists(), "temp file left behind");
+        assert_eq!(load_settings_encrypted(&path, &key).unwrap().ai_provider, "deepseek");
+    }
+
+    #[test]
+    fn a_settings_patch_replaces_only_its_own_fields() {
+        use crate::connections::{merge_settings_patch, AppSettings};
+        let mut current = AppSettings::default();
+        current.locale = "de".into();
+        current.mongosh_path = "/opt/mongosh".into();
+        let patch = serde_json::json!({ "ai_provider": "deepseek", "ai_providers": [] });
+        let merged = merge_settings_patch(&current, &patch).unwrap();
+        assert_eq!(merged.ai_provider, "deepseek");
+        assert_eq!(merged.locale, "de", "untouched field survives");
+        assert_eq!(merged.mongosh_path, "/opt/mongosh");
+    }
+
+    #[test]
+    fn a_settings_patch_rejects_unknown_fields_and_bad_values() {
+        use crate::connections::{merge_settings_patch, AppSettings};
+        let current = AppSettings::default();
+        let err = merge_settings_patch(&current, &serde_json::json!({ "ai_provdier": "x" })).unwrap_err();
+        assert!(err.contains("unknown settings field `ai_provdier`"), "{err}");
+        let err = merge_settings_patch(&current, &serde_json::json!({ "audit_retention_days": "thirty" })).unwrap_err();
+        assert!(err.contains("invalid settings patch"), "{err}");
+        assert!(merge_settings_patch(&current, &serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn the_prompt_text_is_never_scanned_for_placeholders() {
+        use crate::ai::parse_command_template;
+        // The prompt is user content and may say "{model}" literally.
+        let (_, args) = parse_command_template("agent --model={model} {prompt}", r#"find "{model}""#, "m1").unwrap();
+        assert_eq!(args, ["--model=m1", r#"find "{model}""#]);
+        // …and a prompt containing "{prompt}" is not re-expanded either.
+        let (_, args) = parse_command_template("agent {prompt}", "say {prompt}", "").unwrap();
+        assert_eq!(args, ["say {prompt}"]);
+    }
+
+    /// Resolution has to keep working for the settings already in people's
+    /// vaults: the three original providers store their keys in dedicated fields,
+    /// not in the new list, and a stored `ai_provider` must keep selecting them.
+    #[test]
+    fn resolve_ai_provider_keeps_the_built_ins_working() {
+        use crate::ai_providers::ProviderKind;
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "openai".into();
+        // A fresh install has no key; the old adapter refused before any request
+        // and the resolver must too, or the schema and prompt go to the cloud
+        // unauthenticated.
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("No OpenAI API key"), "{err}");
+        settings.ai_provider = "anthropic".into();
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("No Anthropic API key"), "{err}");
+        settings.anthropic_api_key = test_secret(&["sk-", "ant"]);
+        settings.ai_provider = "openai".into();
+        settings.openai_api_key = test_secret(&["sk-", "test"]);
+        let p = resolve_ai_provider(&settings).expect("openai resolves");
+        assert_eq!(p.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(p.endpoint().unwrap(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(p.api_key, settings.openai_api_key);
+        assert_eq!(p.model, "gpt-4o", "an empty stored model falls back");
+
+        settings.ai_provider = "anthropic".into();
+        settings.anthropic_model = "claude-3-5-sonnet".into();
+        let p = resolve_ai_provider(&settings).expect("anthropic resolves with a key");
+        assert_eq!(p.kind, ProviderKind::AnthropicCompatible);
+        assert_eq!(p.endpoint().unwrap(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(p.model, "claude-3-5-sonnet", "a stored model is respected");
+    }
+
+    #[test]
+    fn resolve_ai_provider_keeps_the_built_in_local_agents_working() {
+        use crate::ai_providers::ProviderKind;
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "claude-code".into();
+        let p = resolve_ai_provider(&settings).expect("claude-code resolves");
+        assert_eq!(p.kind, ProviderKind::LocalCli);
+        assert_eq!(p.command, "claude -p {prompt}", "the built-in default template");
+
+        settings
+            .local_commands
+            .insert("claude-code".into(), "claude --model opus -p {prompt}".into());
+        let p = resolve_ai_provider(&settings).expect("resolves");
+        assert_eq!(p.command, "claude --model opus -p {prompt}", "user override wins");
+    }
+
+    #[test]
+    fn resolve_ai_provider_finds_a_user_added_provider() {
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_providers.push(AiProvider {
+            id: "my-deepseek".into(),
+            name: "DeepSeek".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.deepseek.com/v1".into(),
+            api_key: test_secret(&["ds-", "key"]),
+            model: "deepseek-chat".into(),
+            command: String::new(),
+            models_command: String::new(),
+        });
+        settings.ai_provider = "my-deepseek".into();
+
+        let p = resolve_ai_provider(&settings).expect("custom provider resolves");
+        assert_eq!(p.name, "DeepSeek");
+        assert_eq!(p.endpoint().unwrap(), "https://api.deepseek.com/v1/chat/completions");
+        p.validate().expect("valid");
+    }
+
+    /// Gemini is dispatched to its own adapter before the resolver runs. If a
+    /// future change routes it through here anyway, the error must say that —
+    /// not hand back a placeholder that fails validation for the wrong reason.
+    #[test]
+    fn resolve_ai_provider_refuses_gemini_with_the_real_reason() {
+        use crate::connections::{resolve_ai_provider, AppSettings};
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "gemini".into();
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("own adapter"), "must name the real cause: {err}");
+        assert!(!err.contains("endpoint"), "must not blame the config: {err}");
+    }
+
+    #[test]
+    fn resolve_ai_provider_names_the_provider_it_cannot_find() {
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "deleted-provider".into();
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("deleted-provider"), "{err}");
+        assert!(err.contains("Settings"), "should say where to fix it: {err}");
+    }
+
+    /// Settings written before this feature existed have no `ai_providers` key at
+    /// all; serde must read them rather than failing the whole vault load.
+    #[test]
+    fn settings_without_the_provider_list_still_deserialize() {
+        let json = r#"{"ai_provider":"openai","openai_api_key":"x","openai_model":"gpt-4o"}"#;
+        let settings: crate::connections::AppSettings =
+            serde_json::from_str(json).expect("older settings must still load");
+        assert_eq!(settings.ai_provider, "openai");
+        assert!(settings.ai_providers.is_empty());
+    }
+
     fn test_secret(parts: &[&str]) -> String {
         parts.concat()
     }
@@ -2906,7 +3358,7 @@ mod tests {
 
         // {prompt} becomes a single argv element, even with spaces/quotes/shell metachars.
         let (prog, args) =
-            parse_command_template("claude -p {prompt}", "find users; rm -rf / $(whoami)").unwrap();
+            parse_command_template("claude -p {prompt}", "find users; rm -rf / $(whoami)", "").unwrap();
         assert_eq!(prog, "claude");
         assert_eq!(
             args,
@@ -2917,12 +3369,12 @@ mod tests {
         );
 
         // No {prompt} placeholder -> append prompt as final arg.
-        let (prog, args) = parse_command_template("codex exec", "hi there").unwrap();
+        let (prog, args) = parse_command_template("codex exec", "hi there", "").unwrap();
         assert_eq!(prog, "codex");
         assert_eq!(args, vec!["exec".to_string(), "hi there".to_string()]);
 
         // Empty template is an error.
-        assert!(parse_command_template("   ", "x").is_err());
+        assert!(parse_command_template("   ", "x", "").is_err());
     }
 
     #[tokio::test]
@@ -2932,6 +3384,7 @@ mod tests {
         let res = generate_local(
             "definitely-not-a-real-binary-xyz -p {prompt}",
             "find active users",
+            "", // no {model} in this template
         )
         .await;
         assert!(res.is_err());

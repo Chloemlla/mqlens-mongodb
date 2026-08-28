@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub mod limits;
 pub mod ai;
+pub mod ai_providers;
 pub mod audit;
 #[cfg(test)]
 mod command_coverage;
@@ -1134,6 +1135,69 @@ async fn get_resource_usage(state: tauri::State<'_, AppState>) -> Result<Resourc
     Ok(resource_usage_impl(&state))
 }
 
+/// The provider presets the settings form can prefill from.
+///
+/// Served from Rust rather than duplicated in TypeScript: the endpoints are also
+/// what the request adapters build URLs from, and two copies of a base URL is one
+/// copy too many.
+#[tauri::command]
+fn ai_provider_presets() -> Vec<serde_json::Value> {
+    ai_providers::PRESETS
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "kind": p.kind,
+                "baseUrl": p.base_url,
+                "model": p.model,
+                "command": p.command,
+                "modelsCommand": p.models_command,
+                "needsKey": p.needs_key,
+            })
+        })
+        .collect()
+}
+
+/// The instructions MQLens's MCP server gives an agent.
+///
+/// Exposed so Settings can show and copy them: a user pointing an external client
+/// (opencode, Claude Desktop, a local CLI) at MQLens gets the same guidance the
+/// embedded server sends, instead of having to write a system prompt themselves.
+#[tauri::command]
+fn mcp_agent_instructions() -> &'static str {
+    mcp::AGENT_INSTRUCTIONS
+}
+
+/// The models a provider offers, for the settings form to pick from.
+///
+/// HTTP kinds are asked over `GET .../models` with the configured key; a CLI is
+/// asked by running its `models_command`. Either way a failure is reported with
+/// the provider named, and the form keeps the model field typeable, so this can
+/// only ever help.
+#[tauri::command]
+async fn list_ai_models(provider: ai_providers::AiProvider) -> Result<Vec<String>, String> {
+    match provider.kind {
+        ai_providers::ProviderKind::LocalCli => {
+            ai::list_models_cli(&provider.models_command).await
+        }
+        kind => {
+            ai::list_models_http(kind, &provider.models_endpoint()?, &provider.api_key, &provider.name)
+                .await
+        }
+    }
+}
+
+/// Check a provider's configuration without sending a prompt to it.
+#[tauri::command]
+fn validate_ai_provider(provider: ai_providers::AiProvider) -> Result<String, String> {
+    provider.validate()?;
+    match provider.kind {
+        ai_providers::ProviderKind::LocalCli => Ok(provider.command.clone()),
+        _ => provider.endpoint(),
+    }
+}
+
 #[tauri::command]
 async fn generate_mql_query(
     app_handle: tauri::AppHandle,
@@ -1167,44 +1231,52 @@ async fn generate_mql_query(
     };
     let system = ai::apply_custom_instructions(&base_system, &settings.ai_custom_instructions);
 
-    match settings.ai_provider.as_str() {
-        "anthropic" => {
-            let model = if settings.anthropic_model.trim().is_empty() {
-                "claude-opus-4-8".to_string()
-            } else {
-                settings.anthropic_model.clone()
-            };
-            ai::generate_anthropic(
-                &settings.anthropic_api_key,
-                &model,
+    // Gemini keeps a dedicated arm: its request and response shapes are neither
+    // OpenAI's nor Anthropic's, so it is the one provider that cannot be
+    // described as "an endpoint speaking a known format".
+    if settings.ai_provider.trim() == "gemini" {
+        let model = if settings.gemini_model.trim().is_empty() {
+            "gemini-1.5-flash".to_string()
+        } else {
+            settings.gemini_model.clone()
+        };
+        return ai::generate_gemini(&settings.gemini_api_key, &model, &system, &history, &prompt)
+            .await;
+    }
+
+    // Everything else — the built-ins and anything the user added — is resolved
+    // to one shape and dispatched on its wire format.
+    let provider = connections::resolve_ai_provider(&settings)?;
+    provider.validate()?;
+    match provider.kind {
+        ai_providers::ProviderKind::OpenAiCompatible => {
+            ai::generate_openai_compatible(
+                &provider.endpoint()?,
+                &provider.api_key,
+                &provider.model,
+                &provider.name,
                 &system,
                 &history,
                 &prompt,
             )
             .await
         }
-        "openai" => {
-            let model = if settings.openai_model.trim().is_empty() {
-                "gpt-4o".to_string()
-            } else {
-                settings.openai_model.clone()
-            };
-            ai::generate_openai(&settings.openai_api_key, &model, &system, &history, &prompt).await
+        ai_providers::ProviderKind::AnthropicCompatible => {
+            ai::generate_anthropic_compatible(
+                &provider.endpoint()?,
+                &provider.api_key,
+                &provider.model,
+                &provider.name,
+                &system,
+                &history,
+                &prompt,
+            )
+            .await
         }
-        "gemini" => {
-            let model = if settings.gemini_model.trim().is_empty() {
-                "gemini-1.5-flash".to_string()
-            } else {
-                settings.gemini_model.clone()
-            };
-            ai::generate_gemini(&settings.gemini_api_key, &model, &system, &history, &prompt).await
-        }
-        agent @ ("claude-code" | "codex" | "cursor" | "antigravity") => {
-            let template = connections::resolve_local_command(&settings, agent);
+        ai_providers::ProviderKind::LocalCli => {
             let one_prompt = ai::combined_prompt(&system, &history, &prompt);
-            ai::generate_local(&template, &one_prompt).await
+            ai::generate_local(&provider.command, &one_prompt, &provider.model).await
         }
-        other => Err(format!("Unknown AI provider: {}", other)),
     }
 }
 
@@ -2281,6 +2353,27 @@ async fn load_app_settings(
     connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)
 }
 
+/// Change only the named fields, under the settings write lock.
+///
+/// The load → merge → save happens here, on one side of the IPC boundary and
+/// inside one lock, so concurrent callers — the provider list, the locale, the
+/// theme, the shell path — serialize and each sees the other's write.
+#[tauri::command]
+async fn patch_app_settings(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    patch: serde_json::Value,
+) -> Result<connections::AppSettings, String> {
+    let key = state.require_key()?;
+    let path = connections::get_settings_enc_path(&app_handle);
+    let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
+    let current = connections::load_settings_encrypted(&path, &key)?;
+    let merged = connections::merge_settings_patch(&current, &patch)?;
+    connections::save_settings_encrypted(&path, &key, &merged)?;
+    audit::refresh_policy_from_settings(&state, &merged);
+    Ok(merged)
+}
+
 #[tauri::command]
 async fn save_app_settings(
     app_handle: tauri::AppHandle,
@@ -2288,6 +2381,9 @@ async fn save_app_settings(
     settings: connections::AppSettings,
 ) -> Result<(), String> {
     let key = state.require_key()?;
+    // Same lock as `patch_app_settings`, so a whole-object save cannot
+    // interleave with a field patch.
+    let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
     connections::save_settings_encrypted(
         &connections::get_settings_enc_path(&app_handle),
         &key,
@@ -2671,6 +2767,10 @@ pub fn run() {
             preview_restore_command,
             get_resource_usage,
             generate_mql_query,
+            ai_provider_presets,
+            mcp_agent_instructions,
+            validate_ai_provider,
+            list_ai_models,
             detect_local_agents,
             get_mongodb_version,
             start_mongosh_session,
@@ -2752,6 +2852,7 @@ pub fn run() {
             connections::test_connection_uri,
             load_app_settings,
             save_app_settings,
+            patch_app_settings,
             audit_list,
             audit_export,
             audit_open_folder,

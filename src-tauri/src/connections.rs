@@ -164,6 +164,15 @@ pub struct AppSettings {
     // Per-local-agent command templates (agent id -> template). Missing -> built-in default.
     #[serde(default)]
     pub local_commands: std::collections::HashMap<String, String>,
+    /// Providers the user added themselves (#283).
+    ///
+    /// Kept alongside the three original per-vendor key fields rather than
+    /// replacing them: those fields are already written into every existing
+    /// vault, and migrating them on read would rewrite an encrypted file just to
+    /// change its shape. `ai_provider` names either a built-in id or an entry
+    /// here, and `resolve_ai_provider` looks in both.
+    #[serde(default)]
+    pub ai_providers: Vec<crate::ai_providers::AiProvider>,
     // Extra instructions appended to the generated system prompt for any provider.
     #[serde(default)]
     pub ai_custom_instructions: String,
@@ -203,6 +212,7 @@ impl Default for AppSettings {
             gemini_api_key: String::new(),
             gemini_model: default_gemini_model(),
             local_commands: std::collections::HashMap::new(),
+            ai_providers: Vec::new(),
             ai_custom_instructions: String::new(),
             ai_history_retention_months: default_ai_history_retention_months(),
             audit_enabled: default_audit_enabled(),
@@ -223,6 +233,128 @@ pub fn default_local_command(agent: &str) -> &'static str {
         "cursor" => "cursor-agent -p {prompt}",
         "antigravity" => "antigravity {prompt}",
         _ => "{prompt}",
+    }
+}
+
+/// `current` with the top-level fields in `patch` replaced.
+///
+/// A patch names only the fields its caller owns, so writers that run at the
+/// same time cannot erase each other's changes the way whole-object saves do.
+/// An unknown field is an error rather than silently ignored: a typo in a caller
+/// would otherwise look like a save that took effect.
+pub fn merge_settings_patch(
+    current: &AppSettings,
+    patch: &serde_json::Value,
+) -> Result<AppSettings, String> {
+    let serde_json::Value::Object(patch) = patch else {
+        return Err("settings patch must be a JSON object".into());
+    };
+    let mut merged = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(map) = &mut merged else { unreachable!() };
+    for (k, v) in patch {
+        if !map.contains_key(k) {
+            return Err(format!("unknown settings field `{k}`"));
+        }
+        map.insert(k.clone(), v.clone());
+    }
+    serde_json::from_value(merged).map_err(|e| format!("invalid settings patch: {e}"))
+}
+
+/// The provider `settings.ai_provider` names, in a single shape.
+///
+/// The three original providers keep their dedicated key/model fields, so they
+/// are described here rather than stored as list entries — that way an existing
+/// vault needs no migration and the settings UI can keep its familiar layout for
+/// them. Anything else is looked up among the user's own providers.
+pub fn resolve_ai_provider(
+    settings: &AppSettings,
+) -> Result<crate::ai_providers::AiProvider, String> {
+    use crate::ai_providers::{AiProvider, ProviderKind};
+    let id = settings.ai_provider.trim();
+
+    let built_in = |name: &str, kind, base_url: &str, api_key: &str, model: &str, fallback: &str| {
+        AiProvider {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind,
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: if model.trim().is_empty() {
+                fallback.to_string()
+            } else {
+                model.trim().to_string()
+            },
+            command: String::new(),
+            models_command: String::new(),
+        }
+    };
+
+    // The two cloud built-ins are never keyless. The generic adapters allow an
+    // empty key because local servers ignore credentials — but for these two an
+    // empty key means "not set up", and the old adapters refused before making
+    // any request. Keep that: otherwise a fresh install posts the collection
+    // schema, the instructions and the prompt to the cloud unauthenticated.
+    let require_key = |vendor: &str, key: &str| -> Result<(), String> {
+        if key.trim().is_empty() {
+            Err(format!("No {vendor} API key set. Add one in Settings."))
+        } else {
+            Ok(())
+        }
+    };
+    match id {
+        "anthropic" => {
+            require_key("Anthropic", &settings.anthropic_api_key)?;
+        }
+        "openai" => {
+            require_key("OpenAI", &settings.openai_api_key)?;
+        }
+        _ => {}
+    }
+    match id {
+        "anthropic" => Ok(built_in(
+            "Anthropic",
+            ProviderKind::AnthropicCompatible,
+            "https://api.anthropic.com/v1",
+            &settings.anthropic_api_key,
+            &settings.anthropic_model,
+            "claude-opus-4-8",
+        )),
+        "openai" => Ok(built_in(
+            "OpenAI",
+            ProviderKind::OpenAiCompatible,
+            "https://api.openai.com/v1",
+            &settings.openai_api_key,
+            &settings.openai_model,
+            "gpt-4o",
+        )),
+        // Gemini is not a shape this type can describe: its request and response
+        // formats are neither OpenAI's nor Anthropic's, so `generate_mql_query`
+        // dispatches it to its own adapter *before* consulting this resolver. Saying
+        // so beats returning a placeholder struct whose `validate()` would fail
+        // with "no endpoint URL" — a message that points at the wrong problem.
+        "gemini" => Err(
+            "Gemini uses its own adapter and is dispatched before provider resolution; \
+             this is a bug in the caller, not a configuration problem."
+                .to_string(),
+        ),
+        agent @ ("claude-code" | "codex" | "cursor" | "antigravity") => Ok(AiProvider {
+            id: id.to_string(),
+            name: agent.to_string(),
+            kind: ProviderKind::LocalCli,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            command: resolve_local_command(settings, agent),
+            models_command: String::new(),
+        }),
+        other => settings
+            .ai_providers
+            .iter()
+            .find(|p| p.id == other)
+            .cloned()
+            .ok_or_else(|| {
+                format!("Unknown AI provider: {other}. Choose one in Settings → AI.")
+            }),
     }
 }
 
@@ -498,7 +630,11 @@ pub fn read_vault_meta(path: &Path) -> Result<Option<VaultMeta>, String> {
 pub fn write_vault_meta(path: &Path, meta: &VaultMeta) -> Result<(), String> {
     let content =
         serde_json::to_string_pretty(meta).map_err(|e| format!("serialize vault.json: {e}"))?;
-    fs::write(path, content).map_err(|e| format!("write vault.json: {e}"))
+    // The most consequential of the three: this file holds the KDF parameters
+    // and the unlock verifier, so a truncated write leaves a vault no password
+    // can open. Written on unlock-password changes, which is exactly when a
+    // second instance may also be writing.
+    crate::durable::write_atomic(path, content.as_bytes())
 }
 
 pub fn save_profiles_encrypted(
@@ -509,7 +645,9 @@ pub fn save_profiles_encrypted(
     let json = serde_json::to_vec(profiles)
         .map_err(|e| format!("serialize connections: {e}"))?;
     let blob = crate::vault::encrypt(key, &json)?;
-    fs::write(path, blob).map_err(|e| format!("write {}: {e}", path.display()))
+    // Same reasoning as the settings writer, and the stake is higher: this file
+    // holds every saved connection, so a truncated write loses all of them.
+    crate::durable::write_atomic(path, &blob)
 }
 
 pub fn load_profiles_encrypted(
@@ -534,7 +672,10 @@ pub fn save_settings_encrypted(
 ) -> Result<(), String> {
     let json = serde_json::to_vec(settings).map_err(|e| format!("serialize settings: {e}"))?;
     let blob = crate::vault::encrypt(key, &json)?;
-    fs::write(path, blob).map_err(|e| format!("write {}: {e}", path.display()))
+    // Atomic: a bare `fs::write` truncates first, so an exit or a second
+    // instance writing at the same moment leaves a partial ciphertext that
+    // decrypts to nothing — and this file is written on every settings patch.
+    crate::durable::write_atomic(path, &blob)
 }
 
 pub fn load_settings_encrypted(path: &Path, key: &[u8; 32]) -> Result<AppSettings, String> {
@@ -946,6 +1087,19 @@ mod rotation_tests {
         assert!(meta_path.exists(), "metadata must be written last but written");
     }
 
+    /// A path whose write must fail, without depending on the staging name.
+    ///
+    /// The staging path is unpredictable by design, so a test cannot block it.
+    /// Instead the target sits *under a regular file*: `read_backup` sees nothing
+    /// there (so the pre-write snapshot succeeds, which is the point — the
+    /// rollback path is only reached when the write itself fails), and
+    /// `write_atomic`'s `create_dir_all` then fails on the non-directory parent.
+    fn blocked_path(dir: &Path) -> PathBuf {
+        let not_a_dir = dir.join("not-a-dir");
+        fs::write(&not_a_dir, b"regular file").unwrap();
+        not_a_dir.join("blocked.enc")
+    }
+
     #[test]
     fn a_failed_write_restores_every_earlier_file() {
         let dir = tempdir().unwrap();
@@ -954,11 +1108,7 @@ mod rotation_tests {
         fs::write(&good, b"old-good").unwrap();
         fs::write(&meta_path, b"old-meta").unwrap();
 
-        // `write_atomic` stages through `<path>.tmp`; a directory there makes the
-        // *write* fail (not the pre-write snapshot), which is the path that has
-        // to roll back what it already committed.
-        let blocked = dir.path().join("blocked.enc");
-        fs::create_dir(dir.path().join("blocked.enc.tmp")).unwrap();
+        let blocked = blocked_path(dir.path());
 
         let err = commit_vault_rotation(
             vec![
@@ -988,8 +1138,7 @@ mod rotation_tests {
         let dir = tempdir().unwrap();
         let fresh = dir.path().join("settings.json.enc");
         let meta_path = dir.path().join("vault.json");
-        let blocked = dir.path().join("blocked.enc");
-        fs::create_dir(dir.path().join("blocked.enc.tmp")).unwrap();
+        let blocked = blocked_path(dir.path());
 
         commit_vault_rotation(
             vec![

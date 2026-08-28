@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef} from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import {
@@ -40,6 +40,7 @@ import { AppearanceSettings } from '@/components/theme/AppearanceSettings';
 import { KeyboardShortcutsSettings } from '@/components/KeyboardShortcutsSettings';
 import type { AppearanceSettings as AppearanceSettingsType } from '@/lib/themes/schema';
 import { Button } from '@/components/ui/button';
+import { AiProviderManager, type AiProvider } from '@/components/AiProviderManager';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -73,6 +74,7 @@ interface AppSettings {
   gemini_api_key?: string;
   gemini_model?: string;
   local_commands?: Record<string, string>;
+  ai_providers?: AiProvider[];
   ai_custom_instructions?: string;
   ai_history_retention_months?: number;
   audit_enabled?: boolean;
@@ -233,6 +235,18 @@ const McpSettingsPanel: React.FC = () => {
   const [regenerated, setRegenerated] = useState(false);
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  // The instructions MQLens's own MCP server sends. Shown here so a user
+  // pointing an external client at MQLens can paste the same guidance instead of
+  // writing a system prompt themselves.
+  const [agentPrompt, setAgentPrompt] = useState('');
+
+  useEffect(() => {
+    invoke<string>('mcp_agent_instructions')
+      .then(setAgentPrompt)
+      // Purely informational: the embedded server sends these regardless, so a
+      // failure to display them changes nothing about how agents behave.
+      .catch(() => setAgentPrompt(''));
+  }, []);
 
   // Initial status fetch — separate from the poll effect below so the panel
   // renders a real state immediately instead of waiting on the 2s cadence.
@@ -489,6 +503,35 @@ const McpSettingsPanel: React.FC = () => {
         </>
       )}
 
+      {agentPrompt && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">{t('mcp.agentPromptTitle')}</CardTitle>
+            <CardDescription>{t('mcp.agentPromptDescription')}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <pre
+              className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 text-xs text-foreground"
+              data-testid="mcp-agent-prompt"
+            >
+              {agentPrompt}
+            </pre>
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => copy('agent-prompt', agentPrompt)}
+                data-testid="mcp-agent-prompt-copy"
+              >
+                <Copy className="h-3 w-3" />
+                {copiedKey === 'agent-prompt' ? t('mcp.copied') : t('mcp.copy')}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle className="text-base">{t('mcp.profilesTitle')}</CardTitle>
@@ -589,6 +632,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
   const [geminiKey, setGeminiKey] = useState('');
   const [geminiModel, setGeminiModel] = useState('gemini-1.5-flash');
   const [localCommands, setLocalCommands] = useState<Record<string, string>>({});
+  const [aiProviders, setAiProviders] = useState<AiProvider[]>([]);
   const [customInstructions, setCustomInstructions] = useState('');
   const [historyRetentionMonths, setHistoryRetentionMonths] = useState<AiHistoryRetentionMonths>(
     DEFAULT_AI_HISTORY_RETENTION_MONTHS
@@ -641,6 +685,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
         setGeminiKey(s.gemini_api_key || '');
         setGeminiModel(s.gemini_model || 'gemini-1.5-flash');
         setLocalCommands(s.local_commands || {});
+        setAiProviders(s.ai_providers || []);
         setCustomInstructions(s.ai_custom_instructions || '');
         setHistoryRetentionMonths(
           normalizeAiHistoryRetentionMonths(s.ai_history_retention_months)
@@ -677,15 +722,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
   const localCommandFor = (agent: string) =>
     localCommands[agent] ?? DEFAULT_LOCAL_COMMANDS[agent] ?? '{prompt}';
 
+  // Writes the provider list (and the active choice) without waiting for the
+  // form's Save, since the button says "Save provider".
+  //
+  // No frontend queue: every settings write is now a single `patch_app_settings`
+  // call that loads, merges and saves inside one backend lock, so two writers
+  // cannot interleave a load with the other's save. That also covers the writers
+  // outside this component — theme, locale, shell path.
+  //
+  // Two mechanisms, two jobs, and both are needed. `patch_app_settings` merges
+  // under a backend lock, which is what stops one writer's save from erasing
+  // another's field — including writers in other components (theme, locale,
+  // shell path). What a mutex does not give is *order*: two patches of the same
+  // field can acquire it either way round, so adding a provider and quickly
+  // removing it could finish with the add last and the provider back. Writes of
+  // this list are queued here, where the causal order is known; fields owned by
+  // other components are disjoint, so ordering between components never arises.
+  const settingsWrites = useRef<Promise<unknown>>(Promise.resolve());
+  /**
+   * Chain a patch after every earlier one from this form.
+   *
+   * Save goes through here too, not only the provider writes: both patch
+   * `ai_provider` and `ai_providers`, so a Save issued directly could overtake a
+   * queued provider patch that had captured the *previous* active provider, and
+   * that older patch would then land last and revert the choice just saved.
+   */
+  const queueSettingsPatch = (patch: Record<string, unknown>) => {
+    const write = () => invoke('patch_app_settings', { patch });
+    const run = settingsWrites.current.then(write, write);
+    settingsWrites.current = run.catch(() => {});
+    return run;
+  };
+  const persistProviders = (next: AiProvider[], active: string) =>
+    queueSettingsPatch({ ai_providers: next, ai_provider: active }).catch((e) =>
+      setError(t('ai.providerSaveFailed', { error: String(e) }))
+    );
+
   const saveSettings = async () => {
     setSaving(true);
     setError(null);
     setStatus(null);
     try {
-      const current = await invoke<AppSettings>('load_app_settings');
-      await invoke('save_app_settings', {
-        settings: {
-          ...current,
+      // A patch of exactly the fields this form owns. Spreading a loaded copy
+      // used to echo back every field it does not own — appearance, locale —
+      // so a theme or language change made while the form was open was undone
+      // by pressing Save. The backend merges under its own lock.
+      await queueSettingsPatch({
           mongosh_path: mongoshPath.trim(),
           ai_provider: aiProvider,
           anthropic_api_key: anthropicKey.trim(),
@@ -695,6 +777,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
           gemini_api_key: geminiKey.trim(),
           gemini_model: geminiModel.trim() || 'gemini-1.5-flash',
           local_commands: localCommands,
+          ai_providers: aiProviders,
           ai_custom_instructions: customInstructions,
           ai_history_retention_months: historyRetentionMonths,
           audit_enabled: auditEnabled,
@@ -702,7 +785,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
           audit_retention_days: auditRetentionDays,
           audit_include_payloads: auditIncludePayloads,
           update_channel: updateChannel,
-        },
       });
       saveAiHistoryRetentionMonths(historyRetentionMonths);
       setStatus(t('footer.settingsSaved'));
@@ -979,6 +1061,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
                       {[...CLOUD_PROVIDERS, ...LOCAL_AGENTS].map((p) => (
                         <SelectItem key={p} value={p}>{PROVIDER_LABELS[p]}</SelectItem>
                       ))}
+                      {aiProviders.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                 </div>
@@ -1117,6 +1202,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab, onInstal
                 </CardContent>
               </Card>
             )}
+
+            <Card className="xl:col-span-2">
+              <CardHeader>
+                <CardTitle className="text-base">{t('ai.yourProvidersTitle')}</CardTitle>
+                <CardDescription>{t('ai.yourProvidersDescription')}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <AiProviderManager
+                  providers={aiProviders}
+                  onChange={(next) => {
+                    setAiProviders(next);
+                    // A removed provider must not stay selected: the backend would
+                    // reject the id, and the message would arrive at generation
+                    // time rather than here.
+                    const stillValid = next.some((p) => p.id === aiProvider) || !!PROVIDER_LABELS[aiProvider];
+                    const active = stillValid ? aiProvider : 'anthropic';
+                    if (!stillValid) setAiProvider(active);
+                    // The button says "Save provider", so it saves. Until this the
+                    // list lived only in React state and vanished with the window
+                    // unless the form's own Save was also pressed.
+                    void persistProviders(next, active);
+                  }}
+                  reservedIds={[...CLOUD_PROVIDERS, ...LOCAL_AGENTS]}
+                />
+              </CardContent>
+            </Card>
 
             <Card className="xl:col-span-2">
               <CardHeader>

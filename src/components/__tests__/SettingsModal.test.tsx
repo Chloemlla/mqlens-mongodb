@@ -54,7 +54,7 @@ describe('SettingsView Component', () => {
       if (cmd === 'load_app_settings') {
         return Promise.resolve({ mongosh_path: '/usr/local/bin/mongosh' });
       }
-      if (cmd === 'save_app_settings') {
+      if (cmd === 'patch_app_settings' || cmd === 'save_app_settings') {
         return Promise.resolve();
       }
       if (cmd === 'test_mongosh_path') {
@@ -164,8 +164,8 @@ describe('SettingsView Component', () => {
 
     fireEvent.click(screen.getByTestId('settings-save-btn'));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith('save_app_settings', {
-        settings: expect.objectContaining({
+      expect(mockInvoke).toHaveBeenCalledWith('patch_app_settings', {
+        patch: expect.objectContaining({
           mongosh_path: '/opt/homebrew/bin/mongosh',
           ai_provider: 'anthropic',
           anthropic_api_key: '',
@@ -257,12 +257,12 @@ describe('SettingsView Component', () => {
   });
 
   it('loads and saves AI Helper history retention duration', async () => {
-    mockInvoke.mockImplementation((cmd: string, args?: { settings?: { ai_history_retention_months?: number } }) => {
+    mockInvoke.mockImplementation((cmd: string, args?: { patch?: { ai_history_retention_months?: number } }) => {
       if (cmd === 'load_app_settings') {
         return Promise.resolve({ mongosh_path: '', ai_history_retention_months: 6 });
       }
-      if (cmd === 'save_app_settings') {
-        expect(args?.settings?.ai_history_retention_months).toBe(12);
+      if (cmd === 'patch_app_settings' || cmd === 'save_app_settings') {
+        expect(args?.patch?.ai_history_retention_months).toBe(12);
         return Promise.resolve();
       }
       if (cmd === 'detect_local_agents') return Promise.resolve([]);
@@ -285,22 +285,16 @@ describe('SettingsView Component', () => {
     fireEvent.click(screen.getByRole('option', { name: /12 months/i }));
     fireEvent.click(screen.getByTestId('settings-save-btn'));
 
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('save_app_settings', expect.any(Object)));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('patch_app_settings', expect.any(Object)));
     expect(localStorage.getItem('mqlens_ai_history_retention_months')).toBe('12');
   });
 
   it('loads and saves audit logging settings', async () => {
+    let auditPatch: Record<string, unknown> | undefined;
     mockInvoke.mockImplementation(
       (
         cmd: string,
-        args?: {
-          settings?: {
-            audit_enabled?: boolean;
-            audit_level?: string;
-            audit_retention_days?: number;
-            audit_include_payloads?: boolean;
-          };
-        }
+        args?: { patch?: Record<string, unknown> }
       ) => {
         if (cmd === 'load_app_settings') {
           return Promise.resolve({
@@ -311,11 +305,11 @@ describe('SettingsView Component', () => {
             audit_include_payloads: false,
           });
         }
-        if (cmd === 'save_app_settings') {
-          expect(args?.settings?.audit_enabled).toBe(true);
-          expect(args?.settings?.audit_level).toBe('C');
-          expect(args?.settings?.audit_retention_days).toBe(90);
-          expect(args?.settings?.audit_include_payloads).toBe(true);
+        if (cmd === 'patch_app_settings' || cmd === 'save_app_settings') {
+          // Recorded, not asserted here: an `expect` that throws inside the mock
+          // is swallowed by the component's own catch, so the test would pass
+          // whatever the values were. Checked after the await instead.
+          auditPatch = args?.patch;
           return Promise.resolve();
         }
         if (cmd === 'detect_local_agents') return Promise.resolve([]);
@@ -341,8 +335,15 @@ describe('SettingsView Component', () => {
     fireEvent.click(screen.getByTestId('settings-save-btn'));
 
     await waitFor(() =>
-      expect(mockInvoke).toHaveBeenCalledWith('save_app_settings', expect.any(Object))
+      expect(mockInvoke).toHaveBeenCalledWith('patch_app_settings', expect.any(Object))
     );
+    await waitFor(() => expect(auditPatch).toBeTruthy());
+    expect(auditPatch).toMatchObject({
+      audit_enabled: true,
+      audit_level: 'C',
+      audit_retention_days: 90,
+      audit_include_payloads: true,
+    });
   });
 
   it('shows last update check status on the updates tab', async () => {
@@ -393,6 +394,246 @@ describe('SettingsView Component', () => {
       renderSettings();
       await openTab('settings-tab-language');
       expect(await screen.findByText(/falls back to English/i)).toBeInTheDocument();
+    });
+  });
+
+  describe('configurable AI providers (#283)', () => {
+    const deepseek = {
+      id: 'deepseek',
+      name: 'DeepSeek',
+      kind: 'openai-compatible',
+      base_url: 'https://api.deepseek.com/v1',
+      api_key: 'k',
+      model: 'deepseek-chat',
+      command: '',
+    };
+
+    it('offers a saved provider alongside the built-ins', async () => {
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') {
+          return Promise.resolve({ ai_provider: 'deepseek', ai_providers: [deepseek] });
+        }
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+
+      // Listed for management...
+      expect(await screen.findByTestId('ai-provider-row-deepseek')).toHaveTextContent('DeepSeek');
+      // ...and selectable as the active provider.
+      expect(await screen.findByTestId('ai-provider-select')).toHaveTextContent('DeepSeek');
+    });
+
+    it('saves the provider list back into settings', async () => {
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({ ai_providers: [deepseek] });
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        if (cmd === 'validate_ai_provider') return Promise.resolve('ok');
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+      await screen.findByTestId('ai-provider-row-deepseek');
+
+      fireEvent.click(screen.getByTestId('settings-save-btn'));
+      await waitFor(() => {
+        const save = mockInvoke.mock.calls.find(([cmd]) => cmd === 'patch_app_settings');
+        expect(save).toBeTruthy();
+        expect(save![1].patch.ai_providers).toEqual([deepseek]);
+      });
+    });
+
+    it('persists the list as soon as a provider is saved or removed, not only on the form Save', async () => {
+      // The reported bug: providers added, window closed, providers gone.
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({ ai_provider: 'anthropic', ai_providers: [deepseek] });
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+      await screen.findByTestId('ai-provider-row-deepseek');
+
+      fireEvent.click(screen.getByTestId('ai-provider-remove-deepseek'));
+      await waitFor(() => {
+        const patch = mockInvoke.mock.calls.find(([cmd]) => cmd === 'patch_app_settings');
+        expect(patch).toBeTruthy();
+        expect(patch![1].patch.ai_providers).toEqual([]);
+      });
+    });
+
+    it('writes only the fields it owns, so a concurrent theme or locale change survives', async () => {
+      // The form used to load the whole settings object and write it back, which
+      // undid an appearance or locale change made while it was open. Ordering is
+      // no longer a frontend concern either: each write is one backend call that
+      // loads, merges and saves under a lock.
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({ ai_providers: [deepseek] });
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+      await screen.findByTestId('ai-provider-row-deepseek');
+
+      fireEvent.click(screen.getByTestId('settings-save-btn'));
+      await waitFor(() => {
+        const patch = mockInvoke.mock.calls.find(([cmd]) => cmd === 'patch_app_settings');
+        expect(patch).toBeTruthy();
+        const fields = Object.keys(patch![1].patch);
+        expect(fields).toContain('ai_providers');
+        expect(fields).toContain('mongosh_path');
+        // Fields owned by other components are absent, so they cannot be echoed
+        // back over a newer value.
+        expect(fields).not.toContain('appearance');
+        expect(fields).not.toContain('locale');
+      });
+      // And nothing writes the whole object any more.
+      expect(mockInvoke.mock.calls.some(([cmd]) => cmd === 'save_app_settings')).toBe(false);
+    });
+
+    it('applies rapid provider writes in the order they were made', async () => {
+      // The backend mutex gives mutual exclusion, not ordering: add-then-remove
+      // could finish with the add last and the provider back.
+      const patches: any[] = [];
+      let releaseFirst: (v?: unknown) => void = () => {};
+      let calls = 0;
+      mockInvoke.mockImplementation((cmd, args: any) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({ ai_providers: [] });
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        if (cmd === 'validate_ai_provider') return Promise.resolve('ok');
+        if (cmd === 'patch_app_settings') {
+          patches.push(args.patch.ai_providers);
+          calls += 1;
+          // The first write is slow; the second must wait for it regardless.
+          if (calls === 1) return new Promise((res) => { releaseFirst = res; });
+          return Promise.resolve();
+        }
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+
+      // Add one...
+      fireEvent.click(await screen.findByTestId('ai-provider-add'));
+      fireEvent.change(screen.getByTestId('ai-provider-name-input'), { target: { value: 'DeepSeek' } });
+      fireEvent.change(screen.getByTestId('ai-provider-url-input'), { target: { value: 'https://api.deepseek.com/v1' } });
+      fireEvent.change(screen.getByTestId('ai-provider-key-input'), { target: { value: 'k' } });
+      fireEvent.change(screen.getByTestId('ai-provider-model-input'), { target: { value: 'deepseek-chat' } });
+      fireEvent.click(screen.getByTestId('ai-provider-save'));
+      await waitFor(() => expect(patches).toHaveLength(1));
+
+      // ...then remove it before the add has finished writing.
+      fireEvent.click(await screen.findByTestId('ai-provider-remove-deepseek'));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(patches).toHaveLength(1);            // the removal is queued behind it
+      releaseFirst();
+      await waitFor(() => expect(patches).toHaveLength(2));
+
+      // The last write wins, and it is the removal.
+      expect(patches[0]).toHaveLength(1);
+      expect(patches[1]).toEqual([]);
+    });
+
+    it('holds the main Save behind a provider write still in flight', async () => {
+      // Both patch `ai_provider` and `ai_providers`, so a Save issued directly
+      // could overtake a queued provider patch carrying the *previous* active
+      // provider — and that older patch would land last and revert the choice
+      // just saved.
+      const patches: any[] = [];
+      let releaseFirst: (v?: unknown) => void = () => {};
+      let calls = 0;
+      mockInvoke.mockImplementation((cmd, args: any) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({ ai_providers: [] });
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        if (cmd === 'validate_ai_provider') return Promise.resolve('ok');
+        if (cmd === 'patch_app_settings') {
+          patches.push(args.patch);
+          calls += 1;
+          if (calls === 1) return new Promise((res) => { releaseFirst = res; });
+          return Promise.resolve();
+        }
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+
+      // A provider write starts and does not finish.
+      fireEvent.click(await screen.findByTestId('ai-provider-add'));
+      fireEvent.change(screen.getByTestId('ai-provider-name-input'), { target: { value: 'DeepSeek' } });
+      fireEvent.change(screen.getByTestId('ai-provider-url-input'), { target: { value: 'https://api.deepseek.com/v1' } });
+      fireEvent.change(screen.getByTestId('ai-provider-key-input'), { target: { value: 'k' } });
+      fireEvent.change(screen.getByTestId('ai-provider-model-input'), { target: { value: 'deepseek-chat' } });
+      fireEvent.click(screen.getByTestId('ai-provider-save'));
+      await waitFor(() => expect(patches).toHaveLength(1));
+
+      // Save is pressed while it is still in flight.
+      fireEvent.click(screen.getByTestId('settings-save-btn'));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(patches).toHaveLength(1); // queued behind the provider write
+
+      releaseFirst();
+      await waitFor(() => expect(patches).toHaveLength(2));
+      // Save is second, so its `ai_provider` is the value that survives.
+      expect(patches[1]).toHaveProperty('mongosh_path');
+    });
+
+    it('does not leave a removed provider selected', async () => {
+      // The backend rejects an unknown id, and that error would otherwise only
+      // appear the next time the user asked for a query.
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') {
+          return Promise.resolve({ ai_provider: 'deepseek', ai_providers: [deepseek] });
+        }
+        if (cmd === 'ai_provider_presets') return Promise.resolve([]);
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-ai');
+      await screen.findByTestId('ai-provider-row-deepseek');
+      expect(screen.getByTestId('ai-provider-select')).toHaveTextContent('DeepSeek');
+
+      fireEvent.click(screen.getByTestId('ai-provider-remove-deepseek'));
+      await waitFor(() =>
+        expect(screen.getByTestId('ai-provider-select')).not.toHaveTextContent('DeepSeek')
+      );
+    });
+  });
+
+  describe('MCP agent instructions (#283)', () => {
+    it('shows the instructions the server sends, for pasting elsewhere', async () => {
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({});
+        if (cmd === 'mcp_agent_instructions') {
+          return Promise.resolve('WORK IN THIS ORDER. 1. `ping`');
+        }
+        if (cmd === 'mcp_status') {
+          return Promise.resolve({ enabled: false, port: 8765, token: '', running: false });
+        }
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-mcp');
+
+      const prompt = await screen.findByTestId('mcp-agent-prompt');
+      expect(prompt).toHaveTextContent('WORK IN THIS ORDER');
+      expect(screen.getByTestId('mcp-agent-prompt-copy')).toBeInTheDocument();
+    });
+
+    it('hides the panel rather than showing an empty box when they cannot be read', async () => {
+      mockInvoke.mockImplementation((cmd) => {
+        if (cmd === 'load_app_settings') return Promise.resolve({});
+        if (cmd === 'mcp_agent_instructions') return Promise.reject('nope');
+        if (cmd === 'mcp_status') {
+          return Promise.resolve({ enabled: false, port: 8765, token: '', running: false });
+        }
+        return Promise.resolve();
+      });
+      renderSettings();
+      await openTab('settings-tab-mcp');
+
+      await waitFor(() => expect(screen.queryByTestId('mcp-agent-prompt')).not.toBeInTheDocument());
     });
   });
 });

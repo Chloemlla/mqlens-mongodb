@@ -139,6 +139,17 @@ const EXEMPT_HITS: Record<string, string[]> = {
     // <Trans> fallback children (transfer:restoreView.footer.backgroundNote).
     'jsx: Restores run in the background. Track their progress in the',
   ],
+  // AI provider form (#283). Example values a user would type, matching the
+  // service's own documentation, not instructional copy: a CLI invocation, a
+  // vendor base URL, and a model identifier.
+  'src/components/AiProviderManager.tsx': [
+    'placeholder="ollama run {model} {prompt}"',
+    'placeholder="ollama list"',
+    'placeholder="https://api.deepseek.com/v1"',
+    // Model-name placeholder, chosen per kind: a local model for a CLI, a
+    // vendor model id for HTTP.
+    "placeholder={isCli ? 'llama3' : 'deepseek-chat'}",
+  ],
   'src/components/CreateViewView.tsx': [
     // Example view name shown as a placeholder, not an instructional hint —
     // a plausible value the user might type, like ConnectionManager's examples.
