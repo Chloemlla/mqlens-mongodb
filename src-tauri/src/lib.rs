@@ -2425,7 +2425,14 @@ async fn vault_change_password(
     // second instance take the log and append under the old key mid-rotation.
     // Everything fallible after this point runs inside `rotate`, so a failure
     // can reopen the session instead of leaving the app running unaudited.
-    let retained_audit_lock = audit::suspend_for_rotation(&state);
+    //
+    // Taken even when there is no session to suspend. `rotate` rewrites the log
+    // and its state sidecar either way, and without the lock an instance that
+    // *does* own the log keeps appending under the old key while its next state
+    // write lands on top of the rotated sidecar — leaving history that
+    // authenticates against neither password. If the lock cannot be taken the
+    // whole change aborts here, before any vault file is touched.
+    let audit_guard = audit::hold_for_rotation(&app_handle, &state)?;
 
     let rotate = || -> Result<(), String> {
         // Prepare every re-encrypted payload before overwriting any vault file:
@@ -2454,11 +2461,16 @@ async fn vault_change_password(
     // Reopen with the retained lock either way — on failure under `old_key`,
     // which is still the live vault key because it is only swapped below.
     let reopen_key = if rotated.is_ok() { new_key } else { old_key };
-    match retained_audit_lock {
-        Some(lock) => {
+    match audit_guard {
+        // There was a session: hand the same lock back so it never leaves this
+        // instance's hands.
+        audit::AuditRotationGuard::Session(lock) => {
             let _ = audit::resume_after_rotation(&app_handle, &state, reopen_key, lock);
         }
-        None => {
+        // There was none: release the lock first, then let the settings decide
+        // whether auditing opens — the same path as any other unlock.
+        audit::AuditRotationGuard::LockOnly(lock) => {
+            drop(lock);
             let _ = audit::open_on_unlock(&app_handle, &state, reopen_key);
         }
     }
