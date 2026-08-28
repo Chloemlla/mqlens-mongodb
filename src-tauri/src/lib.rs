@@ -1169,6 +1169,35 @@ fn mcp_agent_instructions() -> &'static str {
     mcp::AGENT_INSTRUCTIONS
 }
 
+/// List a provider's models, refusing first to put its key on the wire in clear
+/// text.
+///
+/// Shared by both listing commands. The check lived in one of them and not the
+/// other, which is how a provider saved with a key and a non-loopback `http://`
+/// endpoint still reached the network — automatically, from the chat panel, before
+/// the user sent anything. A test pins the number of callers so a third cannot be
+/// added without coming through here.
+async fn list_models_for_provider(
+    provider: &ai_providers::AiProvider,
+) -> Result<Vec<String>, String> {
+    match provider.kind {
+        ai_providers::ProviderKind::LocalCli => ai::list_models_cli(&provider.models_command).await,
+        kind => {
+            // Before the request, not at Save: listing runs on its own 600 ms after
+            // a key is typed, and for a saved provider on merely opening the panel,
+            // so Save is far too late to be the first check.
+            provider.check_transport()?;
+            ai::list_models_http(
+                kind,
+                &provider.models_endpoint()?,
+                &provider.api_key,
+                &provider.name,
+            )
+            .await
+        }
+    }
+}
+
 /// The models a provider offers, for the settings form to pick from.
 ///
 /// HTTP kinds are asked over `GET .../models` with the configured key; a CLI is
@@ -1177,15 +1206,7 @@ fn mcp_agent_instructions() -> &'static str {
 /// only ever help.
 #[tauri::command]
 async fn list_ai_models(provider: ai_providers::AiProvider) -> Result<Vec<String>, String> {
-    match provider.kind {
-        ai_providers::ProviderKind::LocalCli => {
-            ai::list_models_cli(&provider.models_command).await
-        }
-        kind => {
-            ai::list_models_http(kind, &provider.models_endpoint()?, &provider.api_key, &provider.name)
-                .await
-        }
-    }
+    list_models_for_provider(&provider).await
 }
 
 /// Check a provider's configuration without sending a prompt to it.
@@ -1207,14 +1228,26 @@ async fn generate_mql_query(
     fields: Vec<String>,
     #[allow(non_snake_case)] history: Option<Vec<ai::ChatTurn>>,
     target: Option<String>,
-) -> Result<String, String> {
-    let settings = {
+    images: Option<Vec<ai::ImageAttachment>>,
+    // Per-conversation override from the panel's picker; `None` uses the
+    // settings default. Only the id crosses from the frontend — the key is
+    // looked up here.
+    #[allow(non_snake_case)] providerId: Option<String>,
+    model: Option<String>,
+) -> Result<ai::AiReply, String> {
+    let mut settings = {
         let key = state.require_key()?;
         connections::load_settings_encrypted(
             &connections::get_settings_enc_path(&app_handle),
             &key,
         )?
     };
+    if let Some(id) = providerId.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        settings.ai_provider = id.to_string();
+    }
+    let model_override = model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let images = images.unwrap_or_default();
+    ai::validate_images(&images)?;
 
     if prompt.trim().is_empty() {
         return Err("Describe the query you want in plain language.".to_string());
@@ -1235,18 +1268,25 @@ async fn generate_mql_query(
     // OpenAI's nor Anthropic's, so it is the one provider that cannot be
     // described as "an endpoint speaking a known format".
     if settings.ai_provider.trim() == "gemini" {
-        let model = if settings.gemini_model.trim().is_empty() {
-            "gemini-1.5-flash".to_string()
-        } else {
-            settings.gemini_model.clone()
-        };
-        return ai::generate_gemini(&settings.gemini_api_key, &model, &system, &history, &prompt)
+        let model = model_override
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if settings.gemini_model.trim().is_empty() {
+                    "gemini-1.5-flash".to_string()
+                } else {
+                    settings.gemini_model.clone()
+                }
+            });
+        return ai::generate_gemini(&settings.gemini_api_key, &model, &system, &history, &prompt, &images)
             .await;
     }
 
     // Everything else — the built-ins and anything the user added — is resolved
     // to one shape and dispatched on its wire format.
-    let provider = connections::resolve_ai_provider(&settings)?;
+    let mut provider = connections::resolve_ai_provider(&settings)?;
+    if let Some(m) = model_override {
+        provider.model = m.to_string();
+    }
     provider.validate()?;
     match provider.kind {
         ai_providers::ProviderKind::OpenAiCompatible => {
@@ -1258,6 +1298,7 @@ async fn generate_mql_query(
                 &system,
                 &history,
                 &prompt,
+                &images,
             )
             .await
         }
@@ -1270,14 +1311,116 @@ async fn generate_mql_query(
                 &system,
                 &history,
                 &prompt,
+                &images,
             )
             .await
         }
         ai_providers::ProviderKind::LocalCli => {
+            if !images.is_empty() {
+                // There is no standard way to hand an image to a command-line
+                // agent, and silently dropping it would answer a question the
+                // user did not ask.
+                return Err(format!(
+                    "{} is a local command and cannot receive images. Pick an HTTP provider for this question.",
+                    provider.name
+                ));
+            }
             let one_prompt = ai::combined_prompt(&system, &history, &prompt);
             ai::generate_local(&provider.command, &one_prompt, &provider.model).await
         }
     }
+}
+
+/// The providers the chat panel can pick from, keys withheld.
+///
+/// Built-ins and user-added providers in one list, each with its kind so the
+/// panel can disable image paste for a local command, and with the settings
+/// default flagged so the picker starts on it.
+#[tauri::command]
+async fn ai_provider_options(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let settings = {
+        let key = state.require_key()?;
+        connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)?
+    };
+    let default_id = settings.ai_provider.trim().to_string();
+    // `usesModel` tells the panel whether a model choice reaches the request: an
+    // HTTP provider always sends one, a local command only if its template slots
+    // `{model}` in. Without it the panel would offer a model field that does
+    // nothing for the built-in agents.
+    // `canListModels` tells the panel whether asking for a model list can work at
+    // all. Without it the composer offered a "Load models" button for a CLI with
+    // no listing command — every built-in agent, whose `models_command` is always
+    // empty, and any custom CLI that left the documented-optional field blank. The
+    // click ran an empty command, failed, and said nothing.
+    let entry = |id: &str,
+                 name: &str,
+                 kind: &str,
+                 model: &str,
+                 uses_model: bool,
+                 can_list_models: bool| {
+        serde_json::json!({
+            "id": id, "name": name, "kind": kind, "model": model,
+            "isDefault": id == default_id, "usesModel": uses_model,
+            "canListModels": can_list_models
+        })
+    };
+    let agent_uses_model = |agent: &str| {
+        connections::resolve_local_command(&settings, agent).contains("{model}")
+    };
+    let mut out = vec![
+        entry("anthropic", "Anthropic (Claude)", "anthropic-compatible", &settings.anthropic_model, true, true),
+        entry("openai", "OpenAI (ChatGPT)", "openai-compatible", &settings.openai_model, true, true),
+        // Gemini is listed here for selection only: `list_ai_models_for` refuses it
+        // outright, so claiming otherwise would offer a button that cannot work.
+        entry("gemini", "Google Gemini", "gemini", &settings.gemini_model, true, false),
+    ];
+    for agent in ["claude-code", "codex", "cursor", "antigravity"] {
+        let label = match agent {
+            "claude-code" => "Claude Code (local)",
+            "codex" => "Codex (local)",
+            "cursor" => "Cursor (local)",
+            _ => "Antigravity (local)",
+        };
+        // A built-in agent's `models_command` is always empty (see
+        // `resolve_ai_provider`), so listing can never work for one.
+        out.push(entry(agent, label, "local-cli", "", agent_uses_model(agent), false));
+    }
+    for p in &settings.ai_providers {
+        let kind = serde_json::to_value(p.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let uses_model = p.kind != ai_providers::ProviderKind::LocalCli || p.command.contains("{model}");
+        let can_list_models = if p.kind == ai_providers::ProviderKind::LocalCli {
+            !p.models_command.trim().is_empty()
+        } else {
+            true
+        };
+        out.push(entry(&p.id, &p.name, &kind, &p.model, uses_model, can_list_models));
+    }
+    Ok(out)
+}
+
+/// Models for a provider named by id, resolved here so the key never leaves Rust.
+#[tauri::command]
+async fn list_ai_models_for(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    #[allow(non_snake_case)] providerId: String,
+) -> Result<Vec<String>, String> {
+    let mut settings = {
+        let key = state.require_key()?;
+        connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)?
+    };
+    if providerId.trim() == "gemini" {
+        return Err("Gemini's model list is not fetched here; type a model name.".to_string());
+    }
+    settings.ai_provider = providerId;
+    let provider = connections::resolve_ai_provider(&settings)?;
+    list_models_for_provider(&provider).await
 }
 
 #[tauri::command]
@@ -2353,6 +2496,35 @@ async fn load_app_settings(
     connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)
 }
 
+/// Whether a settings change is one a chat panel's provider picker would show.
+///
+/// Every successful patch used to broadcast, so changing the interface language or
+/// the theme made every open panel re-read its options — and the model-list effect
+/// that follows sends a *credentialed* request to the selected provider. An
+/// unrelated preference should not cause network traffic.
+///
+/// The fields `ai_provider_options` is built from, plus the built-in credentials.
+///
+/// The keys are not *in* the options payload, but they decide whether a picker can
+/// load its model list at all: a panel whose first listing failed for want of a
+/// key stayed stuck on an empty list until it remounted, however many times the
+/// key was corrected. A key change is an AI-settings change, which is the line
+/// this predicate is drawing — not "does the payload differ byte for byte".
+fn ai_options_changed(
+    before: &connections::AppSettings,
+    after: &connections::AppSettings,
+) -> bool {
+    before.ai_provider != after.ai_provider
+        || before.ai_providers != after.ai_providers
+        || before.anthropic_model != after.anthropic_model
+        || before.openai_model != after.openai_model
+        || before.gemini_model != after.gemini_model
+        || before.local_commands != after.local_commands
+        || before.anthropic_api_key != after.anthropic_api_key
+        || before.openai_api_key != after.openai_api_key
+        || before.gemini_api_key != after.gemini_api_key
+}
+
 /// Change only the named fields, under the settings write lock.
 ///
 /// The load → merge → save happens here, on one side of the IPC boundary and
@@ -2367,10 +2539,24 @@ async fn patch_app_settings(
     let key = state.require_key()?;
     let path = connections::get_settings_enc_path(&app_handle);
     let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
+    // The in-process mutex above orders this window's writers; this orders them
+    // against a second MQLens, which would otherwise merge into the same image
+    // and have one patch discarded by the other's rename.
+    let _file_lock = connections::lock_settings_for_write(&path)?;
     let current = connections::load_settings_encrypted(&path, &key)?;
     let merged = connections::merge_settings_patch(&current, &patch)?;
     connections::save_settings_encrypted(&path, &key, &merged)?;
     audit::refresh_policy_from_settings(&state, &merged);
+    // Every window keeps its own copy of the provider list; without this, a panel
+    // in another pane or window holds a stale one, and deleting the provider it
+    // has selected leaves that id selectable until the panel remounts.
+    // Best-effort, like `connections-changed`: a window that misses it re-reads
+    // the list on its next mount. Only when the picker would actually differ —
+    // see `ai_options_changed`.
+    if ai_options_changed(&current, &merged) {
+        use tauri::Emitter;
+        let _ = app_handle.emit("ai-providers-changed", ());
+    }
     Ok(merged)
 }
 
@@ -2381,15 +2567,28 @@ async fn save_app_settings(
     settings: connections::AppSettings,
 ) -> Result<(), String> {
     let key = state.require_key()?;
-    // Same lock as `patch_app_settings`, so a whole-object save cannot
-    // interleave with a field patch.
+    // Same locks as `patch_app_settings`, so a whole-object save cannot
+    // interleave with a field patch — in this process or another one.
     let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
+    let settings_path = connections::get_settings_enc_path(&app_handle);
+    let _file_lock = connections::lock_settings_for_write(&settings_path)?;
+    // Read first, under the same locks, only to answer "would the pickers differ".
+    let before = connections::load_settings_encrypted(&settings_path, &key).ok();
     connections::save_settings_encrypted(
-        &connections::get_settings_enc_path(&app_handle),
+        &settings_path,
         &key,
         &settings,
     )?;
     audit::refresh_policy_from_settings(&state, &settings);
+    // Best-effort, like `connections-changed`: a window that misses it re-reads
+    // the list on its next mount. Only when the picker would actually differ —
+    // and when the previous image could not be read, assume it would, since a
+    // stale picker is worse than one needless refresh.
+    if before.as_ref().is_none_or(|b| ai_options_changed(b, &settings)) {
+        use tauri::Emitter;
+        let _ = app_handle.emit("ai-providers-changed", ());
+    }
+
     Ok(())
 }
 
@@ -2771,6 +2970,8 @@ pub fn run() {
             mcp_agent_instructions,
             validate_ai_provider,
             list_ai_models,
+            ai_provider_options,
+            list_ai_models_for,
             detect_local_agents,
             get_mongodb_version,
             start_mongosh_session,
