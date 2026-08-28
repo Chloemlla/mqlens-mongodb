@@ -6456,7 +6456,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.16.2"
+version = "0.17.0"
 dependencies = [
  "aes-gcm",
  "argon2 0.5.3",
