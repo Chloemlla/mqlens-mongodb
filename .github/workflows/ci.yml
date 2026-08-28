@@ -17,10 +17,10 @@ jobs:
     name: frontend
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - name: i18n catalog check
@@ -39,7 +39,7 @@ jobs:
             .join('\n');
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Frontend coverage\n\n| Metric | Coverage | Covered |\n|---|---:|---:|\n${rows}\n`);
           NODE
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: frontend-coverage
           path: coverage/frontend
@@ -64,7 +64,7 @@ jobs:
       # Integration tests read this; when unset they skip (keeps `cargo test` green offline).
       MQLENS_TEST_MONGO_URI: mongodb://localhost:27017
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The Tauri lib + gssapi-auth feature need these system libs to compile.
       - name: Install Linux dependencies
         run: |
@@ -81,9 +81,18 @@ jobs:
             clang \
             libclang-dev \
             build-essential
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the head of the action's `stable` branch. That branch name was
+      # never magic: the action reads `inputs.toolchain`, whose default differs
+      # per branch, and never looks at the ref it was called by — so the
+      # toolchain is stated here instead of being implied by the ref.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: stable
+      # Same shape: the `cargo-llvm-cov` tag only sets `inputs.tool`'s default.
+      - uses: taiki-e/install-action@419f0f955ea0cf384c06ae25b10b8d3bcba087da # cargo-llvm-cov tag
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
       - name: Backend tests with coverage

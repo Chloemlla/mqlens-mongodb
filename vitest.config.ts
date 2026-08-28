@@ -12,6 +12,11 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
+    // Above the raised `asyncUtilTimeout` in src/test/setup.ts, so a `waitFor`
+    // that genuinely never settles reports its own assertion error instead of
+    // being cut short by vitest. The default 5s was already below the
+    // `{ timeout: 5000 }` override in Sidebar.test.tsx.
+    testTimeout: 15000,
     setupFiles: './src/test/setup.ts',
     coverage: {
       provider: 'v8',

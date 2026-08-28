@@ -1,0 +1,51 @@
+# Keeps dependencies current, and is what makes SHA-pinning the workflows
+# sustainable: a pinned action never updates itself, so without this the pins
+# silently rot and a fixed vulnerability stays in CI. Scorecard's
+# Dependency-Update-Tool check reads this file.
+version: 2
+updates:
+  # The Tauri app's frontend.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine version bumps; anything with a CVE still arrives on
+      # its own so it can be reviewed and merged without waiting for the group.
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The marketing/docs site, which has its own lockfile.
+  - package-ecosystem: npm
+    directory: /website
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      website-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The Rust backend.
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The pinned actions above. Dependabot rewrites the SHA and the trailing
+  # version comment together, so the pins stay both current and readable.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]

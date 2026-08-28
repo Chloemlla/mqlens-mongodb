@@ -144,6 +144,54 @@ fn open_on_unlock_inner(
 /// Releasing it would let a second instance take the log and append under the
 /// old key while rotation swaps in the new-key file — on Unix that second
 /// process keeps writing to the unlinked old inode, so those events vanish.
+/// What a key rotation is holding on the audit log while it runs.
+pub enum AuditRotationGuard {
+    /// A session was suspended; its lock is carried through and the session is
+    /// reopened afterwards.
+    Session(RetainedLock),
+    /// There was no session to suspend, so the lock was taken purely to keep
+    /// other instances off the files. Released afterwards, and whether auditing
+    /// then reopens is decided by the settings as usual.
+    LockOnly(RetainedLock),
+}
+
+/// Hold the audit log for the duration of a key rotation.
+///
+/// Rotation rewrites `audit.log.enc` and its state sidecar, so it must exclude
+/// other instances whether or not *this* one is recording. When another instance
+/// owns the log this fails, and rotation must abort: rewriting the vault metadata
+/// while that instance keeps appending under the old key leaves activity history
+/// no password can open.
+pub fn hold_for_rotation(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<AuditRotationGuard, String> {
+    hold_for_rotation_at(state, connections::get_audit_log_path(app))
+}
+
+/// The path-taking half, so the no-session branch is reachable from tests
+/// without an `AppHandle`.
+fn hold_for_rotation_at(
+    state: &AppState,
+    log_path: std::path::PathBuf,
+) -> Result<AuditRotationGuard, String> {
+    if let Some(lock) = suspend_for_rotation(state) {
+        return Ok(AuditRotationGuard::Session(lock));
+    }
+    // `suspend_for_rotation` clears the degradation reason before it discovers
+    // there is no session to suspend, so bailing out here would leave the vault
+    // unlocked, auditing inactive, and nothing left to say why — the Activity
+    // panel would show "unknown reason" after a password change it refused to
+    // make. The acquisition error is the live reason, so record that.
+    AuditSession::new(log_path)
+        .acquire_retained_lock()
+        .map(AuditRotationGuard::LockOnly)
+        .map_err(|e| {
+            set_degraded(state, Some(e.clone()));
+            e
+        })
+}
+
 pub fn suspend_for_rotation(state: &AppState) -> Option<RetainedLock> {
     set_degraded(state, None);
     let mut slot = state.audit.lock_safe().ok()?;
@@ -297,5 +345,96 @@ mod retention_tests {
         assert_eq!(clamp_retention_days(30), 30);
         let cutoff = retention_cutoff_ms(1, 86_400_000 * 10);
         assert_eq!(cutoff, 86_400_000 * 9);
+    }
+}
+
+#[cfg(test)]
+mod rotation_lock_tests {
+    use super::*;
+    use crate::audit::envelope::AuditPolicy;
+    use crate::audit::level::AuditLevel;
+    use tempfile::tempdir;
+
+    const KEY: [u8; 32] = [9u8; 32];
+
+    fn policy() -> AuditPolicy {
+        AuditPolicy {
+            enabled: true,
+            level: AuditLevel::C,
+            include_payloads: false,
+            retention_days: 30,
+        }
+    }
+
+    #[test]
+    fn a_suspended_session_hands_its_own_lock_through() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log.enc");
+        let state = AppState::new();
+        let session = AuditSession::new(path.clone());
+        session.open(KEY).expect("open");
+        session.set_policy(policy());
+        *state.audit.lock().unwrap() = Some(session);
+
+        match hold_for_rotation_at(&state, path) {
+            Ok(AuditRotationGuard::Session(_)) => {}
+            other => panic!("expected the session's lock to be carried through: {:?}", other.is_ok()),
+        }
+        assert!(
+            state.audit.lock().unwrap().is_none(),
+            "the session must be suspended for the rotation"
+        );
+    }
+
+    #[test]
+    fn no_session_takes_the_lock_purely_for_exclusion() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log.enc");
+        let state = AppState::new();
+
+        match hold_for_rotation_at(&state, path) {
+            Ok(AuditRotationGuard::LockOnly(_)) => {}
+            other => panic!("expected a lock-only guard: {:?}", other.is_ok()),
+        }
+        assert!(
+            degraded_reason(&state).is_none(),
+            "taking the lock successfully is not a degraded state"
+        );
+    }
+
+    #[test]
+    fn a_refused_rotation_still_explains_why_auditing_is_inactive() {
+        // `suspend_for_rotation` clears the degradation reason before it finds
+        // there is no session, so without care a refused password change leaves
+        // the Activity panel saying "inactive" with nothing to show for it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log.enc");
+
+        // Another instance owns the log.
+        let owner = AuditSession::new(path.clone());
+        owner.open(KEY).expect("owner opens");
+
+        let state = AppState::new();
+        set_degraded(&state, Some("an earlier reason".into()));
+
+        let err = hold_for_rotation_at(&state, path.clone())
+            .err()
+            .expect("must refuse while another instance holds the log");
+        assert!(
+            err.contains("another MQLens instance"),
+            "the error should name the cause: {err}"
+        );
+        assert_eq!(
+            degraded_reason(&state).as_deref(),
+            Some(err.as_str()),
+            "the live reason must survive the refusal"
+        );
+
+        // And once the other instance lets go, rotation can proceed. `close`
+        // returns a Result; a failure here must fail the test, or the assertion
+        // below could pass because the lock leaked rather than because it was
+        // released.
+        owner.close().expect("owner releases the log");
+        assert!(hold_for_rotation_at(&state, path).is_ok());
     }
 }

@@ -27,7 +27,12 @@ function Probe({ panelIds, save }: { panelIds: string[]; save?: Layout }) {
     panelIds,
     storage: localStorage,
   });
-  if (save) onLayoutChanged(save);
+  // react-resizable-panels 4.12 added a second argument describing what caused
+  // the change. `useDefaultLayout` only consults it when
+  // `onlySaveAfterUserInteractions` is set, which this app does not set — so
+  // persistence is unchanged and this only has to say what the simulated commit
+  // was: a user finishing a drag.
+  if (save) onLayoutChanged(save, { isUserInteraction: true });
   return <span data-testid="layout">{JSON.stringify(defaultLayout ?? null)}</span>;
 }
 

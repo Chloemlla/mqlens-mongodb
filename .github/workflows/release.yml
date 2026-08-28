@@ -32,8 +32,11 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Read-only by default. Every job that publishes something asks for
+# `contents: write` itself, so a new job added later starts with no write access
+# rather than silently inheriting it from here.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Auto-versioning (main only): compute the next semver from Conventional
@@ -41,17 +44,20 @@ jobs:
   # so it doesn't re-trigger). Outputs the new version + whether to release.
   version:
     runs-on: ubuntu-22.04
+    # Commits the version bump and pushes the tag.
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.compute.outputs.version }}
       release: ${{ steps.compute.outputs.release }}
       notes: ${{ steps.compute.outputs.notes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
       - name: Compute + commit next version
         id: compute
         shell: bash
@@ -181,7 +187,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # On main, the version job already pushed the bump commit — build it.
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
@@ -205,16 +211,19 @@ jobs:
             build-essential \
             curl wget file
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      # See ci.yml: the ref name only sets `inputs.toolchain`'s default, so the
+      # toolchain is passed explicitly now that the ref is a SHA.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
 
@@ -276,7 +285,7 @@ jobs:
           echo "REL_NAME=MQLens v${{ needs.version.outputs.version }}" >> "$GITHUB_ENV"
 
       - name: Build app & publish release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing — produces signed update artifacts + latest.json so
@@ -321,7 +330,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
@@ -374,7 +383,7 @@ jobs:
     env:
       ENABLE_GPG: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
       - name: Import GPG key
@@ -413,7 +422,7 @@ jobs:
     env:
       ENABLE_WIN_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.ENABLE_WIN_SIGNING == 'true'
         with:
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
@@ -433,7 +442,7 @@ jobs:
 
       - name: Azure Trusted Signing
         if: env.ENABLE_WIN_SIGNING == 'true'
-        uses: azure/trusted-signing-action@v0.5.1
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -467,7 +476,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.ref_name == 'main' && 'main' || github.sha }}
       - name: Compose and publish updater manifest

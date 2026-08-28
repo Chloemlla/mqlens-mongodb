@@ -10,8 +10,21 @@ import Editor from '@monaco-editor/react';
 import { generateQueryCode, CODE_LANGUAGES, CODE_LANGUAGE_MONACO_IDS, type CodeLanguage, type QueryCodeSpec } from '../lib/queryCodeGen';
 import { suggestESRIndex, type IndexSuggestion } from '../lib/indexSuggestions';
 import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
-import { EJSON, ObjectId, Long, Decimal128, Int32, Double, Binary, Timestamp } from 'bson';
+import { EJSON } from 'bson';
 import { copyValueToText } from '../lib/copyValue';
+import { ResultsFindBar } from './ResultsFindBar';
+import { registerResultsFindTarget } from '../lib/resultsFindShortcut';
+import { findMatches, isMatchAt, stepMatch, type FindCell } from '../lib/resultsFind';
+import {
+  bsonCallOf,
+  bsonInstanceTypeLabel,
+  bsonValueText,
+  isBsonInstance,
+  jsonStringLiteral,
+  plainBsonShape,
+  tableValueText,
+} from '../lib/bsonDisplay';
+import type { ListImperativeAPI } from 'react-window';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useThemeOptional } from '@/hooks/use-theme';
@@ -380,7 +393,17 @@ const jsonKeyNode = (k: string) => (
     {jsonPunct(' : ')}
   </>
 );
-const printableJsonString = (value: string): string => JSON.stringify(value);
+const printableJsonString = jsonStringLiteral;
+
+// Row index for the table's header band. It is on screen and its field names are
+// searchable, but it is not a row in the virtualized list, so it addresses no
+// index there — stepping to it scrolls horizontally only.
+const TABLE_HEADER_ROW_INDEX = -1;
+
+// Width of the table's row-number gutter, ahead of the first data column.
+// Shared by the header, the rows, the body's minWidth and find's horizontal
+// scrolling, all of which have to agree on where a column starts.
+const TABLE_ROW_NUMBER_WIDTH_PX = 48;
 
 // One row of the tree-table view (Key | Value | Type), data-only for cheap virtualization.
 interface TreeRow {
@@ -402,6 +425,9 @@ interface TreeRow {
 interface JsonRowExtra {
   lines: JsonLine[];
   collapsedFolds: Set<number>;
+  /** Highlight class for a matched line, or undefined. Module-scope row, so
+   *  the lookup is passed in rather than closed over. */
+  findHighlightClass: (rowId: number) => string | undefined;
   toggleFold: (id: number) => void;
   documents: Array<Record<string, any>>;
   openCtxMenu: (
@@ -430,6 +456,7 @@ const JsonRow = ({
   style,
   lines,
   collapsedFolds,
+  findHighlightClass,
   toggleFold,
   documents,
   openCtxMenu,
@@ -447,7 +474,8 @@ const JsonRow = ({
       className={cn(
         'flex items-center whitespace-pre hover:bg-accent',
         line.docIndex % 2 === 0 ? 'bg-background' : 'bg-card',
-        line.isDocRoot && line.docIndex > 0 && 'border-t border-border'
+        line.isDocRoot && line.docIndex > 0 && 'border-t border-border',
+        findHighlightClass(line.num)
       )}
       data-doc-even={line.docIndex % 2 === 0}
       onContextMenu={(e) => openCtxMenu(e, documents[line.docIndex], line.kind === 'scalar' ? line.keyName ?? undefined : undefined, line.value)}
@@ -709,6 +737,52 @@ export const DataGrid: React.FC<DataGridProps> = ({
   const [explainView, setExplainView] = useState<'visual' | 'json'>('visual');
   // Collapsed fold blocks in the JSON view, keyed by their generated fold id.
   const [collapsedFolds, setCollapsedFolds] = useState<Set<number>>(new Set());
+
+  // ── Local find over the loaded results (#279) ────────────────────────────
+  // Searches what is already on screen; the query filter above re-queries the
+  // server and is a different job.
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [activeMatch, setActiveMatch] = useState(-1);
+  // Bumped on every shortcut press so the bar refocuses even when already open.
+  const [findFocusToken, setFindFocusToken] = useState(0);
+  // The whole pane, toolbar included. Clicking a pane's view-mode or tab
+  // controls is how a user selects it before searching, so those controls have
+  // to be inside the element that routing tests against — a root starting at the
+  // results body would leave such a click pointing at no pane at all.
+  const paneRootRef = React.useRef<HTMLDivElement>(null);
+  const jsonListRef = React.useRef<ListImperativeAPI | null>(null);
+  const treeListRef = React.useRef<ListImperativeAPI | null>(null);
+  const tableListRef = React.useRef<ListImperativeAPI | null>(null);
+
+  // Several results panes can be mounted at once, so the shortcut is routed
+  // rather than bound per instance — see resultsFindShortcut.
+  //
+  // Registered only while the results are actually showing: the find bar lives
+  // in the results tab, so claiming the key from the explain or code tab would
+  // swallow it and open a bar the user cannot see.
+  useEffect(() => {
+    if (effectiveTab !== 'results') return;
+    return registerResultsFindTarget({
+      element: () => paneRootRef.current,
+      open: () => {
+        setFindOpen(true);
+        setFindFocusToken((token) => token + 1);
+      },
+    });
+  }, [effectiveTab]);
+
+  const closeFind = React.useCallback(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    setActiveMatch(-1);
+  }, []);
+
+  // Leaving the results tab unmounts the bar, so drop the state with it rather
+  // than coming back to a query the user can no longer see being applied.
+  useEffect(() => {
+    if (effectiveTab !== 'results') closeFind();
+  }, [effectiveTab, closeFind]);
   // Collapsed rows in the tree-table view (separate id space from JSON folds).
   const [treeCollapsed, setTreeCollapsed] = useState<Set<number>>(new Set());
 
@@ -763,20 +837,13 @@ export const DataGrid: React.FC<DataGridProps> = ({
     return Array.from(keys);
   }, [documents]);
 
-  const isBsonObject = (val: any): boolean => {
-    if (val === null || val === undefined) return false;
-    return (
-      val instanceof ObjectId ||
-      val instanceof Date ||
-      val instanceof Long ||
-      val instanceof Decimal128 ||
-      val instanceof Int32 ||
-      val instanceof Double ||
-      val instanceof Binary ||
-      val instanceof Timestamp
-    );
-  };
+  // A value the grid gives a constructor call to. Delegates so this list cannot
+  // fall behind bsonDisplay's.
+  const isBsonObject = (val: any): boolean => isBsonInstance(val);
 
+  // Paints the shared display descriptor. Only the colours live here; what the
+  // text *is* comes from bsonDisplay, which local find reads too, so the two
+  // cannot disagree about what is on screen.
   const renderBsonValueNode = (val: any): React.ReactNode => {
     if (val === null) return <span className="text-syntax-null">null</span>;
     if (typeof val === 'boolean') return <span className="text-syntax-boolean font-bold">{val ? 'true' : 'false'}</span>;
@@ -785,68 +852,20 @@ export const DataGrid: React.FC<DataGridProps> = ({
       return <span className="text-syntax-string">{printableJsonString(val)}</span>;
     }
 
-    if (val instanceof ObjectId) {
+    const call = bsonCallOf(val);
+    if (call) {
       return (
         <>
-          <span className="text-syntax-boolean">ObjectId</span>(
-          <span className="text-syntax-string">{JSON.stringify(val.toString())}</span>)
-        </>
-      );
-    }
-    if (val instanceof Date) {
-      return (
-        <>
-          <span className="text-syntax-boolean">ISODate</span>(
-          <span className="text-syntax-string">{JSON.stringify(val.toISOString())}</span>)
-        </>
-      );
-    }
-    if (val instanceof Long) {
-      return (
-        <>
-          <span className="text-syntax-boolean">NumberLong</span>(
-          <span className="text-syntax-number">{val.toString()}</span>)
-        </>
-      );
-    }
-    if (val instanceof Decimal128) {
-      return (
-        <>
-          <span className="text-syntax-boolean">NumberDecimal</span>(
-          <span className="text-syntax-string">{JSON.stringify(val.toString())}</span>)
-        </>
-      );
-    }
-    if (val instanceof Int32) {
-      return (
-        <>
-          <span className="text-syntax-boolean">NumberInt</span>(
-          <span className="text-syntax-number">{val.toString()}</span>)
-        </>
-      );
-    }
-    if (val instanceof Double) {
-      return (
-        <>
-          <span className="text-syntax-boolean">Double</span>(
-          <span className="text-syntax-number">{val.toString()}</span>)
-        </>
-      );
-    }
-    if (val instanceof Binary) {
-      return (
-        <>
-          <span className="text-syntax-boolean">BinData</span>(
-          <span className="text-syntax-number">{val.sub_type}</span>, 
-          <span className="text-syntax-string">{JSON.stringify(val.toString('base64'))}</span>)
-        </>
-      );
-    }
-    if (val instanceof Timestamp) {
-      return (
-        <>
-          <span className="text-syntax-boolean">Timestamp</span>(
-          <span className="text-syntax-number">{val.toString()}</span>)
+          <span className="text-syntax-boolean">{call.ctor}</span>(
+          {call.args.map((arg, i) => (
+            <React.Fragment key={i}>
+              {i > 0 && ', '}
+              <span className={arg.kind === 'number' ? 'text-syntax-number' : 'text-syntax-string'}>
+                {arg.text}
+              </span>
+            </React.Fragment>
+          ))}
+          )
         </>
       );
     }
@@ -861,21 +880,17 @@ export const DataGrid: React.FC<DataGridProps> = ({
     if (typeof val === 'number') return <span className="text-syntax-number">{String(val)}</span>;
     if (typeof val === 'boolean') return <span className="text-syntax-boolean font-bold">{val ? 'true' : 'false'}</span>;
     if (typeof val === 'object') {
-      if (isBsonObject(val)) return renderBsonValueNode(val);
-      if (typeof val.$oid === 'string') return <span className="text-syntax-string">{val.$oid}</span>;
-      if (val.$date !== undefined) {
-        const s =
-          typeof val.$date === 'string'
-            ? val.$date
-            : val.$date?.$numberLong
-              ? new Date(Number(val.$date.$numberLong)).toISOString()
-              : JSON.stringify(val.$date);
-        return <span className="text-syntax-string">{s}</span>;
+      if (isBsonInstance(val)) return renderBsonValueNode(val);
+      const plain = plainBsonShape(val);
+      if (plain) {
+        return (
+          <span
+            className={plain.kind === 'number' ? 'text-syntax-number' : 'text-syntax-string'}
+          >
+            {plain.text}
+          </span>
+        );
       }
-      if (val.$numberLong !== undefined) return <span className="text-syntax-number">{String(val.$numberLong)}</span>;
-      if (val.$numberDecimal !== undefined) return <span className="text-syntax-number">{String(val.$numberDecimal)}</span>;
-      if (val.$numberInt !== undefined) return <span className="text-syntax-number">{String(val.$numberInt)}</span>;
-      if (val.$numberDouble !== undefined) return <span className="text-syntax-number">{String(val.$numberDouble)}</span>;
       return <span className="text-muted-foreground">{JSON.stringify(val)}</span>;
     }
     return <span>{String(val)}</span>;
@@ -885,15 +900,11 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // so the JSON view can render a continuous, line-numbered, collapsible panel.
   // Approximate rendered character count of a scalar value (for horizontal width).
   const valueLen = (v: any): number => {
-    if (v === null) return 4;
-    if (typeof v === 'boolean') return v ? 4 : 5;
-    if (typeof v === 'number') return String(v).length;
-    if (typeof v === 'string') return printableJsonString(v).length;
-    if (v instanceof ObjectId) return 40;
-    if (v instanceof Date) return 36;
-    if (v instanceof Binary) return 64;
-    if (isBsonObject(v)) return String((v as any).toString?.() ?? '').length + 16;
-    return 12;
+    // Containers get lines of their own, so only their bracket is on this one.
+    if (v !== null && typeof v === 'object' && !isBsonObject(v)) return 12;
+    // Exact rather than estimated: the displayed text is now available, so the
+    // per-type guesses (40 for an ObjectId, 64 for any Binary) are gone.
+    return bsonValueText(v).length;
   };
 
   const { jsonLines, jsonMaxWidthPx } = useMemo<{ jsonLines: JsonLine[]; jsonMaxWidthPx: number }>(() => {
@@ -1018,6 +1029,25 @@ export const DataGrid: React.FC<DataGridProps> = ({
     }
   };
 
+  // The text of one JSON line, mirroring renderJsonLineContent above: the quoted
+  // key, the separator, the value or bracket, and the trailing comma. Find
+  // searches exactly what that renderer paints, so a visible `ObjectId(`, a
+  // quote, or an escaped `\n` is matchable.
+  const jsonLineText = (line: JsonLine): string => {
+    const key = line.keyName !== null ? `"${line.keyName}" : ` : '';
+    const comma = line.hasComma ? ',' : '';
+    switch (line.kind) {
+      case 'scalar':
+        return `${key}${bsonValueText(line.value)}${comma}`;
+      case 'open':
+        return `${key}${line.bracket || '{'}`;
+      case 'empty':
+        return `${key}${line.brackets || '{}'}${comma}`;
+      case 'close':
+        return `${line.bracket || '}'}${comma}`;
+    }
+  };
+
   const toggleFold = (id: number) => {
     setCollapsedFolds((prev) => {
       const next = new Set(prev);
@@ -1028,16 +1058,14 @@ export const DataGrid: React.FC<DataGridProps> = ({
   };
 
   // ── Tree-table view (Key | Value | Type) ──────────────────────────────────
+  // The Type column. BSON instances are labelled from bsonDisplay's ordered
+  // table — the same table that decides the value's constructor call — so the
+  // two columns of one row cannot contradict each other. The rest is
+  // JavaScript-level and belongs here.
   const bsonTypeLabel = (v: any): string => {
     if (v === null) return 'Null';
-    if (v instanceof ObjectId) return 'ObjectId';
-    if (v instanceof Date) return 'Date';
-    if (v instanceof Decimal128) return 'Decimal128';
-    if (v instanceof Long) return 'Int64';
-    if (v instanceof Int32) return 'Int32';
-    if (v instanceof Double) return 'Double';
-    if (v instanceof Binary) return 'Binary';
-    if (v instanceof Timestamp) return 'Timestamp';
+    const bson = bsonInstanceTypeLabel(v);
+    if (bson) return bson;
     if (Array.isArray(v)) return 'Array';
     if (typeof v === 'object') return 'Object';
     if (typeof v === 'boolean') return 'Boolean';
@@ -1114,6 +1142,103 @@ export const DataGrid: React.FC<DataGridProps> = ({
   useEffect(() => {
     setTreeCollapsed(new Set(treeDefaultCollapsed));
   }, [treeDefaultCollapsed]);
+
+  // The text of one tree row: all three columns, since all three are on screen.
+  // Container rows show their child count, so that label is searchable too.
+  const treeRowText = (row: TreeRow): string => {
+    const value =
+      row.kind === 'scalar'
+        ? bsonValueText(row.value)
+        : row.kind === 'array'
+          ? t('dataGrid.labels.elements', { count: row.childCount })
+          : t('dataGrid.labels.fields', { count: row.childCount });
+    return `${row.keyName} ${value} ${row.type}`;
+  };
+
+  // Flatten the active view into searchable cells. Built from the *full* row
+  // lists, not the visible ones: every view is virtualized and folds can hide a
+  // row, so a match must be findable before it is rendered.
+  const findCells = useMemo<FindCell[]>(() => {
+    if (!findOpen) return [];
+    if (viewMode === 'json') {
+      // Every line, brackets included: they are rendered, so they are findable.
+      return jsonLines.map((line) => ({
+        rowIndex: line.num,
+        text: jsonLineText(line),
+        ancestors: line.ancestors,
+      }));
+    }
+    if (viewMode === 'tree') {
+      return treeRows.map((row) => ({
+        rowIndex: row.num,
+        text: treeRowText(row),
+        ancestors: row.ancestors,
+      }));
+    }
+    if (viewMode === 'table') {
+      // Each column header once, then the cell values. A field name shown only
+      // in the header has to be findable, but adding it to every cell's text
+      // would report a match per row for text that appears a single time — so it
+      // is indexed as the one thing it is, ahead of the rows it labels.
+      //
+      // The tree view's "Key"/"Value"/"Type" headings are deliberately not
+      // indexed: those are fixed chrome, whereas a table heading is a field name
+      // from the documents themselves.
+      const headers: FindCell[] = columns.map((col) => ({
+        rowIndex: TABLE_HEADER_ROW_INDEX,
+        columnKey: col,
+        text: col,
+      }));
+      return headers.concat(
+        documents.flatMap((doc, index) =>
+          columns.map((col) => ({
+            rowIndex: index,
+            columnKey: col,
+            text: tableValueText((doc as Record<string, unknown>)?.[col]),
+          }))
+        )
+      );
+    }
+    // Chart has no text to search.
+    return [];
+    // jsonLineText/treeRowText are recreated each render but read only the rows
+    // and the translator, both of which are already dependencies.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findOpen, viewMode, jsonLines, treeRows, documents, columns, t]);
+
+  const findMatchList = useMemo(() => findMatches(findCells, findQuery), [findCells, findQuery]);
+
+  // A new match list starts from its first match. Done during render, not in an
+  // effect: an effect resets one render too late, and in that render the reveal
+  // effect below would take the *old* index into the *new* list and expand the
+  // folds around a match that is not the selected one. Nothing collapses those
+  // again, so they stayed open for the rest of the session.
+  //
+  // This is React's documented "adjusting state when props change" pattern — the
+  // render output is discarded and immediately retried, so no effect ever
+  // observes the stale index. Editing the query is the common way in, but a view
+  // switch or a new result set changes the list the same way.
+  const [matchListOfActive, setMatchListOfActive] = useState(findMatchList);
+  if (matchListOfActive !== findMatchList) {
+    setMatchListOfActive(findMatchList);
+    setActiveMatch(findMatchList.length > 0 ? 0 : -1);
+  }
+
+  const activeFindMatch = activeMatch >= 0 ? findMatchList[activeMatch] : undefined;
+
+  // Open whatever folds hide the active match. The two views keep separate
+  // collapse state, so each is updated on its own.
+  useEffect(() => {
+    if (!activeFindMatch || activeFindMatch.ancestors.length === 0) return;
+    const reveal = (prev: Set<number>) => {
+      if (!activeFindMatch.ancestors.some((a) => prev.has(a))) return prev;
+      const next = new Set(prev);
+      for (const ancestor of activeFindMatch.ancestors) next.delete(ancestor);
+      return next;
+    };
+    if (viewMode === 'json') setCollapsedFolds(reveal);
+    else if (viewMode === 'tree') setTreeCollapsed(reveal);
+  }, [activeFindMatch, viewMode]);
 
   const visibleTreeRows = useMemo(
     () => treeRows.filter((r) => !r.ancestors.some((a) => treeCollapsed.has(a))),
@@ -1214,13 +1339,19 @@ export const DataGrid: React.FC<DataGridProps> = ({
         className="flex items-center border-b border-border font-mono text-xs hover:bg-accent"
         onContextMenu={(e) => openCtxMenu(e, rawDoc)}
       >
-        <div className="flex h-full w-12 shrink-0 select-none items-center justify-center border-r border-border text-[10px] text-muted-foreground">
+        <div
+          className="flex h-full shrink-0 select-none items-center justify-center border-r border-border text-[10px] text-muted-foreground"
+          style={{ width: `${TABLE_ROW_NUMBER_WIDTH_PX}px` }}
+        >
           {index + 1}
         </div>
         {columns.map((col) => (
           <div
             key={col}
-            className="flex h-full items-center truncate border-r border-border px-3 text-foreground"
+            className={cn(
+              'flex h-full items-center truncate border-r border-border px-3 text-foreground',
+              findHighlightClass(index, col)
+            )}
             style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
             onContextMenu={(e) => openCtxMenu(e, rawDoc, col, rawDoc[col])}
           >
@@ -1236,6 +1367,94 @@ export const DataGrid: React.FC<DataGridProps> = ({
     );
   };
 
+
+  // Bring the matched column into view as well as the matched row. The table
+  // scrolls in both directions once resized columns overflow, so a vertical jump
+  // alone can leave the highlighted cell off the side of the viewport while the
+  // counter says it is active.
+  //
+  // Which box actually scrolls sideways is not fixed — it is this wrapper or the
+  // virtualized List's own scroller, depending on overflow — so the one that can
+  // is found rather than assumed, the same way the header-sync listener does it.
+  const scrollTableColumnIntoView = React.useCallback(
+    (columnKey: string) => {
+      const wrapper = tableBodyRef.current;
+      if (!wrapper) return;
+      const candidates = [wrapper, ...Array.from(wrapper.querySelectorAll<HTMLElement>('*'))];
+      const scroller = candidates.find((el) => el.scrollWidth > el.clientWidth);
+      if (!scroller) return;
+
+      const columnIndex = columns.indexOf(columnKey);
+      if (columnIndex < 0) return;
+      // The row-number gutter is `w-12`, ahead of the first column.
+      const left =
+        TABLE_ROW_NUMBER_WIDTH_PX +
+        columns.slice(0, columnIndex).reduce((sum, col) => sum + colWidth(col), 0);
+      const right = left + colWidth(columnKey);
+
+      // Only move when the cell is actually outside the visible band, so
+      // stepping between matches in already-visible columns doesn't jiggle.
+      if (left < scroller.scrollLeft) scroller.scrollLeft = left;
+      else if (right > scroller.scrollLeft + scroller.clientWidth) {
+        scroller.scrollLeft = right - scroller.clientWidth;
+      }
+    },
+    [columns, colWidths]
+  );
+
+  // Scroll after the visible lists recompute, so revealing a fold and jumping to
+  // the row happen in the right order. `scrollToRow` throws on an out-of-range
+  // index, so the row is looked up rather than assumed present.
+  useEffect(() => {
+    if (!activeFindMatch) return;
+    if (viewMode === 'table') {
+      if (
+        activeFindMatch.rowIndex >= 0 &&
+        activeFindMatch.rowIndex < documents.length
+      ) {
+        tableListRef.current?.scrollToRow({ index: activeFindMatch.rowIndex, align: 'smart' });
+      }
+      if (activeFindMatch.columnKey) scrollTableColumnIntoView(activeFindMatch.columnKey);
+      return;
+    }
+    const rows = viewMode === 'json' ? visibleJsonLines : viewMode === 'tree' ? visibleTreeRows : [];
+    const index = rows.findIndex((row) => row.num === activeFindMatch.rowIndex);
+    if (index < 0) return;
+    const list = viewMode === 'json' ? jsonListRef : treeListRef;
+    list.current?.scrollToRow({ index, align: 'smart' });
+  }, [
+    activeFindMatch,
+    viewMode,
+    visibleJsonLines,
+    visibleTreeRows,
+    documents.length,
+    scrollTableColumnIntoView,
+  ]);
+
+  // Row-level highlighting: every view renders its values through its own
+  // coloured spans, so marking the containing row or cell keeps one mechanism
+  // across all three instead of threading a text range through each renderer.
+  const findMatchedRows = useMemo(
+    () => new Set(findMatchList.filter((m) => !m.columnKey).map((m) => m.rowIndex)),
+    [findMatchList]
+  );
+  const findMatchedCells = useMemo(
+    () =>
+      new Set(
+        findMatchList.filter((m) => m.columnKey).map((m) => `${m.rowIndex}:${m.columnKey}`)
+      ),
+    [findMatchList]
+  );
+  const findHighlightClass = (rowId: number, columnKey?: string): string | undefined => {
+    if (!findOpen || findQuery.trim() === '') return undefined;
+    const matched = columnKey
+      ? findMatchedCells.has(`${rowId}:${columnKey}`)
+      : findMatchedRows.has(rowId);
+    if (!matched) return undefined;
+    return isMatchAt(activeFindMatch, rowId, columnKey)
+      ? 'bg-warning/40 ring-1 ring-inset ring-warning'
+      : 'bg-warning/15';
+  };
 
   // Row height depends on viewMode and density
   const getRowHeight = () => {
@@ -1265,7 +1484,8 @@ export const DataGrid: React.FC<DataGridProps> = ({
         className={cn(
           'flex items-center border-b border-border font-mono text-[11.5px] hover:bg-accent',
           row.docIndex % 2 === 0 ? 'bg-background' : 'bg-card',
-          row.isDocRoot && row.docIndex > 0 && 'border-t border-border'
+          row.isDocRoot && row.docIndex > 0 && 'border-t border-border',
+          findHighlightClass(row.num)
         )}
         data-doc-even={row.docIndex % 2 === 0}
         onContextMenu={(e) => openCtxMenu(e, documents[row.docIndex], row.kind === 'scalar' ? row.keyName : undefined, row.value)}
@@ -1299,7 +1519,10 @@ export const DataGrid: React.FC<DataGridProps> = ({
     );
   };
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
+    <div
+      ref={paneRootRef}
+      className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+    >
       {/* Control Bar — omitted for a chromeless render, where none of these
           controls have anything to act on. */}
       {!chromeless && (
@@ -1507,6 +1730,18 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
       {effectiveTab === 'results' ? (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {findOpen && (
+          <ResultsFindBar
+            query={findQuery}
+            onQueryChange={setFindQuery}
+            matchCount={findMatchList.length}
+            activeIndex={activeMatch}
+            onNext={() => setActiveMatch((i) => stepMatch(findMatchList.length, i, 1))}
+            onPrevious={() => setActiveMatch((i) => stepMatch(findMatchList.length, i, -1))}
+            onClose={closeFind}
+            focusToken={findFocusToken}
+          />
+        )}
         {!documents || documents.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center p-8 text-muted-foreground">
             <ListFilter size={24} className="mb-2 text-muted-foreground" />
@@ -1517,11 +1752,13 @@ export const DataGrid: React.FC<DataGridProps> = ({
             <div className="min-h-0 flex-1 min-w-0 overflow-auto">
               <List<JsonRowExtra>
                 rowCount={visibleJsonLines.length}
+                listRef={jsonListRef}
                 rowHeight={getRowHeight()}
                 rowComponent={JsonRow}
                 rowProps={{
                   lines: visibleJsonLines,
                   collapsedFolds,
+                  findHighlightClass,
                   toggleFold,
                   documents,
                   openCtxMenu,
@@ -1551,6 +1788,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
             <div className="min-h-0 flex-1 min-w-0 overflow-hidden">
               <List<{}>
                 rowCount={visibleTreeRows.length}
+                listRef={treeListRef}
                 rowHeight={getRowHeight()}
                 rowComponent={TreeRowComponent}
                 rowProps={{}}
@@ -1574,13 +1812,19 @@ export const DataGrid: React.FC<DataGridProps> = ({
                 className="flex h-6 shrink-0 select-none items-center overflow-hidden border-b border-border bg-sidebar text-ui-2xs font-bold uppercase tracking-wider text-muted-foreground"
                 style={{ scrollbarGutter: 'stable' }}
               >
-                <div className="flex items-center justify-center border-r border-border w-12 flex-shrink-0">
+                <div
+                  className="flex items-center justify-center border-r border-border flex-shrink-0"
+                  style={{ width: `${TABLE_ROW_NUMBER_WIDTH_PX}px` }}
+                >
                   #
                 </div>
                 {columns.map((col) => (
                   <div
                     key={col}
-                    className="px-3 border-r border-border flex items-center truncate relative"
+                    className={cn(
+                      'px-3 border-r border-border flex items-center truncate relative',
+                      findHighlightClass(TABLE_HEADER_ROW_INDEX, col)
+                    )}
                     style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
                   >
                     {col}
@@ -1604,10 +1848,11 @@ export const DataGrid: React.FC<DataGridProps> = ({
             >
               <List<{}>
                 rowCount={documents.length}
+                listRef={tableListRef}
                 rowHeight={getRowHeight()}
                 rowComponent={Row}
                 rowProps={{}}
-                style={{ height: '100%', width: '100%', minWidth: viewMode === 'table' ? `${columns.reduce((s, c) => s + colWidth(c), 0) + 48 + (hasRowActions ? 72 : 0)}px` : '100%' }}
+                style={{ height: '100%', width: '100%', minWidth: viewMode === 'table' ? `${columns.reduce((s, c) => s + colWidth(c), 0) + TABLE_ROW_NUMBER_WIDTH_PX + (hasRowActions ? 72 : 0)}px` : '100%' }}
               />
             </div>
           </div>

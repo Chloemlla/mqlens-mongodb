@@ -600,16 +600,31 @@ impl AuditLog {
         }
 
         let (framed, next) = encode_record(key, open.seq + 1, &open.head, event)?;
-        open.file
+        // Where the file ended before this frame. A failed append has to leave it
+        // exactly here: `seq` and `head` are only advanced after the fsync below,
+        // so bytes left behind by a half-written frame would be followed by the
+        // *next* append reusing this same sequence number. The reload then finds
+        // either a duplicate sequence or a frame that fails authentication, and
+        // seals the log — or reads the leftovers as a torn tail and drops every
+        // good record after them.
+        let start = open
+            .file
             .seek(SeekFrom::End(0))
             .map_err(|e| format!("seek {}: {e}", self.path.display()))?;
-        open.file
-            .write_all(&framed)
-            .map_err(|e| format!("append {}: {e}", self.path.display()))?;
+        if let Err(e) = open.file.write_all(&framed) {
+            let cause = format!("append {}: {e}", self.path.display());
+            return Err(rewind_failed_append(open, start, cause));
+        }
         // The point of the whole design: durability per event, not per batch.
-        open.file
-            .sync_data()
-            .map_err(|e| format!("fsync {}: {e}", self.path.display()))?;
+        //
+        // A failure here is ambiguous — the bytes may or may not have reached the
+        // platter — so the frame is removed rather than kept. This call already
+        // reports the event as unrecorded, and a log that matches its counter
+        // matters more than a record nobody was told about.
+        if let Err(e) = open.file.sync_data() {
+            let cause = format!("fsync {}: {e}", self.path.display());
+            return Err(rewind_failed_append(open, start, cause));
+        }
 
         open.seq += 1;
         open.head = next;
@@ -724,6 +739,18 @@ impl AuditLog {
         slot.take().map(|open| RetainedLock(open.lock))
     }
 
+    /// Take the cross-process lock without opening a session.
+    ///
+    /// Key rotation rewrites the log and its state sidecar even when this
+    /// instance has no session — auditing switched off, or another instance
+    /// already owns the log. In that second case the rotation previously ran with
+    /// no lock at all: the owning instance kept appending under the old key, and
+    /// its next state write landed on top of the freshly rotated sidecar, leaving
+    /// a log that authenticates against neither key.
+    pub fn acquire_retained_lock(&self) -> Result<RetainedLock, String> {
+        self.acquire_lock().map(RetainedLock)
+    }
+
     /// Recover the log using a lock that is already held.
     pub fn open_retaining(
         &self,
@@ -731,6 +758,24 @@ impl AuditLog {
         lock: RetainedLock,
     ) -> Result<(Vec<AuditEvent>, LoadReport), String> {
         self.open_inner(key, Some(lock))
+    }
+}
+
+/// Undo a frame that failed to land, or seal the session if it cannot be undone.
+///
+/// Returns the error to report. Sealing is the fallback because the alternative —
+/// carrying on with an unaccounted tail — turns one lost event into a log that
+/// refuses to load at all.
+fn rewind_failed_append(open: &mut Open, start: u64, cause: String) -> String {
+    match open.file.set_len(start).and_then(|()| open.file.sync_data()) {
+        Ok(()) => cause,
+        Err(e) => {
+            let reason = format!(
+                "{cause}; the partial record could not be removed either ({e}), so the log now                  ends in bytes no counter accounts for"
+            );
+            open.sealed_reason = Some(reason.clone());
+            format!("audit log is sealed: {reason}")
+        }
     }
 }
 
@@ -1142,10 +1187,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let (log, path) = log_with(dir.path(), 3);
 
-        // Block only the state sidecar's staging path, so the data file is
-        // replaced but the counter cannot follow it.
-        let state_tmp = dir.path().join("audit.log.enc.state.tmp");
-        fs::create_dir(&state_tmp).unwrap();
+        // Block only the state sidecar, so the data file is replaced but the
+        // counter cannot follow it. Standing a directory in the sidecar's place
+        // makes its rename fail; the staging path is unpredictable by design, so
+        // a test must not reach for it.
+        let state = log.state_path().to_path_buf();
+        fs::remove_file(&state).unwrap();
+        fs::create_dir(&state).unwrap();
 
         let err = log
             .compact(&KEY, &[event("e3", 1_003)])
@@ -1256,6 +1304,102 @@ mod tests {
             events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
             ["e3", "e4"]
         );
+    }
+
+    #[test]
+    fn a_leftover_partial_frame_breaks_the_next_append() {
+        // The hazard the rewind below exists to prevent, demonstrated first:
+        // bytes left in the file while `seq` and `head` stay behind, then another
+        // append on top of them reusing the same sequence number.
+        let dir = tempdir().unwrap();
+        let (log, path) = log_with(dir.path(), 2);
+        {
+            let mut slot = log.open.lock().unwrap();
+            let open = slot.as_mut().unwrap();
+            open.file.seek(SeekFrom::End(0)).unwrap();
+            open.file.write_all(&[0xAB; 40]).unwrap();
+            open.file.sync_data().unwrap();
+        }
+        log.append(&KEY, &event("e3", 1_003)).expect("append lands on disk");
+        log.close();
+
+        let reopened = AuditLog::new(path.clone());
+        let (events, report) = reopened.open(&KEY).expect("load");
+        assert!(
+            report.integrity_error.is_some() || events.len() < 3,
+            "a tail nothing accounts for must not read back as a healthy log: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_append_leaves_the_file_at_its_previous_length() {
+        let dir = tempdir().unwrap();
+        let (log, path) = log_with(dir.path(), 2);
+        let before = fs::metadata(&path).unwrap().len();
+
+        // Stand in for a `write_all` that errors halfway: bytes on disk, `seq`
+        // and `head` not yet advanced. This is the state `append` unwinds from.
+        {
+            let mut slot = log.open.lock().unwrap();
+            let open = slot.as_mut().unwrap();
+            open.file.seek(SeekFrom::End(0)).unwrap();
+            open.file.write_all(&[0xAB; 40]).unwrap();
+            open.file.sync_data().unwrap();
+            assert!(fs::metadata(&path).unwrap().len() > before);
+
+            let reported = rewind_failed_append(open, before, "simulated write failure".into());
+            assert_eq!(
+                reported, "simulated write failure",
+                "a clean rewind reports the original cause, not a seal"
+            );
+            assert!(
+                open.sealed_reason.is_none(),
+                "a clean rewind must not seal the session"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            before,
+            "the partial frame must be gone"
+        );
+
+        // And the session is still usable: the next append takes the sequence
+        // the failed one never consumed.
+        log.append(&KEY, &event("e3", 1_003)).expect("append after rewind");
+        log.close();
+
+        let reopened = AuditLog::new(path.clone());
+        let (events, report) = reopened.open(&KEY).expect("load");
+        assert!(report.integrity_error.is_none(), "{report:?}");
+        assert_eq!(
+            events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["e1", "e2", "e3"]
+        );
+    }
+
+    #[test]
+    fn the_rotation_lock_excludes_another_instance() {
+        // Key rotation rewrites the log and its sidecar even with no session of
+        // its own. It must not be able to do that while another instance holds
+        // the log — hence taking the same lock, and failing if it is taken.
+        let dir = tempdir().unwrap();
+        let (log, path) = log_with(dir.path(), 1);
+
+        let rotator = AuditLog::new(path.clone());
+        let err = match rotator.acquire_retained_lock() {
+            Ok(_) => panic!("must not get the lock while another instance records"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("another MQLens instance"),
+            "the message should say why rotation cannot proceed: {err}"
+        );
+
+        log.close();
+        let held = rotator
+            .acquire_retained_lock()
+            .expect("available once the other instance releases it");
+        drop(held);
     }
 
     #[test]
