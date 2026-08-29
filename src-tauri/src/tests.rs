@@ -27,7 +27,6 @@ mod tests {
         std::array::from_fn(|_| byte)
     }
 
-    /// Build test-only passwords without hard-coded string literals for static analysis.
     #[test]
     fn model_listing_parses_both_http_shapes() {
         use crate::ai::parse_models_json;
@@ -105,6 +104,183 @@ mod tests {
         assert_eq!(args, ["run", "llama3:latest", "find users"]);
     }
 
+    #[test]
+    fn the_model_list_refuses_a_cleartext_key_before_any_request_leaves() {
+        // `list_ai_models` never went through `validate`, and it runs 600 ms
+        // after a key is typed — so Save was far too late to be the first check.
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        let mut p = AiProvider {
+            id: "p".into(),
+            name: "Remote".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "http://api.example.com/v1".into(),
+            api_key: "sk-secret".into(),
+            model: "m".into(),
+            command: String::new(),
+            models_command: String::new(),
+        };
+        let err = p.check_transport().unwrap_err();
+        assert!(err.contains("clear text"), "{err}");
+        p.base_url = "https://api.example.com/v1".into();
+        p.check_transport().expect("TLS is fine");
+        p.base_url = "http://localhost:11434/v1".into();
+        p.check_transport().expect("this machine is fine");
+    }
+
+    #[test]
+    fn a_redirect_to_cleartext_is_not_followed() {
+        // `check_transport` judges the URL the user typed. reqwest then followed up
+        // to ten redirects on its own, so an https endpoint answering 302 with an
+        // http location got the key sent again over that hop — and `x-api-key` is
+        // an ordinary header, so unlike `authorization` it is not stripped across
+        // origins. Automatic model loading meant no further user action was needed.
+        use crate::ai::redirect_is_safe;
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+
+        // From an https cloud endpoint: only the same host, and only over TLS.
+        let from = url("https://api.openai.com/v1/chat/completions");
+        assert!(
+            redirect_is_safe(&url("https://api.openai.com/v2/chat"), &from),
+            "same origin, different path"
+        );
+        // A different port on the same host is a different origin, and may well be
+        // a different program listening there.
+        assert!(
+            !redirect_is_safe(&url("https://api.openai.com:8443/v1"), &from),
+            "a port change must not carry the key"
+        );
+        for bad in [
+            // Another host, even over TLS: `x-api-key` is an ordinary header, so
+            // reqwest keeps it across origins and the credential would go with it.
+            "https://elsewhere.example/v1",
+            "https://api.openai.com.attacker.example/v1",
+            // A downgrade on the same host puts it on the wire in clear text.
+            "http://api.openai.com/v1",
+            "http://attacker.example/collect",
+        ] {
+            assert!(!redirect_is_safe(&url(bad), &from), "{bad} must not be followed");
+        }
+
+        // A local server is reached over http by design, and may stay there.
+        let local = url("http://localhost:11434/v1/models");
+        assert!(redirect_is_safe(&url("http://localhost:11434/api/tags"), &local));
+        // ...but not hop to whatever else is listening on this machine: Ollama on
+        // 11434 and something else on 1234 are not the same service.
+        assert!(
+            !redirect_is_safe(&url("http://localhost:1234/v1"), &local),
+            "another loopback port is another program"
+        );
+        // ...but not hop off the machine, TLS or not.
+        assert!(!redirect_is_safe(&url("https://elsewhere.example/v1"), &local));
+        assert!(!redirect_is_safe(&url("http://192.168.1.50:8000/v1"), &local));
+
+        // A plain scheme upgrade on the same host is strictly better than what was
+        // asked for: the port changes only because the scheme did.
+        let plain = url("http://llm.internal.example/v1/models");
+        assert!(redirect_is_safe(&url("https://llm.internal.example/v1/models"), &plain));
+        // An upgrade that also moves to a non-default port is not that case.
+        assert!(
+            !redirect_is_safe(&url("https://llm.internal.example:8443/v1"), &plain),
+            "an upgrade may not also change the port"
+        );
+        // Explicit ports that agree are fine.
+        let explicit = url("https://llm.internal.example:8443/v1/models");
+        assert!(redirect_is_safe(&url("https://llm.internal.example:8443/v2"), &explicit));
+    }
+
+    #[test]
+    fn both_model_list_commands_share_the_transport_checked_path() {
+        // The check was in `list_ai_models` and not `list_ai_models_for`, so a
+        // provider saved with a key and an `http://` endpoint still reached the
+        // network — automatically, on opening the panel.
+        let src = include_str!("lib.rs");
+        assert_eq!(
+            src.matches("ai::list_models_http(").count(),
+            1,
+            "only `list_models_for_provider` may issue an HTTP model list"
+        );
+        assert_eq!(
+            src.matches("ai::list_models_cli(").count(),
+            1,
+            "only `list_models_for_provider` may run a CLI model list"
+        );
+        assert_eq!(
+            src.matches("list_models_for_provider(").count(),
+            3,
+            "the definition plus both commands — a new caller must come through it"
+        );
+    }
+
+    #[test]
+    fn every_request_shares_the_one_redirect_constrained_client() {
+        // A new provider path is added by copying an existing one, and a bare
+        // `Client::new()` silently restores reqwest's follow-anything default.
+        let src = include_str!("ai.rs");
+        assert_eq!(
+            src.matches("Client::builder()").count(),
+            1,
+            "only `http_client` may build a client"
+        );
+        assert_eq!(
+            src.matches("reqwest::Client::new()").count(),
+            0,
+            "`Client::new()` restores reqwest's follow-anything redirect default"
+        );
+        assert_eq!(
+            src.matches("http_client()").count(),
+            7,
+            "six request paths plus the definition — a new one must go through it"
+        );
+    }
+
+    #[test]
+    fn only_provider_relevant_settings_changes_ask_the_panels_to_refresh() {
+        // Every successful patch used to broadcast, so changing the interface
+        // language or the theme made every open panel re-read its options — and
+        // the model-list effect that follows sends a *credentialed* request to the
+        // selected provider. An unrelated preference must not cause that.
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        let base = crate::connections::AppSettings::default();
+
+        // Unrelated preferences: no refresh.
+        let mut themed = base.clone();
+        themed.update_channel = "beta".into();
+        assert!(!crate::ai_options_changed(&base, &themed), "update channel");
+        let mut shell = base.clone();
+        shell.mongosh_path = "/usr/local/bin/mongosh".into();
+        assert!(!crate::ai_options_changed(&base, &shell), "mongosh path");
+        // A built-in key IS an AI-settings change, even though the options payload
+        // does not carry it: a picker whose first listing failed for want of a key
+        // stayed stuck on an empty list however often the key was corrected.
+        let mut anthropic = base.clone();
+        anthropic.anthropic_api_key = "sk-new".into();
+        assert!(crate::ai_options_changed(&base, &anthropic), "anthropic key");
+        let mut openai = base.clone();
+        openai.openai_api_key = "sk-new".into();
+        assert!(crate::ai_options_changed(&base, &openai), "openai key");
+        let mut gemini = base.clone();
+        gemini.gemini_api_key = "sk-new".into();
+        assert!(crate::ai_options_changed(&base, &gemini), "gemini key");
+
+        // Everything the picker actually shows: refresh.
+        let mut chosen = base.clone();
+        chosen.ai_provider = "deepseek".into();
+        assert!(crate::ai_options_changed(&base, &chosen), "default provider");
+        let mut added = base.clone();
+        added.ai_providers = vec![AiProvider {
+            id: "deepseek".into(), name: "DeepSeek".into(), kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.deepseek.com/v1".into(), api_key: "k".into(),
+            model: "deepseek-chat".into(), command: String::new(), models_command: String::new(),
+        }];
+        assert!(crate::ai_options_changed(&base, &added), "provider list");
+        let mut model = base.clone();
+        model.openai_model = "gpt-4o-mini".into();
+        assert!(crate::ai_options_changed(&base, &model), "built-in model");
+        let mut cmd = base.clone();
+        cmd.local_commands.insert("codex".into(), "codex exec {model} {prompt}".into());
+        assert!(crate::ai_options_changed(&base, &cmd), "local command");
+    }
+
     #[tokio::test]
     async fn a_pasted_key_is_trimmed_before_it_reaches_the_headers() {
         // Model loading runs on the uncommitted draft, so the trim on the save
@@ -115,9 +291,22 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let served = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap();
-            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Read until the end of the headers. TCP does not promise one read
+            // returns the whole request, so asserting on a single read would
+            // inspect a truncated request whenever it happened to split.
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break; // peer half-closed
+                }
+                received.extend_from_slice(&chunk[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let received = String::from_utf8_lossy(&received).to_string();
             let body = br#"{"data":[{"id":"m1"}]}"#;
             let head = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
@@ -181,6 +370,46 @@ mod tests {
         assert!(crate::ai::ANTHROPIC_URL.starts_with("https://api.anthropic.com/"));
     }
 
+    #[tokio::test]
+    async fn a_stalled_endpoint_gives_up_instead_of_hanging_the_chat() {
+        // A server that accepts the connection and then says nothing at all.
+        // Bounding only `send()` would not catch this once headers had arrived,
+        // and bounding neither left the chat disabled with no way out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accepting = tokio::spawn(async move {
+            // Hold every connection open, unanswered, for as long as the test runs.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let request = reqwest::Client::new().post(format!("http://{addr}/v1/chat/completions"));
+        let err = crate::ai::send_json_within(
+            request,
+            "Stalled provider",
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .expect_err("a stalled endpoint must not be waited on forever");
+        assert!(err.contains("did not answer within"), "{err}");
+        assert!(err.contains("Stalled provider"), "{err}");
+    }
+
+    #[test]
+    fn every_request_in_ai_rs_goes_through_the_bounded_helper() {
+        // The deadline can only be verified per call site, and a new provider
+        // path is added by copying an existing one. Keeping `send()` in exactly
+        // one place is what makes "every request is bounded" checkable at all.
+        let src = include_str!("ai.rs");
+        assert_eq!(
+            src.matches(".send()").count(),
+            1,
+            "a request outside `send_json_within` would have no deadline; route it through the helper"
+        );
+    }
+
     #[test]
     fn a_quoted_path_survives_command_parsing() {
         // `split_whitespace` kept the quotes and split the path, so Python got
@@ -200,7 +429,10 @@ mod tests {
             crate::ai::split_command_line_for(r"cmd /My\ Path/x", false).unwrap(),
             ["cmd", "/My Path/x"]
         );
-        assert_eq!(split_command_line(r"cmd 'a'").unwrap(), ["cmd", r"a"]);
+        assert_eq!(
+            split_command_line(r"cmd 'a\b'").unwrap(),
+            ["cmd", r"a\b"],
+        );
         // An empty quoted argument is a real argument.
         assert_eq!(split_command_line(r#"cmd "" x"#).unwrap(), ["cmd", "", "x"]);
     }
@@ -368,6 +600,260 @@ mod tests {
         assert_eq!(args, ["say {prompt}"]);
     }
 
+    // ── AiReply: thoughts, notes, images ─────────────────────────────────
+
+    #[test]
+    fn split_keeps_the_prose_around_the_json_as_notes() {
+        use crate::ai::split_json_object;
+        let text = "Looking at the fields, `age` is numeric so a range filter works.\n\
+                    {\"queryType\":\"find\",\"filter\":{\"age\":{\"$gt\":30}},\"sort\":{},\"pipeline\":[]}\n\
+                    That should be indexed.";
+        let (json, notes) = split_json_object(text).unwrap();
+        assert!(json.starts_with("{\"queryType\""), "{json}");
+        let notes = notes.expect("prose is kept");
+        assert!(notes.contains("range filter"), "{notes}");
+        assert!(notes.contains("should be indexed"), "{notes}");
+        assert!(!notes.contains("queryType"), "the JSON itself is not part of the notes: {notes}");
+    }
+
+    #[test]
+    fn split_takes_the_last_parsing_object_so_braces_in_notes_do_not_mislead() {
+        // Notes about a query naturally contain braces. `{ age: {$gt: 30} }` is
+        // not valid JSON (bare keys) and must not be mistaken for the answer.
+        use crate::ai::split_json_object;
+        let text = "I'll filter with { age: {$gt: 30} } and sort by name.\n\
+                    {\"queryType\":\"find\",\"filter\":{\"age\":{\"$gt\":30}},\"sort\":{\"name\":1}}";
+        let (json, notes) = split_json_object(text).unwrap();
+        assert!(json.contains("\"name\":1"), "picked the real answer: {json}");
+        assert!(notes.unwrap().contains("sort by name"));
+    }
+
+    #[test]
+    fn split_prefers_the_final_object_when_two_valid_ones_appear() {
+        // A model that "shows its work" with a draft object then a corrected one
+        // means the last one. The prompt asks for exactly that.
+        use crate::ai::split_json_object;
+        let text = "Draft: {\"a\":1}\nFinal:\n{\"a\":2}";
+        let (json, _) = split_json_object(text).unwrap();
+        assert_eq!(json, "{\"a\":2}");
+    }
+
+    #[test]
+    fn split_strips_fences_from_notes_and_reports_no_notes_when_there_are_none() {
+        use crate::ai::split_json_object;
+        let (json, notes) = split_json_object("```json\n{\"a\":1}\n```").unwrap();
+        assert_eq!(json, "{\"a\":1}");
+        assert!(notes.is_none(), "fences alone are not notes: {notes:?}");
+        let (_, notes) = split_json_object("{\"a\":1}").unwrap();
+        assert!(notes.is_none());
+    }
+
+    #[test]
+    fn split_never_returns_a_fragment_of_a_malformed_answer() {
+        // A trailing comma makes the outer object invalid. The old scan stepped
+        // inside and returned the nested `{}` — which the panel read as "find
+        // everything". A broken answer has to surface as an error.
+        use crate::ai::split_json_object;
+        let bad = r#"{"queryType":"find","filter":{"age":{"$gt":30}},"sort":{},}"#;
+        let err = split_json_object(bad).unwrap_err();
+        assert!(err.contains("no valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn split_refuses_a_truncated_answer_instead_of_returning_a_nested_part_of_it() {
+        // An answer cut off before its last brace never closes, so everything in
+        // it is nested inside an object with no end. Stepping past the opening
+        // brace and scanning inside handed back the nested filter as the whole
+        // reply, which the panel ran as a query of its own.
+        use crate::ai::split_json_object;
+        let err = split_json_object(r#"{"queryType":"find","filter":{"tenant":"acme"}"#)
+            .unwrap_err();
+        assert!(err.contains("unterminated"), "{err}");
+
+        // A brace in prose has no quoted key, so it is still just stepped over:
+        // covered by `split_survives_a_stray_brace_in_prose_before_the_answer`.
+
+        // The cost of the rule, pinned deliberately rather than left to be
+        // discovered: a note containing a *JSON-shaped* truncated brace before the
+        // real answer fails the whole reply. Everything after an unterminated `{`
+        // is nested inside it, so the answer cannot be told apart from a fragment
+        // of a cut-off one — and refusing is the safe half of that ambiguity,
+        // since the alternative silently runs a query the user never asked for.
+        let err = split_json_object(
+            "The filter is {\"tenant\": \"acme\"\n{\"queryType\":\"find\",\"filter\":{}}",
+        )
+        .unwrap_err();
+        assert!(err.contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn split_refuses_a_malformed_final_object_rather_than_returning_note_json() {
+        // The model wrote a note containing a valid object, then its intended
+        // answer with a trailing comma. Skipping the broken answer and returning
+        // the note leaves the panel with a filter the user never asked for, and
+        // one that looks entirely valid — so the reply has to be refused.
+        use crate::ai::split_json_object;
+        let text = "Using {\"status\":\"active\"} as a starting point.\n\
+                    {\"queryType\":\"find\",\"filter\":{\"status\":\"active\"},}";
+        let err = split_json_object(text).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn split_survives_a_stray_brace_in_prose_before_the_answer() {
+        use crate::ai::split_json_object;
+        let (json, notes) = split_json_object("use { for grouping\n{\"a\":1}").unwrap();
+        assert_eq!(json, "{\"a\":1}");
+        assert!(notes.unwrap().contains("grouping"));
+    }
+
+    #[test]
+    fn split_distinguishes_no_json_from_invalid_json() {
+        use crate::ai::split_json_object;
+        assert!(split_json_object("no braces here").unwrap_err().contains("no JSON object"));
+        assert!(split_json_object("only { bare: keys }").unwrap_err().contains("no valid JSON"));
+    }
+
+    #[test]
+    fn the_prompts_now_allow_notes_but_still_demand_one_final_object() {
+        use crate::ai::{mql_shell_system_prompt, mql_system_prompt};
+        for p in [mql_system_prompt("c", &[]), mql_shell_system_prompt("c", &[])] {
+            assert!(p.contains("working notes"), "{p}");
+            assert!(p.contains("exactly one JSON object"), "{p}");
+            assert!(!p.contains("Output only that JSON"), "old rule must be gone: {p}");
+        }
+    }
+
+    fn png(data: &str) -> crate::ai::ImageAttachment {
+        crate::ai::ImageAttachment { media_type: "image/png".into(), data: data.into() }
+    }
+
+    #[test]
+    fn images_are_validated_before_any_request() {
+        use crate::ai::{validate_images, ImageAttachment, MAX_IMAGES};
+        validate_images(&[]).unwrap();
+        validate_images(&[png("aGVsbG8=")]).unwrap();
+        let too_many: Vec<_> = (0..=MAX_IMAGES).map(|_| png("aGVsbG8=")).collect();
+        assert!(validate_images(&too_many).unwrap_err().contains("At most"));
+        let bad_type = ImageAttachment { media_type: "image/tiff".into(), data: "x".into() };
+        assert!(validate_images(&[bad_type]).unwrap_err().contains("image/tiff"));
+        assert!(validate_images(&[png("   ")]).unwrap_err().contains("no data"));
+        // Not just measured — decoded. A truncated or corrupted payload used to
+        // reach the provider and come back as an opaque transport error, which is
+        // exactly what this function exists to prevent.
+        for broken in ["not base64!!", "aGVsbG8", "####"] {
+            let err = validate_images(&[png(broken)]).unwrap_err();
+            assert!(err.contains("could not be read"), "{broken}: {err}");
+        }
+        // ~6 MB decoded, over the 5 MB cap.
+        let huge = "A".repeat(8 * 1024 * 1024);
+        assert!(validate_images(&[png(&huge)]).unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn a_user_turn_stays_plain_text_until_an_image_is_attached() {
+        use crate::ai::{anthropic_user_content, gemini_user_parts, openai_user_content};
+        assert_eq!(openai_user_content("hi", &[]), serde_json::json!("hi"));
+        assert_eq!(anthropic_user_content("hi", &[]), serde_json::json!("hi"));
+        assert_eq!(gemini_user_parts("hi", &[]), vec![serde_json::json!({"text":"hi"})]);
+    }
+
+    #[test]
+    fn each_wire_format_carries_the_image_its_own_way() {
+        use crate::ai::{anthropic_user_content, gemini_user_parts, openai_user_content};
+        let img = [png("QUJD")];
+
+        let o = openai_user_content("what is this", &img);
+        assert_eq!(o[0]["type"], "text");
+        assert_eq!(o[1]["type"], "image_url");
+        assert_eq!(o[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+
+        let a = anthropic_user_content("what is this", &img);
+        assert_eq!(a[0]["type"], "image", "Anthropic puts the image first");
+        assert_eq!(a[0]["source"]["media_type"], "image/png");
+        assert_eq!(a[0]["source"]["data"], "QUJD");
+        assert_eq!(a[1]["type"], "text");
+
+        let g = gemini_user_parts("what is this", &img);
+        assert_eq!(g[0]["inline_data"]["mime_type"], "image/png");
+        assert_eq!(g[1]["text"], "what is this");
+    }
+
+    #[test]
+    fn images_ride_in_the_last_user_message_only() {
+        use crate::ai::{build_openai_request, ChatTurn};
+        let history = vec![ChatTurn { role: "user".into(), content: "earlier".into() }];
+        let req = build_openai_request("m", "sys", &history, "now", &[png("QUJD")]);
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["content"], "earlier", "history turns stay text");
+        assert!(msgs[2]["content"].is_array(), "the new turn carries the image");
+    }
+
+    #[test]
+    fn reasoning_is_read_from_each_format_and_absent_when_not_emitted() {
+        use crate::ai::{extract_anthropic_thinking, extract_gemini_thoughts, extract_openai_reasoning};
+        let ds = serde_json::json!({"choices":[{"message":{"content":"{}","reasoning_content":" thinking… "}}]});
+        assert_eq!(extract_openai_reasoning(&ds).as_deref(), Some("thinking…"));
+        let relay = serde_json::json!({"choices":[{"message":{"content":"{}","reasoning":"via gateway"}}]});
+        assert_eq!(extract_openai_reasoning(&relay).as_deref(), Some("via gateway"));
+        let plain = serde_json::json!({"choices":[{"message":{"content":"{}"}}]});
+        assert!(extract_openai_reasoning(&plain).is_none());
+
+        let a = serde_json::json!({"content":[
+            {"type":"thinking","thinking":"step one"},
+            {"type":"thinking","thinking":"step two"},
+            {"type":"text","text":"{}"}]});
+        assert_eq!(extract_anthropic_thinking(&a).as_deref(), Some("step one\nstep two"));
+        assert!(extract_anthropic_thinking(&serde_json::json!({"content":[{"type":"text","text":"{}"}]})).is_none());
+
+        let g = serde_json::json!({"candidates":[{"content":{"parts":[
+            {"text":"hmm","thought":true},{"text":"{}"}]}}]});
+        assert_eq!(extract_gemini_thoughts(&g).as_deref(), Some("hmm"));
+        assert!(extract_gemini_thoughts(&serde_json::json!({"candidates":[{"content":{"parts":[{"text":"{}"}]}}]})).is_none());
+    }
+
+    #[test]
+    fn gemini_reasoning_is_not_also_returned_as_notes() {
+        // Both readers walk the same parts array; without filtering, a thought
+        // part landed in the answer text too and the panel printed it twice.
+        use crate::ai::{extract_gemini_text, extract_gemini_thoughts};
+        let resp = serde_json::json!({"candidates":[{"content":{"parts":[
+            {"text":"weighing an index scan","thought":true},
+            {"text":"{\"queryType\":\"find\",\"filter\":{}}"}]}}]});
+        assert_eq!(extract_gemini_thoughts(&resp).as_deref(), Some("weighing an index scan"));
+        let answer = extract_gemini_text(&resp);
+        assert!(!answer.contains("weighing"), "reasoning leaked into the answer: {answer}");
+        let (json, notes) = crate::ai::split_json_object(&answer).unwrap();
+        assert_eq!(json, "{\"queryType\":\"find\",\"filter\":{}}");
+        assert!(notes.is_none(), "notes should be empty, got {notes:?}");
+    }
+
+    #[test]
+    fn a_reply_omits_what_it_does_not_have() {
+        // The frontend treats a missing key and null the same, but the JSON the
+        // panel stores should not carry `"thoughts": null` for every message.
+        let r = crate::ai::AiReply { query: "{}".into(), thoughts: None, notes: None };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"query":"{}"}"#);
+        let r = crate::ai::AiReply { query: "{}".into(), thoughts: Some("t".into()), notes: None };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"query":"{}","thoughts":"t"}"#);
+    }
+
+    #[test]
+    fn chat_records_round_trip_without_the_new_fields() {
+        // Chats saved before this change have neither field; they must load.
+        let old = r#"{"id":"m1","role":"user","text":"hi"}"#;
+        let m: crate::chats::ChatMessage = serde_json::from_str(old).unwrap();
+        assert!(m.thoughts.is_none() && m.attachments.is_none());
+        let with = crate::chats::ChatMessage {
+            thoughts: Some("why".into()),
+            attachments: Some(vec![crate::chats::AttachmentMeta { media_type: "image/png".into(), bytes: 1234 }]),
+            ..m.clone()
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""mediaType":"image/png""#), "{json}");
+        assert!(!json.contains("data"), "no image bytes are ever stored: {json}");
+    }
+
     /// Resolution has to keep working for the settings already in people's
     /// vaults: the three original providers store their keys in dedicated fields,
     /// not in the new list, and a stored `ai_provider` must keep selecting them.
@@ -480,6 +966,7 @@ mod tests {
         assert!(settings.ai_providers.is_empty());
     }
 
+    /// Build test-only passwords without hard-coded string literals for static analysis.
     fn test_secret(parts: &[&str]) -> String {
         parts.concat()
     }
@@ -2775,7 +3262,7 @@ mod tests {
     #[test]
     fn test_build_query_gen_request_shape() {
         use crate::ai::build_query_gen_request;
-        let body = build_query_gen_request("claude-opus-4-8", "SYS", &[], "users older than 30");
+        let body = build_query_gen_request("claude-opus-4-8", "SYS", &[], "users older than 30", &[]);
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["messages"][0]["role"], "user");
@@ -3233,7 +3720,7 @@ mod tests {
         ];
 
         // Anthropic: history messages precede the final user message.
-        let a = build_query_gen_request("claude-opus-4-8", "SYS", &history, "now sort by age");
+        let a = build_query_gen_request("claude-opus-4-8", "SYS", &history, "now sort by age", &[]);
         let msgs = a["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "user");
@@ -3241,14 +3728,14 @@ mod tests {
         assert_eq!(msgs[2]["content"], "now sort by age");
 
         // OpenAI: system first, then history, then final user.
-        let o = build_openai_request("gpt-4o", "SYS", &history, "now sort by age");
+        let o = build_openai_request("gpt-4o", "SYS", &history, "now sort by age", &[]);
         let omsgs = o["messages"].as_array().unwrap();
         assert_eq!(omsgs[0]["role"], "system");
         assert_eq!(omsgs.len(), 4);
         assert_eq!(omsgs[3]["content"], "now sort by age");
 
         // Gemini: assistant role maps to "model".
-        let g = build_gemini_request("SYS", &history, "now sort by age");
+        let g = build_gemini_request("SYS", &history, "now sort by age", &[]);
         let contents = g["contents"].as_array().unwrap();
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[1]["role"], "model");
@@ -3315,7 +3802,7 @@ mod tests {
     fn test_openai_request_and_extract() {
         use crate::ai::{build_openai_request, extract_openai_text};
 
-        let body = build_openai_request("gpt-4o", "SYS", &[], "users older than 30");
+        let body = build_openai_request("gpt-4o", "SYS", &[], "users older than 30", &[]);
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "SYS");
@@ -3340,7 +3827,7 @@ mod tests {
         // by logs, crash reports and proxies, and is echoed in transport errors.
         assert!(!url.contains("key="), "credential in URL: {url}");
 
-        let body = build_gemini_request("SYS", &[], "active users");
+        let body = build_gemini_request("SYS", &[], "active users", &[]);
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][0]["parts"][0]["text"], "active users");
@@ -3398,7 +3885,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_anthropic_requires_api_key() {
         use crate::ai::generate_anthropic;
-        let res = generate_anthropic("", "claude-opus-4-8", "SYS", &[], "active users").await;
+        let res = generate_anthropic("", "claude-opus-4-8", "SYS", &[], "active users", &[]).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("API key"));
     }
@@ -5156,6 +5643,8 @@ mod chat_store_tests {
             variant: "editor".to_string(),
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
+            provider_id: None,
+            model: None,
         }
     }
 
@@ -5209,6 +5698,8 @@ mod chat_store_tests {
                 text: format!("msg {i}"),
                 query: None,
                 error: None,
+                thoughts: None,
+                attachments: None,
             })
             .collect();
 
@@ -5231,6 +5722,8 @@ mod chat_store_tests {
             text: "x".to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            attachments: None,
         };
 
         assert_eq!(next_message_id(&[]), "m0");
@@ -5253,6 +5746,8 @@ mod chat_store_tests {
             text: id.to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            attachments: None,
         };
         let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
         stored.messages = vec![msg("m0"), msg("m1"), msg("m2")];
@@ -5276,6 +5771,8 @@ mod chat_store_tests {
             text: "x".to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            attachments: None,
         };
         let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
         stored.messages = vec![msg("m0")];
@@ -5361,6 +5858,8 @@ mod chat_store_tests {
             text: "hello".to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            attachments: None,
         }];
 
         let out = summaries(&[c], None);

@@ -49,6 +49,22 @@ pub struct ChatMessage {
     pub query: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<bool>,
+    /// The model's reasoning or working notes, shown collapsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thoughts: Option<String>,
+    /// What was attached to a user turn. Metadata only: this store is plain
+    /// JSON on disk, and screenshots of the user's own data do not belong in
+    /// it. The bytes go to the provider once and are then dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<AttachmentMeta>>,
+}
+
+/// A pasted image, remembered by shape rather than by content.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentMeta {
+    pub media_type: String,
+    pub bytes: u64,
 }
 
 /// One conversation, with the scope it belongs to baked in.
@@ -57,6 +73,12 @@ pub struct ChatMessage {
 pub struct Chat {
     pub id: String,
     pub title: String,
+    /// A provider chosen for this conversation in the panel header. Overrides
+    /// the settings default for this chat only; `None` means "use the default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
     /// Connection NAME, not the session id — like `queries::collection_key`, so
@@ -373,6 +395,10 @@ pub async fn append_chat_message(
     text: String,
     query: Option<Value>,
     error: Option<bool>,
+    // The reply's reasoning, when it had any. Parking an in-flight answer used to
+    // drop it: the text and query survived the tab closing while the thoughts
+    // silently did not, so History showed a reply that had never reasoned.
+    thoughts: Option<String>,
     updated_at: String,
 ) -> Result<(), String> {
     let _guard = store_lock();
@@ -388,6 +414,8 @@ pub async fn append_chat_message(
         text,
         query,
         error,
+        thoughts,
+        attachments: None,
     });
     if chat.messages.len() > MAX_MESSAGES {
         let excess = chat.messages.len() - MAX_MESSAGES;

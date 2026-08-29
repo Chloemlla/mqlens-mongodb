@@ -334,6 +334,41 @@ fn authenticated_service(base_url: &str) -> Option<&'static str> {
         })
 }
 
+/// Whether `url` would carry a request off this machine without TLS.
+///
+/// A key on such an endpoint is sent as a header in clear text, along with the
+/// schema and the prompt, so one mistyped or copy-pasted URL puts a credential on
+/// the network. Keyless `http://` stays allowed: a LAN Ollama or vLLM has nothing
+/// to leak, and refusing it would rule out the setups these presets exist for.
+///
+/// Loopback covers `localhost`, its subdomains, and any loopback IP, which is
+/// what the local presets use.
+fn is_cleartext_remote(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false; // not a URL we would request over; `endpoint()` judges it
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false; // nothing to send to
+    };
+    // `host_str` brackets an IPv6 literal, which `IpAddr` does not accept.
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        // A name that is not `localhost` resolves somewhere off this machine as
+        // far as we can tell, and guessing otherwise is what leaks the key.
+        Err(_) => true,
+    }
+}
+
 impl AiProvider {
     /// The URL a request should be posted to, or an error naming what is missing.
     pub fn endpoint(&self) -> Result<String, String> {
@@ -378,6 +413,38 @@ impl AiProvider {
     }
 
     /// Reject a configuration before it produces a confusing HTTP or shell error.
+    /// Refuse to put a credential on the network in clear text.
+    ///
+    /// Its own method rather than a step inside `validate`, because the model
+    /// list is fetched from the draft before anything is saved: `list_ai_models`
+    /// never went through `validate`, so the auto-load 600 ms after a key was
+    /// typed sent it to a remote `http://` endpoint while the form still showed
+    /// no error. Every path that puts the key on the wire calls this.
+    pub fn check_transport(&self) -> Result<(), String> {
+        // Here rather than only in `validate`, so the model-list path enforces it
+        // too: reaching a service known to authenticate over `http://` puts the
+        // request on the network in clear text even with no key set, and a
+        // redirect or an error arrives far too late to have protected it.
+        if let Some(service) = authenticated_service(&self.base_url) {
+            if !uses_tls(&self.base_url) {
+                return Err(format!(
+                    "{} must reach {} over https://. Over http:// the collection \
+                     schema, your prompt and any API key would cross the network \
+                     in clear text.",
+                    self.name, service
+                ));
+            }
+        }
+        if !self.api_key.trim().is_empty() && is_cleartext_remote(&self.base_url) {
+            return Err(format!(
+                "{}'s API key would be sent in clear text, because its URL is http:// \
+                 and not on this machine. Use https://, or remove the key.",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.id.trim().is_empty() {
             return Err("A provider needs an id.".to_string());
@@ -404,24 +471,27 @@ impl AiProvider {
                 Ok(())
             }
             _ => {
-                self.endpoint()?;
+                let endpoint = self.endpoint()?;
+                // Parsed, not just concatenated: `endpoint()` only joins a path, so
+                // `not a url`, a bare path, or `ftp://host` was saved happily and
+                // failed later inside reqwest — an error the form could not attach
+                // to the field the user had got wrong.
+                if host_of(&endpoint).is_none() {
+                    return Err(format!(
+                        "{}'s URL must be an http:// or https:// address with a host. \
+                         `{}` is not one.",
+                        self.name,
+                        self.base_url.trim()
+                    ));
+                }
                 if self.model.trim().is_empty() {
                     return Err(format!("{} needs a model name.", self.name));
                 }
-                if let Some(service) = authenticated_service(&self.base_url) {
-                    // TLS first: reaching a cloud service over `http://` puts the
-                    // schema and the prompt on the network in clear text even with
-                    // no key set, and a redirect or an error arrives far too late
-                    // to have protected them.
-                    if !uses_tls(&self.base_url) {
-                        return Err(format!(
-                            "{} must reach {} over https://. Over http:// the collection \
-                             schema, your prompt and any API key would cross the network \
-                             in clear text.",
-                            self.name, service
-                        ));
-                    }
-                    if self.api_key.trim().is_empty() {
+                // Transport first: over `http://` the answer is "use https", not
+                // "add a key" that would then travel in clear text as well.
+                self.check_transport()?;
+                if self.api_key.trim().is_empty() {
+                    if let Some(service) = authenticated_service(&self.base_url) {
                         return Err(format!(
                             "{} needs an API key: {} authenticates every request, so without \
                              one the collection schema and your prompt would be sent to it \
@@ -451,6 +521,21 @@ mod tests {
             command: String::new(),
             models_command: String::new(),
         }
+    }
+
+    #[test]
+    fn a_url_that_is_not_a_url_is_refused_at_save_rather_than_at_first_request() {
+        // `endpoint()` only joins a path, so these were saved happily and failed
+        // later inside reqwest — an error the form could not attach to the field.
+        for bad in ["not a url", "/v1/chat", "ftp://files.example/v1", "api.openai.com/v1"] {
+            let p = provider(ProviderKind::OpenAiCompatible, bad);
+            let err = p.validate().unwrap_err();
+            assert!(err.contains("http://"), "{bad}: {err}");
+        }
+        // ...and a real one still passes.
+        let mut ok = provider(ProviderKind::OpenAiCompatible, "https://llm.internal.example/v1");
+        ok.api_key = String::new();
+        ok.validate().expect("a well-formed URL is fine");
     }
 
     #[test]
@@ -510,6 +595,41 @@ mod tests {
     }
 
     #[test]
+    fn a_key_on_a_cleartext_remote_endpoint_is_refused() {
+        // An `http://` URL off this machine carries the key as a plain header,
+        // along with the schema and the prompt, so one mistyped or copy-pasted
+        // URL is enough to put a credential on the network.
+        // Hosts no preset covers, so the *key* is what makes these unacceptable —
+        // a known cloud host over http is refused outright, keyed or not, and is
+        // covered by `a_known_cloud_service_cannot_be_reached_over_http`.
+        for url in [
+            "http://llm.vendor.example/v1",
+            "http://192.168.1.50:8000/v1",
+            "http://[2001:db8::1]:8000/v1",
+        ] {
+            let mut p = provider(ProviderKind::OpenAiCompatible, url);
+            p.api_key = "sk-secret".into();
+            let err = p.validate().unwrap_err();
+            assert!(err.contains("clear text"), "{url}: {err}");
+            // Without a key there is nothing to leak, and LAN servers are the
+            // reason the keyless presets exist.
+            p.api_key = String::new();
+            assert!(p.validate().is_ok(), "{url} must stay usable without a key");
+        }
+    }
+
+    #[test]
+    fn the_model_list_path_also_refuses_a_known_service_over_http() {
+        // `list_ai_models` never goes through `validate`, so the TLS rule lives in
+        // `check_transport` where both paths reach it.
+        let p = provider(ProviderKind::OpenAiCompatible, "http://api.openai.com/v1");
+        let err = p.check_transport().unwrap_err();
+        assert!(err.contains("https://"), "{err}");
+        let ok = provider(ProviderKind::OpenAiCompatible, "https://api.openai.com/v1");
+        ok.check_transport().expect("https is fine");
+    }
+
+    #[test]
     fn an_endpoint_no_preset_covers_still_needs_no_key() {
         // Only origins this app ships a preset for are held to a key. A private
         // gateway or a LAN server must stay usable without one.
@@ -522,6 +642,21 @@ mod tests {
             let p = provider(ProviderKind::OpenAiCompatible, preset.base_url);
             p.validate()
                 .unwrap_or_else(|e| panic!("{} should not need a key: {e}", preset.id));
+        }
+    }
+
+    #[test]
+    fn a_key_is_allowed_over_tls_and_on_this_machine() {
+        for url in [
+            "https://api.deepseek.com/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+            "http://ollama.localhost:11434/v1",
+        ] {
+            let mut p = provider(ProviderKind::OpenAiCompatible, url);
+            p.api_key = "sk-secret".into();
+            assert!(p.validate().is_ok(), "{url} should be accepted: {:?}", p.validate());
         }
     }
 
