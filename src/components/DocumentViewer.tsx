@@ -5,7 +5,7 @@ import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
 import { useCollectionSchema } from '../lib/useCollectionSchema';
 import { collectionRef, type GeneratedQuery } from '../lib/mongoCommand';
-import { parseShellJson, parseQueryObject, shellDocErrorKey } from '../lib/shellDoc';
+import { parseShellJson, parseQueryObject, shellDocErrorKey, shellDocErrorParams, type ShellDocNotices } from '../lib/shellDoc';
 import {
   loadCollectionQueries,
   saveQuery,
@@ -793,7 +793,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         // Our own parse failures carry a code and get a translated message;
         // errors from the underlying parser only have an English message.
         shellDocErrorKey(e)
-          ? td(shellDocErrorKey(e)!)
+          ? td(shellDocErrorKey(e)!, shellDocErrorParams(e))
           : td('documentViewer.errors.invalidJsonSyntax', { message: e.message }),
       );
     }
@@ -904,25 +904,38 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   // The reason, not just the fact. A query that fails on a character the user
   // cannot see — a smart quote, a zero-width space pasted in from a browser —
-  // reads as correct on screen, and a bare "Invalid JSON" gives them nothing
+  // reads as correct on screen, and a bare "Invalid query" gives them nothing
   // to act on.
   const [filterError, setFilterError] = useState<string | null>(null);
+  // The query is fine and will run, but it does not mean quite what it says —
+  // a regex flag BSON cannot carry was dropped on the way to the server. Kept
+  // separate from `filterError` so it never blocks Run.
+  const [filterNotice, setFilterNotice] = useState<string | null>(null);
 
   useEffect(() => {
     try {
+      const notices: ShellDocNotices = { droppedRegexFlags: [] };
       if (filterQuery.trim()) {
-        parseQueryObject(filterQuery);
+        parseQueryObject(filterQuery, notices);
       }
       setIsFilterValid(true);
       setFilterError(null);
+      setFilterNotice(
+        notices.droppedRegexFlags.length
+          ? td('documentViewer.notices.regexFlagsIgnored', {
+              flags: notices.droppedRegexFlags.join(', '),
+            })
+          : null
+      );
     } catch (err) {
       setIsFilterValid(false);
+      setFilterNotice(null);
       // Our own parse failures carry a code and have a translated message;
       // only the underlying parser's errors are stuck in English. Same rule
       // the Run and Explain paths follow.
       const key = shellDocErrorKey(err);
       setFilterError(
-        key ? td(key) : err instanceof Error ? err.message : String(err)
+        key ? td(key, shellDocErrorParams(err)) : err instanceof Error ? err.message : String(err)
       );
     }
     // `td` too: switching the interface language re-renders this component but
@@ -1349,7 +1362,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         // Our own parse failures carry a code and get a translated message;
         // errors from the underlying parser only have an English message.
         shellDocErrorKey(e)
-          ? td(shellDocErrorKey(e)!)
+          ? td(shellDocErrorKey(e)!, shellDocErrorParams(e))
           : td('documentViewer.errors.invalidJsonSyntax', { message: e.message }),
       );
     }
@@ -1420,7 +1433,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       // `disabled` guard, only the trigger does — so this path has to map our
       // own parse errors to a translated message like the two above it.
       const key = shellDocErrorKey(e);
-      setError(key ? td(key) : e.message || String(e));
+      setError(key ? td(key, shellDocErrorParams(e)) : e.message || String(e));
     } finally {
       setExplainLoading(false);
     }
@@ -1851,6 +1864,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 }}
                 filterInvalid={!isFilterValid}
                 filterError={filterError}
+                filterNotice={filterNotice}
                 projectionInvalid={!isProjectionValid}
                 sortInvalid={!isSortValid}
                 fields={fields}

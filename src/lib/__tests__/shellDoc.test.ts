@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ObjectId, Long, Decimal128, Int32 } from 'bson';
-import { docToShell, shellToEjson, parseShellJson, parseQueryObject } from '../shellDoc';
+import { docToShell, shellToEjson, parseShellJson, parseQueryObject, shellDocErrorKey, shellDocErrorParams, type ShellDocNotices } from '../shellDoc';
 
 describe('docToShell', () => {
   it('renders EJSON-shaped values as shell constructors', () => {
@@ -276,5 +276,127 @@ describe('parseShellJson — queries pasted from somewhere else', () => {
 
   it('keeps a straight quote found inside a smart-quoted run', () => {
     expect(parseShellJson('q: “say "hi"”')).toEqual({ q: 'say "hi"' });
+  });
+});
+
+// #312: `{"name": /test/g}` failed the whole find with "The regular expression
+// option [g] is not supported", which the query bar showed as "Invalid JSON" —
+// so the reporter concluded MQLens had no regex support at all.
+describe('parseShellJson — regex flags BSON cannot carry (#312)', () => {
+  const flagsOf = (text: string, notices?: ShellDocNotices) =>
+    parseShellJson(text, notices).name.$regularExpression.options;
+
+  it('runs a /g query instead of rejecting it, and drops the flag', () => {
+    const notices: ShellDocNotices = { droppedRegexFlags: [] };
+    expect(flagsOf('{"name": /test/g}', notices)).toBe('');
+    expect(notices.droppedRegexFlags).toEqual(['g']);
+  });
+
+  it('drops only the unsupported flag, keeping the rest of the pattern intact', () => {
+    const notices: ShellDocNotices = { droppedRegexFlags: [] };
+    const parsed = parseShellJson('{"name": /^a.c$/gi}', notices);
+    expect(parsed.name.$regularExpression).toEqual({ pattern: '^a.c$', options: 'i' });
+    expect(notices.droppedRegexFlags).toEqual(['g']);
+  });
+
+  it('drops `g` rather than translating it to `s` the way the driver does', () => {
+    // The Node driver (and so mongosh and Compass) serializes a native RegExp
+    // by mapping `global` onto `s` — dotAll — which silently makes `.` match
+    // newlines. Copying that would change which documents the filter matches.
+    expect(flagsOf('{"name": /test/g}')).not.toContain('s');
+  });
+
+  it('rejects sticky rather than silently widening the query (#315 review)', () => {
+    // `/foo/y` only matches at position 0, so reconstructing `/foo/` would run
+    // a BROADER query than the user wrote. Quietly widening a filter is the
+    // failure this path exists to avoid, so it refuses instead of guessing.
+    expect(() => parseShellJson('{"name": /test/y}')).toThrow(/\[y\]/);
+    expect(() => parseShellJson('{"name": /test/gy}')).toThrow(/\[y\]/);
+  });
+
+  it('surfaces the flag it rejected as a translatable code, not a raw message', () => {
+    try {
+      parseShellJson('{"name": /test/y}');
+      expect.unreachable('should have thrown');
+    } catch (err) {
+      expect(shellDocErrorKey(err)).toBe('documentViewer.errors.unsupportedRegexFlag');
+      expect(shellDocErrorParams(err)).toEqual({ flag: 'y' });
+    }
+  });
+
+  it('keeps the flag diagnosis through the braceless-retry path', () => {
+    // `name: /a/y` only parses on the wrapped retry, so the original "not an
+    // expression" error would otherwise mask the real reason.
+    expect(() => parseShellJson('name: /a/y')).toThrow(/\[y\]/);
+  });
+
+  it('rejects `d` and `v` at the parser, before flag handling is reached', () => {
+    // Documents why DROPPABLE_REGEX_FLAGS lists `d` even though nothing can
+    // exercise it: the parser's regex lexer refuses both flags outright. If a
+    // parser upgrade ever makes these reachable, this test fails and the flag
+    // policy above gets a deliberate second look rather than silently applying.
+    expect(() => parseShellJson('{"name": /test/d}')).toThrow(/Invalid regular expression flag/);
+    expect(() => parseShellJson('{"name": /test/v}')).toThrow(/Invalid regular expression flag/);
+  });
+
+  it('does not mistake a user field named _bsontype for a BSON value (#315 review)', () => {
+    // A document may legally contain a field called `_bsontype`, and treating
+    // any truthy value there as a BSON scalar made the walker skip the subtree.
+    // Narrowing the check to real BSON type tags is the correct reading either
+    // way — but note the reviewer's predicted symptom does NOT reproduce:
+    // EJSON refuses any plain object carrying a `_bsontype` field at all, with
+    // a version error, whether or not a regex is nested under it. So such a
+    // query fails identically before and after this change; the walker's early
+    // return was never what broke it. That EJSON limitation is pre-existing and
+    // separate from regex flags.
+    expect(() => parseShellJson('{meta: {_bsontype: "custom", name: /test/g}}')).toThrow(
+      /BSON version|bson types must be/
+    );
+    // What the narrowed check does buy: the walker no longer treats it as an
+    // opaque leaf, so a genuine BSON value beside it is still handled normally.
+    const parsed = parseShellJson('{_id: ObjectId("603d1f77bcf86cd799439011"), r: /a/g}');
+    expect(parsed._id.$oid).toBe('603d1f77bcf86cd799439011');
+    expect(parsed.r.$regularExpression.options).toBe('');
+  });
+
+  it('leaves flags MongoDB does support alone, and reports nothing', () => {
+    for (const f of ['i', 'm', 'u', '']) {
+      const notices: ShellDocNotices = { droppedRegexFlags: [] };
+      expect(flagsOf(`{"name": /test/${f}}`, notices)).toBe(f);
+      expect(notices.droppedRegexFlags).toEqual([]);
+    }
+  });
+
+  it('reaches a regex nested in an operator and in an array', () => {
+    const notices: ShellDocNotices = { droppedRegexFlags: [] };
+    const parsed = parseShellJson('{tags: {$in: [/a/g, "b"]}}', notices);
+    expect(parsed.tags.$in[0].$regularExpression.options).toBe('');
+    expect(parsed.tags.$in[1]).toBe('b');
+    expect(notices.droppedRegexFlags).toEqual(['g']);
+  });
+
+  it('normalises through the braceless-retry path too', () => {
+    // `name: /test/g` is not a valid standalone expression, so it only parses
+    // on the wrapped retry — which re-parses from scratch and must still report.
+    const notices: ShellDocNotices = { droppedRegexFlags: [] };
+    expect(flagsOf('name: /test/g', notices)).toBe('');
+    expect(notices.droppedRegexFlags).toEqual(['g']);
+  });
+
+  it('leaves other BSON types untouched while normalising', () => {
+    // The walker rebuilds plain containers; ObjectId/Date/Long must pass through
+    // by reference, and a Long must still force canonical serialization.
+    const parsed = parseShellJson(
+      '{_id: ObjectId("603d1f77bcf86cd799439011"), n: NumberLong("9007199254740993"), r: /x/g}'
+    );
+    expect(parsed._id.$oid).toBe('603d1f77bcf86cd799439011');
+    expect(parsed.n.$numberLong).toBe('9007199254740993');
+    expect(parsed.r.$regularExpression.options).toBe('');
+  });
+
+  it('reports nothing for a query that was rejected', () => {
+    const notices: ShellDocNotices = { droppedRegexFlags: [] };
+    expect(() => parseQueryObject('[/a/g]', notices)).toThrow();
+    expect(notices.droppedRegexFlags).toEqual([]);
   });
 });
