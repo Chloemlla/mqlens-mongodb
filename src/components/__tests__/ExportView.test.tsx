@@ -227,6 +227,171 @@ describe('ExportView', () => {
     expect(screen.getByTestId('export-full-btn')).toBeEnabled();
   });
 
+  describe('shell syntax in the filtered card (#314)', () => {
+    // These fields were JSON.parse'd, so the export view rejected the syntax
+    // the document view accepts — a filter that had just run could not be
+    // carried over. They now share the query bar's parser, and what reaches
+    // the backend is the PARSED value rather than the typed text.
+    const exportWith = (value: string) => {
+      const onExport = vi.fn();
+      renderExportView({ onExport, filtered: { kind: 'find', filter: '{}' } });
+      fireEvent.change(screen.getByTestId('query-filter-input'), { target: { value } });
+      fireEvent.click(screen.getByTestId('export-filtered-btn'));
+      return onExport;
+    };
+
+    it('accepts a regex literal and sends it as Extended JSON', () => {
+      const onExport = exportWith('{name: /acme/i}');
+      expect(onExport).toHaveBeenCalled();
+      expect(JSON.parse(onExport.mock.calls[0][3].filter)).toEqual({
+        name: { $regularExpression: { pattern: 'acme', options: 'i' } },
+      });
+    });
+
+    it('accepts ObjectId() and unquoted keys', () => {
+      const onExport = exportWith('{_id: ObjectId("603d1f77bcf86cd799439011")}');
+      expect(JSON.parse(onExport.mock.calls[0][3].filter)).toEqual({
+        _id: { $oid: '603d1f77bcf86cd799439011' },
+      });
+    });
+
+    it('accepts a query pasted with smart quotes', () => {
+      const onExport = exportWith('{ tier: “gold” }');
+      expect(JSON.parse(onExport.mock.calls[0][3].filter)).toEqual({ tier: 'gold' });
+    });
+
+    it('still rejects genuinely malformed input and disables export', () => {
+      renderExportView({ filtered: { kind: 'find', filter: '{}' } });
+      fireEvent.change(screen.getByTestId('query-filter-input'), { target: { value: '{bad' } });
+      expect(screen.getByTestId('export-filtered-btn')).toBeDisabled();
+      expect(screen.getAllByText('Invalid query').length).toBeGreaterThan(0);
+    });
+
+    it('counts against the parsed filter, not the raw text', async () => {
+      const onCountFilter = vi.fn().mockResolvedValue(7);
+      renderExportView({ onCountFilter, filtered: { kind: 'find', filter: '{}' } });
+      fireEvent.change(screen.getByTestId('query-filter-input'), {
+        target: { value: '{name: /acme/i}' },
+      });
+      fireEvent.click(screen.getByTestId('export-filtered-count-btn'));
+      await waitFor(() => expect(onCountFilter).toHaveBeenCalled());
+      expect(JSON.parse(onCountFilter.mock.calls[0][0])).toEqual({
+        name: { $regularExpression: { pattern: 'acme', options: 'i' } },
+      });
+    });
+
+    it('accepts shell syntax in an aggregation pipeline', () => {
+      const onExport = vi.fn();
+      renderExportView({ onExport, filtered: { kind: 'aggregate', pipeline: '[]' } });
+      fireEvent.change(screen.getByTestId('export-filtered-pipeline-input'), {
+        target: { value: '[{$match: {name: /acme/i}}, {$limit: 10}]' },
+      });
+      fireEvent.click(screen.getByTestId('export-filtered-btn'));
+      expect(JSON.parse(onExport.mock.calls[0][3].pipeline)).toEqual([
+        { $match: { name: { $regularExpression: { pattern: 'acme', options: 'i' } } } },
+        { $limit: 10 },
+      ]);
+    });
+
+    it('rejects a pipeline that is not an array of stages', () => {
+      renderExportView({ filtered: { kind: 'aggregate', pipeline: '[]' } });
+      fireEvent.change(screen.getByTestId('export-filtered-pipeline-input'), {
+        target: { value: '{$match: {a: 1}}' },
+      });
+      expect(screen.getByTestId('export-filtered-btn')).toBeDisabled();
+      expect(screen.getByText('Pipeline must be an array of stages')).toBeInTheDocument();
+    });
+
+    it('forwards strict JSON untouched, preserving 64-bit integers (#316 review)', () => {
+      // A bare integer past 2^53 cannot survive a JS number. Strict JSON is
+      // what the backend read before these fields learned mongosh syntax, so
+      // it is handed over verbatim rather than re-serialized — otherwise
+      // 9007199254740993 silently becomes ...992 and matches another document.
+      const onExport = exportWith('{"counter":9007199254740993}');
+      expect(onExport.mock.calls[0][3].filter).toBe('{"counter":9007199254740993}');
+    });
+
+    it('preserves 64-bit integers in a strict-JSON pipeline too', () => {
+      const onExport = vi.fn();
+      renderExportView({ onExport, filtered: { kind: 'aggregate', pipeline: '[]' } });
+      const raw = '[{"$match":{"counter":9007199254740993}}]';
+      fireEvent.change(screen.getByTestId('export-filtered-pipeline-input'), {
+        target: { value: raw },
+      });
+      fireEvent.click(screen.getByTestId('export-filtered-btn'));
+      expect(onExport.mock.calls[0][3].pipeline).toBe(raw);
+    });
+
+    it('keeps NumberLong exact on the shell path as well', () => {
+      // The shell parser serializes canonically when a Long is present, so the
+      // mongosh spelling of a big integer is lossless through that route too.
+      const onExport = exportWith('{counter: NumberLong("9007199254740993")}');
+      expect(JSON.parse(onExport.mock.calls[0][3].filter)).toEqual({
+        counter: { $numberLong: '9007199254740993' },
+      });
+    });
+
+    it('blocks preview and field scan while the query is malformed (#316 review)', async () => {
+      // A failed check has no value, so nothing can fall back to `{}` — which
+      // is a filter that matches everything. Before this, an invalid filter
+      // silently previewed and scanned the ENTIRE collection.
+      const onPreview = vi.fn().mockResolvedValue('[]');
+      const onScanFields = vi.fn().mockResolvedValue(['a']);
+      renderExportView({ onPreview, onScanFields, filtered: { kind: 'find', filter: '{}' } });
+
+      fireEvent.change(screen.getByTestId('query-filter-input'), { target: { value: '{bad' } });
+
+      expect(screen.getByTestId('export-preview-btn')).toBeDisabled();
+      expect(screen.getByTestId('export-scan-fields-btn')).toBeDisabled();
+
+      // Even if a gate were missed, the handlers must refuse rather than run
+      // against everything.
+      fireEvent.click(screen.getByTestId('export-preview-btn'));
+      fireEvent.click(screen.getByTestId('export-scan-fields-btn'));
+      await waitFor(() => expect(screen.getByTestId('export-filtered-btn')).toBeDisabled());
+      expect(onPreview).not.toHaveBeenCalled();
+      expect(onScanFields).not.toHaveBeenCalled();
+    });
+
+    it('blocks preview and field scan on a malformed pipeline too', () => {
+      const onPreview = vi.fn().mockResolvedValue('[]');
+      const onScanFields = vi.fn().mockResolvedValue(['a']);
+      renderExportView({ onPreview, onScanFields, filtered: { kind: 'aggregate', pipeline: '[]' } });
+      fireEvent.change(screen.getByTestId('export-filtered-pipeline-input'), {
+        target: { value: '[{$match: ' },
+      });
+      expect(screen.getByTestId('export-preview-btn')).toBeDisabled();
+      expect(screen.getByTestId('export-scan-fields-btn')).toBeDisabled();
+    });
+
+    it('still previews and scans once the query parses', async () => {
+      const onPreview = vi.fn().mockResolvedValue('[]');
+      const onScanFields = vi.fn().mockResolvedValue(['a']);
+      renderExportView({ onPreview, onScanFields, filtered: { kind: 'find', filter: '{}' } });
+      fireEvent.change(screen.getByTestId('query-filter-input'), {
+        target: { value: '{name: /acme/i}' },
+      });
+      fireEvent.click(screen.getByTestId('export-scan-fields-btn'));
+      await waitFor(() => expect(onScanFields).toHaveBeenCalled());
+      expect(JSON.parse(onScanFields.mock.calls[0][0].filter)).toEqual({
+        name: { $regularExpression: { pattern: 'acme', options: 'i' } },
+      });
+    });
+
+    it('reports an unsupported regex flag using the shared translated message', () => {
+      // Cross-namespace lookup: the parser's error codes live in `documents`,
+      // while this view's own catalog is `transfer`.
+      renderExportView({ filtered: { kind: 'find', filter: '{}' } });
+      fireEvent.change(screen.getByTestId('query-filter-input'), {
+        target: { value: '{name: /acme/y}' },
+      });
+      expect(screen.getByTestId('export-filtered-btn')).toBeDisabled();
+      expect(
+        screen.getByTestId('query-invalid-badge').getAttribute('title')
+      ).toContain('regex flag y');
+    });
+  });
+
   it('seeds the filter editor and keeps filtered export enabled by default', () => {
     renderExportView({ filtered: { kind: 'find', filter: '{}', matchCount: null } });
     const input = screen.getByTestId('query-filter-input') as HTMLTextAreaElement;
