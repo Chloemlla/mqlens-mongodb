@@ -59,6 +59,9 @@ pub const DEFAULT_PORT: u16 = 8765;
 
 /// HTTP path the streamable-HTTP service is nested under.
 const MCP_PATH: &str = "/mcp";
+/// Where MQLens's own agent connects. A separate path rather than a flag on the
+/// request, because `rmcp` builds its server per session with no view of it.
+const MCP_HELPER_PATH: &str = "/helper/mcp";
 
 /// How long `stop_if_running` waits for the server task's graceful shutdown
 /// (in-flight requests finishing, then `axum::serve` returning) before
@@ -116,6 +119,14 @@ pub struct McpControl {
     /// disconnect what it connected, never a connection a human opened by
     /// hand, even if that connection's profile happens to be opted in.
     pub session_connections: std::collections::HashSet<String>,
+    /// A second token, for MQLens's own query-generation agent.
+    ///
+    /// It reaches the same tools on a separate path, so the server can tell the
+    /// two apart without threading per-request state through `rmcp`: an external
+    /// client keeps exactly today's behaviour, while a write asked for by the
+    /// helper has to be confirmed by the user in the app first. The agent is
+    /// handed this one and never the token an external client uses.
+    pub helper_token: String,
 }
 
 impl McpControl {
@@ -127,6 +138,7 @@ impl McpControl {
             log: VecDeque::new(),
             server: None,
             session_connections: std::collections::HashSet::new(),
+            helper_token: String::new(),
         }
     }
 }
@@ -269,11 +281,14 @@ pub async fn set_enabled_impl(
     // stale) value. Storing the token first means the very first request
     // the new task can possibly serve already sees the right one.
     let token = new_token();
+    let helper_token = new_token();
     {
         let mut control = state.mcp.lock_safe()?;
         control.enabled = true;
         control.port = port;
         control.token = token;
+        // Minted with it and, like it, distinct every time the server starts.
+        control.helper_token = helper_token;
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -316,6 +331,9 @@ pub async fn stop_if_running(state: &AppState) -> Result<(), String> {
         // defense in depth, not the only thing preventing a stale-token
         // auth bypass).
         control.token = String::new();
+        // Fail-closed alongside it: a helper token surviving a disable would be a
+        // way back in to a server the user has switched off.
+        control.helper_token = String::new();
         control.server.take()
     }; // guard dropped here, before the await below.
 
@@ -338,6 +356,8 @@ pub async fn stop_if_running(state: &AppState) -> Result<(), String> {
 pub fn regenerate_token_impl(state: &AppState) -> Result<McpStatusUi, String> {
     let mut control = state.mcp.lock_safe()?;
     control.token = new_token();
+    // Both, or "regenerate" would leave the older of the two still working.
+    control.helper_token = new_token();
     Ok(status_from(&control))
 }
 
@@ -354,6 +374,8 @@ struct McpServer {
     /// `rmcp-2.2.0/tests/test_progress_subscriber.rs`).
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    /// True for MQLens's own query-generation agent. See `MCP_HELPER_PATH`.
+    helper: bool,
     /// `Some` for every server actually spawned by `set_enabled_impl` (see
     /// its doc comment); `None` only for the bare `McpServer` values the
     /// golden-snapshot test below builds to introspect `tool_router()`
@@ -366,7 +388,13 @@ struct McpServer {
 
 impl McpServer {
     fn new(app_handle: Option<tauri::AppHandle>) -> Self {
-        Self { tool_router: Self::tool_router(), app_handle }
+        Self { tool_router: Self::tool_router(), app_handle, helper: false }
+    }
+
+    /// A server for MQLens's own agent: same tools, but a write must be confirmed
+    /// by the user in the app rather than by the agent asserting it asked.
+    fn new_helper(app_handle: Option<tauri::AppHandle>) -> Self {
+        Self { tool_router: Self::tool_router(), app_handle, helper: true }
     }
 
     /// Resolves `self.app_handle` into `(AppHandle, encrypted-profiles-path)`
@@ -481,6 +509,17 @@ impl McpServer {
         let _ = &path; // disconnect needs no profile lookup; kept for a uniform `resolve()` call site.
         let state = app_handle.state::<AppState>();
         let summary = crate::mcp_tools::truncate_summary(&format!("connectionId={}", args.connection_id), 200);
+        // Not for MQLens's own agent. `disconnect_impl` authorises against the
+        // app-wide set of connections opened over MCP, not against this session, so
+        // the agent could close one another client opened and is doing so outside
+        // the write-confirmation path. It has no business managing connection
+        // lifecycle either way: it is here to read a schema, not to tidy up.
+        if self.helper {
+            let refusal = "disconnect is not available to MQLens's query assistant. Leave \
+                           connections alone; the user manages them."
+                .to_string();
+            return finish_json::<()>(&state, "disconnect", Some(args.connection_id), &summary, Err(refusal));
+        }
         match crate::mcp_tools::disconnect_impl(&state, &args.connection_id).await {
             Ok(()) => {
                 if let Ok(connections) = crate::connection_list_impl(&state) {
@@ -601,6 +640,32 @@ impl McpServer {
         let connection_id = args.connection_id.clone();
         let summary =
             crate::mcp_tools::truncate_summary(&crate::mcp_tools::insert_one_summary(&args.database, &args.collection, &args.document, args._confirm), 200);
+        // Every route, not only the helper's. `_confirm` is a boolean the caller
+        // supplies, so it was never a gate — and a CLI that found the external
+        // route through its own global config reached these tools with no prompt
+        // at all, which is the hole the helper path alone could not close.
+        //
+        // Gated on `_confirm` only so the *documented first pass* never reaches
+        // the user: `_confirm: false` is rejected by `require_confirm` in the impl
+        // below without touching the collection, so prompting for it asked someone
+        // to approve an operation that could not run, and the agent's retry with
+        // `true` then asked them a second time. This gives up nothing — an
+        // unconfirmed call never writes, and every call that does write still
+        // passes through the prompt, on every route.
+        if args._confirm {
+            match confirm_write(&app_handle, "insert_one", serde_json::json!({
+                "connectionId": args.connection_id,
+                "namespace": format!("{}.{}", args.database, args.collection),
+                "document": args.document,
+            }), self.helper).await
+            {
+                // Through the finishing path, not `?`: that is the only place a
+                // call is logged, so a refused delete would otherwise vanish from
+                // the MCP log entirely rather than appear as a failed call.
+                Err(e) => return finish_json::<()>(&state, "insert_one", Some(connection_id), &summary, Err(e)),
+                Ok(()) => {}
+            }
+        }
         let result = crate::audit::with_source("mcp", crate::mcp_tools::insert_one_impl(&state, &path, args)).await;
         finish_json(&state, "insert_one", Some(connection_id), &summary, result)
     }
@@ -616,6 +681,33 @@ impl McpServer {
             &crate::mcp_tools::update_many_summary(&args.database, &args.collection, &args.filter, &args.update, args._confirm),
             200,
         );
+        // Every route, not only the helper's. `_confirm` is a boolean the caller
+        // supplies, so it was never a gate — and a CLI that found the external
+        // route through its own global config reached these tools with no prompt
+        // at all, which is the hole the helper path alone could not close.
+        //
+        // Gated on `_confirm` only so the *documented first pass* never reaches
+        // the user: `_confirm: false` is rejected by `require_confirm` in the impl
+        // below without touching the collection, so prompting for it asked someone
+        // to approve an operation that could not run, and the agent's retry with
+        // `true` then asked them a second time. This gives up nothing — an
+        // unconfirmed call never writes, and every call that does write still
+        // passes through the prompt, on every route.
+        if args._confirm {
+            match confirm_write(&app_handle, "update_many", serde_json::json!({
+                "connectionId": args.connection_id,
+                "namespace": format!("{}.{}", args.database, args.collection),
+                "filter": args.filter,
+                "update": args.update,
+            }), self.helper).await
+            {
+                // Through the finishing path, not `?`: that is the only place a
+                // call is logged, so a refused delete would otherwise vanish from
+                // the MCP log entirely rather than appear as a failed call.
+                Err(e) => return finish_json::<()>(&state, "update_many", Some(connection_id), &summary, Err(e)),
+                Ok(()) => {}
+            }
+        }
         let result = crate::audit::with_source("mcp", crate::mcp_tools::update_many_tool_impl(&state, &path, args)).await;
         finish_json(&state, "update_many", Some(connection_id), &summary, result)
     }
@@ -628,6 +720,32 @@ impl McpServer {
         let state = app_handle.state::<AppState>();
         let connection_id = args.connection_id.clone();
         let summary = crate::mcp_tools::truncate_summary(&crate::mcp_tools::delete_many_summary(&args.database, &args.collection, &args.filter, args._confirm), 200);
+        // Every route, not only the helper's. `_confirm` is a boolean the caller
+        // supplies, so it was never a gate — and a CLI that found the external
+        // route through its own global config reached these tools with no prompt
+        // at all, which is the hole the helper path alone could not close.
+        //
+        // Gated on `_confirm` only so the *documented first pass* never reaches
+        // the user: `_confirm: false` is rejected by `require_confirm` in the impl
+        // below without touching the collection, so prompting for it asked someone
+        // to approve an operation that could not run, and the agent's retry with
+        // `true` then asked them a second time. This gives up nothing — an
+        // unconfirmed call never writes, and every call that does write still
+        // passes through the prompt, on every route.
+        if args._confirm {
+            match confirm_write(&app_handle, "delete_many", serde_json::json!({
+                "connectionId": args.connection_id,
+                "namespace": format!("{}.{}", args.database, args.collection),
+                "filter": args.filter,
+            }), self.helper).await
+            {
+                // Through the finishing path, not `?`: that is the only place a
+                // call is logged, so a refused delete would otherwise vanish from
+                // the MCP log entirely rather than appear as a failed call.
+                Err(e) => return finish_json::<()>(&state, "delete_many", Some(connection_id), &summary, Err(e)),
+                Ok(()) => {}
+            }
+        }
         let result = crate::audit::with_source("mcp", crate::mcp_tools::delete_many_tool_impl(&state, &path, args)).await;
         finish_json(&state, "delete_many", Some(connection_id), &summary, result)
     }
@@ -651,6 +769,37 @@ impl McpServer {
             ),
             200,
         );
+        // Every route, not only the helper's. `_confirm` is a boolean the caller
+        // supplies, so it was never a gate — and a CLI that found the external
+        // route through its own global config reached these tools with no prompt
+        // at all, which is the hole the helper path alone could not close.
+        //
+        // Gated on `_confirm` only so the *documented first pass* never reaches
+        // the user: `_confirm: false` is rejected by `require_confirm` in the impl
+        // below without touching the collection, so prompting for it asked someone
+        // to approve an operation that could not run, and the agent's retry with
+        // `true` then asked them a second time. This gives up nothing — an
+        // unconfirmed call never writes, and every call that does write still
+        // passes through the prompt, on every route.
+        if args._confirm {
+            match confirm_write(&app_handle, "create_index", serde_json::json!({
+                "connectionId": args.connection_id,
+                "namespace": format!("{}.{}", args.database, args.collection),
+                "keys": args.keys,
+                "name": args.name,
+                "unique": args.unique,
+                // Shown because it changes which documents are indexed at all, and
+                // with `unique` it changes what uniqueness is enforced over.
+                "sparse": args.sparse,
+            }), self.helper).await
+            {
+                // Through the finishing path, not `?`: that is the only place a
+                // call is logged, so a refused delete would otherwise vanish from
+                // the MCP log entirely rather than appear as a failed call.
+                Err(e) => return finish_json::<()>(&state, "create_index", Some(connection_id), &summary, Err(e)),
+                Ok(()) => {}
+            }
+        }
         let result = crate::audit::with_source("mcp", crate::mcp_tools::create_index_tool_impl(&state, &path, args)).await;
         finish_json(&state, "create_index", Some(connection_id), &summary, result)
     }
@@ -754,7 +903,269 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// are always the same fixed length (32 bytes), so `constant_time_eq`'s own
 /// length check never itself becomes a side channel on the real token's
 /// length.
-fn bearer_token_matches(control: &StdMutex<McpControl>, headers: &axum::http::HeaderMap) -> bool {
+/// Where MQLens's own agent should connect, when the server is running.
+///
+/// Deliberately not part of `McpStatusUi`: that goes to the frontend for display,
+/// and the helper token has no business there. Only the backend, handing it to an
+/// agent it is about to run, ever needs it.
+pub fn helper_access(state: &AppState) -> Option<(u16, String)> {
+    let control = state.mcp.lock().ok()?;
+    if !control.enabled || control.helper_token.is_empty() {
+        return None;
+    }
+    Some((control.port, control.helper_token.clone()))
+}
+
+/// The path MQLens's own agent connects on. See `MCP_HELPER_PATH`.
+pub fn helper_path() -> &'static str {
+    MCP_HELPER_PATH
+}
+
+/// The user's answer to one of those requests, from the panel.
+///
+/// Unknown ids are accepted quietly: the request may have already timed out, and
+/// a late click is not an error worth showing anyone.
+pub fn resolve_write_impl(state: &AppState, id: &str, approved: bool) -> Result<(), String> {
+    let sender = state.mcp_write_confirms.lock_safe()?.remove(id);
+    if let Some(sender) = sender {
+        let _ = sender.send(approved);
+    }
+    Ok(())
+}
+
+/// Owns one pending confirmation: its entry in `mcp_write_confirms`, and the
+/// `mcp-write-settled` broadcast that retires the prompt in every webview.
+///
+/// Both belong here for the same reason. Doing either after the `await` covers an
+/// answer and a timeout but not *cancellation*: `rmcp` drops the handler future
+/// when the client goes away, and `stop_if_running` aborts the server task once
+/// `GRACEFUL_SHUTDOWN_TIMEOUT` is up. A dropped future never runs the line after
+/// its await — which first left the sender in app-wide state for the life of the
+/// process, and then, once that was fixed here, left every webview holding a
+/// prompt for a request that no longer existed until its local TTL ran out. One
+/// owner for both means there is no fourth outcome to forget.
+struct ConfirmEntry<'a> {
+    state: &'a AppState,
+    /// Retires the prompt in every webview.
+    ///
+    /// Injected rather than reached through a stored `AppHandle` so that the
+    /// cancellation path can be tested for what it actually does. Holding a handle
+    /// would have made this guard unconstructible without a running app, leaving
+    /// the one outcome nothing else covers pinned by a source guard alone.
+    settled: Box<dyn Fn(&str) + Send + 'static>,
+    /// Taken on release, so `Drop` cannot settle the same id twice.
+    id: Option<String>,
+}
+
+impl<'a> ConfirmEntry<'a> {
+    fn register(
+        state: &'a AppState,
+        id: String,
+        tx: oneshot::Sender<bool>,
+        settled: Box<dyn Fn(&str) + Send + 'static>,
+    ) -> Result<Self, String> {
+        state.mcp_write_confirms.lock_safe()?.insert(id.clone(), tx);
+        Ok(Self {
+            state,
+            settled,
+            id: Some(id),
+        })
+    }
+
+    /// Retire it now, on the ordinary path, before the audit write.
+    fn release(mut self) {
+        self.settle();
+    }
+
+    fn settle(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        // No `lock_safe` here: this runs from `Drop`, where there is nothing to
+        // return an error to, and a poisoned lock must not panic a second time.
+        if let Ok(mut live) = self.state.mcp_write_confirms.lock() {
+            live.remove(&id);
+        }
+        (self.settled)(&id);
+    }
+}
+
+impl Drop for ConfirmEntry<'_> {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+/// How long a write waits for the user before it is refused.
+///
+/// Generous, because the user may be reading what the agent proposes; finite and
+/// fail-closed, because an unanswered prompt must not become an approval — an
+/// abandoned window would otherwise hold a write open indefinitely.
+const WRITE_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ask the user, in the app, before MQLens's own agent writes.
+///
+/// The write tools are gated on a `_confirm` boolean the caller supplies, which
+/// for an external client is a reasonable contract — the operator chose to connect
+/// it. For MQLens's own agent it is not: the agent supplies that boolean itself,
+/// so "delete inactive users" typed into the chat, or a prompt injected through a
+/// document the agent sampled, is one hop from a live connection. This asks the
+/// person instead, and refuses on silence.
+async fn confirm_write(
+    app_handle: &tauri::AppHandle,
+    tool: &str,
+    details: serde_json::Value,
+    from_helper: bool,
+) -> Result<(), String> {
+    use tauri::{Emitter, Manager};
+    let state = app_handle.state::<AppState>();
+    let id = new_token();
+    // The operation itself, not the call-log summary. That summary reports a
+    // filter as a byte count — enough for a log line, useless for a decision:
+    // `{"state":"OLD"}` and `{}` are both "34 bytes", and one of them empties the
+    // collection. Whoever is approving has to see what will actually run.
+    let shown = serde_json::to_string_pretty(&details).unwrap_or_else(|_| details.to_string());
+
+    // Addressed to the panel whose agent asked. The event reaches every webview —
+    // that is what `emit` does — so the address is carried *in* the payload and
+    // the panels filter on it, which is deterministic in a way that guessing at
+    // the right `EventTarget` variant is not, and works for two panes of one
+    // window where a window label cannot tell them apart.
+    // Exactly one run, or nobody is asked. `rmcp` gives this handler no view of
+    // the request, so with two agents running the write cannot be attributed —
+    // and putting one panel's delete in front of whoever else is looking is worse
+    // than making the agent ask in its reply.
+    // One live run means the write belongs to it, so the prompt goes to that
+    // panel. With none — an external client — or with several, which `rmcp` gives
+    // no way to tell apart, it is addressed to nobody in particular and any window
+    // may answer: still a person deciding, just not a known conversation.
+    // The route is the only identity available: `rmcp` builds its server per
+    // session and hands the tool no view of the request, so the session itself
+    // cannot be carried through. What that rules out is *guessing*: a write from
+    // an external client is never attributed to a conversation, however many chats
+    // happen to be generating — inferring one from app-wide activity presented
+    // somebody else's operation as belonging to a chat that never asked for it.
+    // The *conversation*, not the run: a tab can be moved or detached to another
+    // window mid-run, and a run id means nothing to the webview it moves to — the
+    // destination filtered the prompt out and the source no longer mounted the
+    // tab, so nobody could answer. The conversation travels with the tab.
+    let requester = if from_helper {
+        let live = state.mcp_helper_requesters.lock_safe()?;
+        match live.as_slice() {
+            [only] => Some(only.conversation.clone()),
+            // Two runs, and no way to tell which asked.
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Registered only once there is somebody to ask and something to ask about.
+    // Inserting earlier left an unreachable sender behind on every failure above,
+    // and repeated attempts grew the map without bound.
+    let (tx, rx) = oneshot::channel::<bool>();
+    // The entry is owned by this guard from here on, so it goes whichever way the
+    // handler ends. Removing it after the `await` is not enough on its own: the
+    // request can be *cancelled* while the prompt is up — the client disconnects,
+    // or `stop_if_running` aborts the task once `GRACEFUL_SHUTDOWN_TIMEOUT` is up
+    // — and a dropped future never reaches the line after the await, so every
+    // cancelled write left its sender in app-wide state for the life of the app.
+    let emitter = app_handle.clone();
+    let entry = ConfirmEntry::register(
+        &state,
+        id.clone(),
+        tx,
+        Box::new(move |settled| {
+            let _ = emitter.emit("mcp-write-settled", serde_json::json!({ "id": settled }));
+        }),
+    )?;
+
+    let emitted = app_handle.emit(
+        "mcp-write-request",
+        serde_json::json!({ "id": id, "tool": tool, "summary": shown, "requester": requester }),
+    );
+    if emitted.is_err() {
+        // Nobody can be asked, so nobody has agreed. The guard takes the entry.
+        return Err(format!(
+            "{tool} needs the user's confirmation and MQLens could not ask for it."
+        ));
+    }
+
+    let answer = tokio::time::timeout(WRITE_CONFIRM_TIMEOUT, rx).await;
+    // Retired either way: a decision that arrives later has nothing to resolve,
+    // and the prompt must leave every webview. Explicit rather than left to the
+    // end of the function so both happen before the audit write below — but the
+    // guard is what makes them unconditional, cancellation included.
+    entry.release();
+
+    let (approved, refusal) = match answer {
+        Ok(Ok(true)) => (true, None),
+        Ok(Ok(false)) => (
+            false,
+            Some(format!(
+                "{tool} was refused by the user. Do not retry it; explain what you were \
+                 going to change and let them decide."
+            )),
+        ),
+        // The sender was dropped, or nobody answered in time.
+        _ => (
+            false,
+            Some(format!(
+                "{tool} was not confirmed by the user in time, so nothing was changed. \
+                 Ask again in your reply rather than retrying the tool."
+            )),
+        ),
+    };
+
+    // Recorded whichever way it went. The write's own audit entry only exists if
+    // it ran, so a refusal would otherwise leave no trace — and "the agent asked
+    // to delete and was told no" is exactly what a trail is for.
+    // Metadata only. `summary` is stored verbatim; only `args` passes the payload
+    // gate and the redactor, so putting the document or filter here would keep and
+    // export production values from a user who switched payloads off.
+    let namespace = details
+        .get("namespace")
+        .and_then(|n| n.as_str())
+        .unwrap_or("an unknown namespace");
+    let asked = format!("{tool} on {namespace}");
+    let payload = details.to_string();
+    // Split out for the audit's own fields. For a refused or timed-out write this
+    // is the *only* record — the operation never ran — so leaving the scope empty
+    // meant it could not be found by filtering on the connection or namespace it
+    // was aimed at, which is precisely what a refusal trail is for.
+    let scope_connection = details.get("connectionId").and_then(|c| c.as_str());
+    let (scope_db, scope_collection) = match namespace.split_once('.') {
+        Some((db, coll)) if !db.is_empty() && !coll.is_empty() => (Some(db), Some(coll)),
+        _ => (None, None),
+    };
+    crate::audit::maybe_record(
+        &state,
+        crate::audit::RecordInput {
+            event_id: None,
+            ts: None,
+            connection_id: scope_connection,
+            database: scope_db,
+            collection: scope_collection,
+            op: "agent_write_request",
+            class: None,
+            source: Some("mcp"),
+            ok: approved,
+            error: refusal.as_deref(),
+            duration_ms: None,
+            summary: &asked,
+            // Through the gate, so it is kept only if the user asked for payloads.
+            args: Some(&payload),
+        },
+    );
+
+    match refusal {
+        None => Ok(()),
+        Some(reason) => Err(reason),
+    }
+}
+
+fn bearer_token_matches(
+    control: &StdMutex<McpControl>,
+    headers: &axum::http::HeaderMap,
+    helper_path: bool,
+) -> bool {
     let Some(header_value) = headers.get(axum::http::header::AUTHORIZATION) else {
         return false;
     };
@@ -770,7 +1181,9 @@ fn bearer_token_matches(control: &StdMutex<McpControl>, headers: &axum::http::He
     // Fail-closed: an empty stored token (server never enabled, or between
     // `stop_if_running` clearing it and a future re-enable minting a fresh
     // one) must never match anything, no matter what's presented.
-    if guard.token.is_empty() {
+    // The token for *this* path, and only this one.
+    let expected = if helper_path { &guard.helper_token } else { &guard.token };
+    if expected.is_empty() {
         return false;
     }
 
@@ -779,7 +1192,7 @@ fn bearer_token_matches(control: &StdMutex<McpControl>, headers: &axum::http::He
     let presented_digest = presented_hasher.finalize();
 
     let mut expected_hasher = Sha256::new();
-    expected_hasher.update(guard.token.as_bytes());
+    expected_hasher.update(expected.as_bytes());
     let expected_digest = expected_hasher.finalize();
 
     constant_time_eq(&presented_digest, &expected_digest)
@@ -804,22 +1217,40 @@ fn unauthorized_response() -> axum::response::Response {
 /// bounds how long a caller waits for that.
 async fn run_server(listener: TcpListener, mcp: Arc<StdMutex<McpControl>>, app_handle: Option<tauri::AppHandle>, shutdown_rx: oneshot::Receiver<()>) {
     let session_manager: Arc<LocalSessionManager> = Default::default();
+    let helper_handle = app_handle.clone();
     let http_service: StreamableHttpService<McpServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(McpServer::new(app_handle.clone())), session_manager, StreamableHttpServerConfig::default());
+    // MQLens's own agent, on its own path with its own token and its own rules
+    // for writes. Same tools; `rmcp` builds a server per session with no view of
+    // the request, so the path is what tells them apart.
+    let helper_service: StreamableHttpService<McpServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(McpServer::new_helper(helper_handle.clone())),
+            Default::default(),
+            StreamableHttpServerConfig::default(),
+        );
 
     let auth_mcp = Arc::clone(&mcp);
-    let router = axum::Router::new().nest_service(MCP_PATH, http_service).layer(axum::middleware::from_fn(
-        move |req: axum::extract::Request, next: axum::middleware::Next| {
-            let mcp = Arc::clone(&auth_mcp);
-            async move {
-                if bearer_token_matches(&mcp, req.headers()) {
-                    next.run(req).await
-                } else {
-                    unauthorized_response()
+    let router = axum::Router::new()
+        .nest_service(MCP_HELPER_PATH, helper_service)
+        .nest_service(MCP_PATH, http_service)
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let mcp = Arc::clone(&auth_mcp);
+                async move {
+                    // Each token is accepted only on its own path. Accepting
+                    // either on both would make the split cosmetic: an external
+                    // client could take the helper's route and its write rules,
+                    // or the agent could take the external one and escape them.
+                    let helper_path = req.uri().path().starts_with(MCP_HELPER_PATH);
+                    if bearer_token_matches(&mcp, req.headers(), helper_path) {
+                        next.run(req).await
+                    } else {
+                        unauthorized_response()
+                    }
                 }
-            }
-        },
-    ));
+            },
+        ));
 
     if let Err(e) = axum::serve(listener, router.into_make_service())
         .with_graceful_shutdown(async move {
@@ -835,6 +1266,375 @@ async fn run_server(listener: TcpListener, mcp: Arc<StdMutex<McpControl>>, app_h
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn headers_with(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn the_audit_summary_carries_no_write_payload() {
+        // `summary` is stored verbatim; only `args` passes the payload gate and the
+        // redactor. Putting the document or filter in the summary kept and exported
+        // production values from a user who had switched payloads off.
+        let src = include_str!("mcp.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let confirm = body
+            .split("async fn confirm_write")
+            .nth(1)
+            .expect("confirm_write");
+        // The summary is built from the namespace, not from the details.
+        assert!(
+            confirm.contains(r#"format!("{tool} on {namespace}")"#),
+            "the summary must be metadata only"
+        );
+        assert!(
+            !confirm.contains(r#"format!("{tool}: {}", details)"#),
+            "the details must not be interpolated into the summary"
+        );
+        // ...and the details go through the gated field.
+        assert!(confirm.contains("args: Some(&payload)"), "details belong in args");
+    }
+
+    #[test]
+    fn a_refused_write_is_still_logged_as_a_call() {
+        // `finish_json` is the only path that logs, so `confirm_write(..).await?`
+        // made a refused delete vanish from the MCP log rather than appear as a
+        // failed call. Exercising it needs a live AppHandle, so this holds the
+        // shape: no write handler may take the early return again.
+        // Only the code, not this module: `include_str!` pulls in the test file
+        // too, and the assertions below mention the very strings they count.
+        let whole = include_str!("mcp.rs");
+        let src = &whole[..whole.find("\n#[cfg(test)]").unwrap_or(whole.len())];
+        let confirmations = src.matches("confirm_write(&app_handle").count();
+        assert_eq!(confirmations, 4, "one per write tool");
+        assert_eq!(
+            src.matches("finish_json::<()>").count(),
+            5,
+            "four write refusals plus the helper's disconnect refusal, all logged"
+        );
+        // The `?` form is what dropped them.
+        for line in src.lines() {
+            assert!(
+                !(line.contains("confirm_write(") && line.trim_end().ends_with(".await?;")),
+                "a refusal must not skip the log: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_documented_first_pass_is_not_put_in_front_of_the_user() {
+        // `_confirm: false` is the pass the tool descriptions tell the agent to
+        // make first, and `require_confirm` rejects it without touching the
+        // collection. Prompting before that check asked someone to approve an
+        // operation that then could not run, and the agent's retry with `true`
+        // asked them again. Needs a live AppHandle to exercise, so this pins the
+        // order instead.
+        let whole = include_str!("mcp.rs");
+        let src = &whole[..whole.find("\n#[cfg(test)]").unwrap_or(whole.len())];
+        for tool in ["insert_one", "update_many", "delete_many", "create_index"] {
+            let fn_at = src
+                .find(&format!("async fn {tool}(&self"))
+                .unwrap_or_else(|| panic!("{tool} handler"));
+            let call = src[fn_at..]
+                .find(&format!("confirm_write(&app_handle, \"{tool}\""))
+                .unwrap_or_else(|| panic!("{tool} must confirm"));
+            let preamble = &src[fn_at..fn_at + call];
+            assert!(
+                preamble.contains("if args._confirm {"),
+                "{tool} must not prompt for a call it is about to reject: {preamble}"
+            );
+        }
+        // The fall-through this relies on: the impls still reject an unconfirmed
+        // call, so skipping the prompt cannot become skipping the check.
+        let tools = include_str!("mcp_tools.rs");
+        let body = &tools[..tools.find("\n#[cfg(test)]").unwrap_or(tools.len())];
+        assert_eq!(
+            body.matches("require_confirm(args._confirm").count(),
+            4,
+            "one per write impl"
+        );
+    }
+
+    /// A `ConfirmEntry` plus the ids it settled, so a test can watch both halves.
+    fn recording_entry<'a>(
+        state: &'a AppState,
+        id: &str,
+    ) -> (ConfirmEntry<'a>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (tx, _rx) = oneshot::channel::<bool>();
+        let entry = ConfirmEntry::register(
+            state,
+            id.to_string(),
+            tx,
+            Box::new(move |settled| sink.lock().unwrap().push(settled.to_string())),
+        )
+        .expect("register");
+        (entry, seen)
+    }
+
+    #[test]
+    fn a_cancelled_confirmation_is_both_removed_and_settled() {
+        // Nothing after the `await` runs if the handler future is dropped instead
+        // of polled to completion — the client disconnects, or `stop_if_running`
+        // aborts the task after `GRACEFUL_SHUTDOWN_TIMEOUT`. That first stranded
+        // the sender in app-wide state, and then, once the map was cleaned up,
+        // left every webview holding a prompt for a request that no longer existed
+        // until its local TTL ran out. Both have to happen on this path.
+        let state = AppState::new();
+        let settled;
+        {
+            let (_entry, seen) = recording_entry(&state, "w1");
+            settled = seen;
+            assert_eq!(
+                state.mcp_write_confirms.lock_safe().unwrap().len(),
+                1,
+                "registered while the prompt is up"
+            );
+            assert!(
+                settled.lock().unwrap().is_empty(),
+                "not settled while the user can still answer"
+            );
+            // Scope end stands in for the dropped future: nothing here awaits or
+            // releases, exactly as a cancelled handler does not.
+        }
+        assert!(
+            state.mcp_write_confirms.lock_safe().unwrap().is_empty(),
+            "a cancelled confirmation must not leave its sender behind"
+        );
+        assert_eq!(
+            settled.lock().unwrap().as_slice(),
+            ["w1"],
+            "a cancelled confirmation must retire its prompt in every webview"
+        );
+    }
+
+    #[test]
+    fn an_answered_confirmation_settles_once() {
+        // The ordinary path retires the entry at the same point it always did, and
+        // the id is taken so the guard's own `Drop` cannot settle it a second time.
+        let state = AppState::new();
+        let (entry, settled) = recording_entry(&state, "w2");
+        entry.release();
+        assert!(
+            state.mcp_write_confirms.lock_safe().unwrap().is_empty(),
+            "release must remove the entry"
+        );
+        assert_eq!(
+            settled.lock().unwrap().as_slice(),
+            ["w2"],
+            "released, then dropped — settled exactly once"
+        );
+    }
+
+    #[test]
+    fn the_prompt_is_addressed_by_conversation_not_by_run() {
+        // A run id is minted in one webview and means nothing in another, so a tab
+        // moved to a second window took its pending write out of reach of every
+        // panel. The conversation travels with the tab.
+        let src = include_str!("mcp.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let confirm = body
+            .split("async fn confirm_write")
+            .nth(1)
+            .expect("confirm_write");
+        let decision = &confirm[..confirm.find("let emitted").unwrap_or(confirm.len())];
+        assert!(
+            decision.contains("only.conversation.clone()"),
+            "the address must be the conversation: {decision}"
+        );
+        assert!(
+            !decision.contains("only.run"),
+            "the run id is not an address any other webview can resolve"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_is_owned_by_the_guard() {
+        // The bare insert, the bare removal, and a settle emitted outside the
+        // guard are each what made a cancelled write go unnoticed. None may return.
+        let whole = include_str!("mcp.rs");
+        let src = &whole[..whole.find("\n#[cfg(test)]").unwrap_or(whole.len())];
+        let confirm = src
+            .split("async fn confirm_write")
+            .nth(1)
+            .expect("confirm_write");
+        assert!(
+            confirm.contains("ConfirmEntry::register("),
+            "the entry must be registered through the guard"
+        );
+        assert!(
+            !confirm.contains("mcp_write_confirms.lock_safe()?.insert"),
+            "a bare insert is not owned by anything"
+        );
+        assert!(
+            !confirm.contains("mcp_write_confirms.lock_safe()?.remove"),
+            "a bare removal is skipped when the future is dropped"
+        );
+        // The one emit confirm_write still makes is the request itself; settling is
+        // the guard's, so it cannot be skipped by cancellation.
+        assert!(
+            !confirm.contains(r#"app_handle.emit("mcp-write-settled""#),
+            "settling must belong to the guard, not to the happy path"
+        );
+        let guard = src
+            .split("impl<'a> ConfirmEntry<'a>")
+            .nth(1)
+            .expect("ConfirmEntry impl");
+        assert!(
+            guard.contains("(self.settled)(&id);"),
+            "settle must run wherever the entry is retired"
+        );
+    }
+
+    #[test]
+    fn an_external_write_is_never_attributed_to_a_conversation() {
+        // The route is the only identity available — `rmcp` hands the tool no view
+        // of the request — and what that rules out is guessing. Inferring the
+        // requester from app-wide activity presented an external client's write as
+        // belonging to whichever chat happened to be generating.
+        let src = include_str!("mcp.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let confirm = body.split("async fn confirm_write").nth(1).expect("confirm_write");
+        let decision = &confirm[..confirm.find("let emitted").unwrap_or(confirm.len())];
+        // The helper route may address a single live run; nothing else may.
+        assert!(decision.contains("if from_helper"), "the route decides: {decision}");
+        assert!(
+            decision.contains("} else {\n        None\n    };"),
+            "an external write is addressed to nobody"
+        );
+        // Every call site passes its route rather than assuming one.
+        assert_eq!(body.matches("self.helper).await").count(), 4, "one per write tool");
+    }
+
+    #[test]
+    fn the_approval_prompt_shows_what_would_actually_run() {
+        // The call-log summary reports a filter as a byte count. `{"state":"OLD"}`
+        // and `{}` are both "34 bytes", and one of them empties the collection —
+        // so approving from that summary is approving blind.
+        let details = serde_json::json!({
+            "connectionId": "conn-1",
+            "namespace": "shop.orders",
+            "filter": { "state": "OLD" },
+        });
+        let shown = serde_json::to_string_pretty(&details).unwrap();
+        assert!(shown.contains("\"state\""), "{shown}");
+        assert!(shown.contains("OLD"), "{shown}");
+        assert!(shown.contains("shop.orders"), "{shown}");
+        // The connection is named too: two profiles can share a display name.
+        assert!(shown.contains("conn-1"), "{shown}");
+        // And nothing is reduced to a size.
+        assert!(!shown.contains("filter_bytes"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_users_decision_reaches_the_parked_write() {
+        let state = AppState::new();
+        let (tx, rx) = oneshot::channel::<bool>();
+        state.mcp_write_confirms.lock().unwrap().insert("req-1".into(), tx);
+
+        resolve_write_impl(&state, "req-1", true).unwrap();
+        assert_eq!(rx.await, Ok(true), "the approval reaches the waiting tool");
+        // Taken out on the way, so a second click has nothing to resolve.
+        assert!(state.mcp_write_confirms.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_carried_as_a_refusal() {
+        let state = AppState::new();
+        let (tx, rx) = oneshot::channel::<bool>();
+        state.mcp_write_confirms.lock().unwrap().insert("req-2".into(), tx);
+        resolve_write_impl(&state, "req-2", false).unwrap();
+        assert_eq!(rx.await, Ok(false));
+    }
+
+    #[test]
+    fn a_late_or_unknown_decision_is_not_an_error() {
+        // The request may have already timed out; a late click is not worth
+        // showing anyone an error for.
+        let state = AppState::new();
+        resolve_write_impl(&state, "never-existed", true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_reads_as_refusal_not_approval() {
+        // Fail-closed: whatever goes wrong — a closed window, a cleared map — the
+        // waiting write must not take silence for a yes.
+        let state = AppState::new();
+        let (tx, rx) = oneshot::channel::<bool>();
+        state.mcp_write_confirms.lock().unwrap().insert("req-3".into(), tx);
+        state.mcp_write_confirms.lock().unwrap().clear(); // sender dropped
+        assert!(rx.await.is_err(), "a dropped sender must not resolve to true");
+    }
+
+    #[test]
+    fn the_agent_is_never_handed_the_external_token() {
+        // The whole point: MQLens's own agent gets credentials that route through
+        // the confirmation, and never the ones an external client uses — which
+        // would take it straight back to the `_confirm` honour system.
+        let state = AppState::new();
+        {
+            let mut control = state.mcp.lock().unwrap();
+            control.enabled = true;
+            control.port = 8765;
+            control.token = "external".into();
+            control.helper_token = "helper".into();
+        }
+        let (port, token) = helper_access(&state).expect("running server");
+        assert_eq!(port, 8765);
+        assert_eq!(token, "helper");
+        assert_ne!(token, "external");
+        assert_eq!(helper_path(), "/helper/mcp");
+    }
+
+    #[test]
+    fn a_disabled_server_offers_the_agent_nothing() {
+        // No credentials at all rather than stale ones: `generate_local` then
+        // refuses a command asking for {mcp_config} instead of quietly running
+        // without the tools.
+        let state = AppState::new();
+        assert!(helper_access(&state).is_none(), "disabled");
+
+        let mut control = state.mcp.lock().unwrap();
+        control.enabled = true;
+        control.helper_token = String::new();
+        drop(control);
+        assert!(helper_access(&state).is_none(), "enabled but no token minted yet");
+    }
+
+    #[test]
+    fn each_token_works_only_on_its_own_path() {
+        // The split is the whole basis of the helper's stricter write rules. If
+        // either token were accepted on both paths it would be cosmetic: an
+        // external client could take the helper's route, or the agent could take
+        // the external one and escape the confirmation.
+        let control = StdMutex::new(McpControl {
+            token: "outside".into(),
+            helper_token: "inside".into(),
+            ..McpControl::new()
+        });
+
+        assert!(bearer_token_matches(&control, &headers_with("outside"), false));
+        assert!(!bearer_token_matches(&control, &headers_with("outside"), true));
+        assert!(bearer_token_matches(&control, &headers_with("inside"), true));
+        assert!(!bearer_token_matches(&control, &headers_with("inside"), false));
+        assert!(!bearer_token_matches(&control, &headers_with("neither"), true));
+    }
+
+    #[test]
+    fn a_stopped_server_accepts_neither_token() {
+        // Fail-closed on both, or a stale helper token would be a way back in to
+        // a server the user has switched off.
+        let control = StdMutex::new(McpControl::new());
+        assert!(!bearer_token_matches(&control, &headers_with(""), false));
+        assert!(!bearer_token_matches(&control, &headers_with(""), true));
+        assert!(!bearer_token_matches(&control, &headers_with("anything"), true));
+    }
 
     /// Binds a *real, currently-occupied* ephemeral port and returns both
     /// the listener (keep it alive — dropping it frees the port) and its

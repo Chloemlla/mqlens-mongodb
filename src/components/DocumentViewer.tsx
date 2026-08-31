@@ -2410,6 +2410,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               <AIChatPanel
                 variant="editor"
                 embedded
+                connectionId={connectionId}
                 connectionName={connectionName}
                 databaseName={databaseName}
                 collectionName={collectionName}

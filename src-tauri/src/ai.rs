@@ -35,6 +35,199 @@ pub struct AiReply {
     /// provider — local CLIs included, which have no reasoning channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// What a local agent ran on the way to the answer. Empty for HTTP providers,
+    /// which are asked for one completion and call nothing.
+    #[serde(rename = "toolCalls", default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<AgentToolCall>,
+}
+
+/// One tool an agent ran while answering, for the panel to show.
+///
+/// Local coding agents do real work before they reply — reading a file, running a
+/// query — and until now that arrived as undifferentiated prose in `notes`. This
+/// is the same activity, kept structured.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolCall {
+    pub name: String,
+    /// The arguments, as compact JSON. Clipped: a tool input can be a whole file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// What the tool returned. Clipped for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// What an agent's event stream amounted to: its answer, and what it ran to get there.
+#[derive(Debug, PartialEq)]
+pub struct AgentRun {
+    pub text: String,
+    pub tool_calls: Vec<AgentToolCall>,
+}
+
+/// How much of an agent's output is read at all.
+///
+/// `MAX_EVENTS`, `MAX_TOOL_CALLS` and `MAX_TOOL_TEXT` bound the *transcript*;
+/// none of them bounds memory, because `Command::output()` has already buffered
+/// the whole of stdout before any of them is consulted. A structured run whose
+/// tool returned a 1 MB document per call, or read a large file, could exhaust
+/// the app before parsing began. Generous — a long agent turn is nowhere near
+/// this — and the excess is reported rather than silently dropped.
+const MAX_AGENT_STDOUT: usize = 8 * 1024 * 1024;
+/// Enough for a stack trace and a message; stderr is drained mainly so a chatty
+/// child does not block on a full pipe while stdout is being read.
+const MAX_AGENT_STDERR: usize = 256 * 1024;
+
+/// Kept small on purpose: this is a transcript entry, not a log. A tool can
+/// return a whole file, and the panel has to stay readable.
+const MAX_TOOL_CALLS: usize = 50;
+const MAX_TOOL_TEXT: usize = 2000;
+/// Far above any real turn, so it only ever catches a runaway stream.
+const MAX_EVENTS: usize = 10_000;
+
+/// `text` clipped to `max` characters, on a character boundary.
+fn clip(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth(max) {
+        None => trimmed.to_string(),
+        Some((end, _)) => format!("{}…", &trimmed[..end]),
+    }
+}
+
+/// Parse a local agent's structured event stream into its answer and tool calls.
+///
+/// `None` when the output is not an event stream, which is the ordinary case: no
+/// built-in command asks for one, so this only sees events when the user has put
+/// the flags in the command themselves. The caller then treats the output as text
+/// exactly as before, so nothing that works today stops working.
+///
+/// The shape handled here is Claude Code's `--output-format stream-json`, checked
+/// against a real run rather than assumed — see the fixture in `tests/fixtures`.
+/// Codex and cursor-agent have structured modes too, but with different envelopes
+/// that are not implemented until they can be verified the same way.
+pub fn parse_agent_events(stdout: &str) -> Option<AgentRun> {
+    // Streamed rather than collected: a long agent run emits megabytes, and
+    // holding every parsed event as well as the string they came from doubles
+    // that for no gain — each is read once and thrown away. `MAX_TOOL_CALLS`
+    // bounds what is *kept*; this bounds what is *parsed*.
+    let mut parsed_events = 0usize;
+    let mut calls: Vec<AgentToolCall> = Vec::new();
+    // Where each `tool_use_id` landed, so its result can be attached later.
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut assistant_text = String::new();
+    let mut final_text: Option<String> = None;
+    let mut saw_known = false;
+
+    for line in stdout.lines().map(str::trim) {
+        if parsed_events >= MAX_EVENTS {
+            break;
+        }
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(kind) = event.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        parsed_events += 1;
+        let event = &event;
+        match kind {
+            "assistant" | "user" => {
+                saw_known = true;
+                let blocks = event
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array());
+                let Some(blocks) = blocks else { continue };
+                for block in blocks {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("tool_use") => {
+                            if calls.len() >= MAX_TOOL_CALLS {
+                                continue;
+                            }
+                            let name = block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("tool")
+                                .to_string();
+                            let input = block
+                                .get("input")
+                                .map(|i| clip(&i.to_string(), MAX_TOOL_TEXT))
+                                .filter(|i| !i.is_empty() && i != "{}");
+                            if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                                by_id.insert(id.to_string(), calls.len());
+                            }
+                            calls.push(AgentToolCall {
+                                name,
+                                input,
+                                output: None,
+                                failed: false,
+                            });
+                        }
+                        Some("tool_result") => {
+                            let Some(idx) = block
+                                .get("tool_use_id")
+                                .and_then(|i| i.as_str())
+                                .and_then(|id| by_id.get(id))
+                                .copied()
+                            else {
+                                continue;
+                            };
+                            let raw = match block.get("content") {
+                                Some(serde_json::Value::String(t)) => t.clone(),
+                                Some(other) => other.to_string(),
+                                None => String::new(),
+                            };
+                            let call = &mut calls[idx];
+                            let clipped = clip(&raw, MAX_TOOL_TEXT);
+                            call.output = (!clipped.is_empty()).then_some(clipped);
+                            call.failed = block
+                                .get("is_error")
+                                .and_then(|e| e.as_bool())
+                                .unwrap_or(false);
+                        }
+                        Some("text") => {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                if !assistant_text.is_empty() {
+                                    assistant_text.push('\n');
+                                }
+                                assistant_text.push_str(t);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "result" => {
+                saw_known = true;
+                // The agent's own summary of the turn, which is the answer when
+                // there is one. An errored turn has no answer to take.
+                if event.get("subtype").and_then(|s| s.as_str()) == Some("success") {
+                    if let Some(t) = event.get("result").and_then(|r| r.as_str()) {
+                        final_text = Some(t.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // One stray JSON line in ordinary prose is not an event stream.
+    if !saw_known || parsed_events < 2 {
+        return None;
+    }
+    Some(AgentRun {
+        text: final_text.unwrap_or(assistant_text),
+        tool_calls: calls,
+    })
 }
 
 /// An image pasted into the chat, sent with the request and never stored.
@@ -675,13 +868,13 @@ pub async fn generate_openai(
 /// Build the reply from an OpenAI-format response body.
 fn openai_reply(json: &serde_json::Value) -> Result<AiReply, String> {
     let (query, notes) = split_json_object(&extract_openai_text(json))?;
-    Ok(AiReply { query, thoughts: extract_openai_reasoning(json), notes })
+    Ok(AiReply { query, thoughts: extract_openai_reasoning(json), notes , tool_calls: Vec::new() })
 }
 
 /// Build the reply from an Anthropic-format response body.
 fn anthropic_reply(json: &serde_json::Value) -> Result<AiReply, String> {
     let (query, notes) = split_json_object(&response_text(json))?;
-    Ok(AiReply { query, thoughts: extract_anthropic_thinking(json), notes })
+    Ok(AiReply { query, thoughts: extract_anthropic_thinking(json), notes , tool_calls: Vec::new() })
 }
 
 /// Post a chat completion to any OpenAI-compatible endpoint.
@@ -1036,7 +1229,169 @@ pub async fn generate_gemini(
         return Err(format!("Gemini API error ({}): {}", status.as_u16(), message));
     }
     let (query, notes) = split_json_object(&extract_gemini_text(&json))?;
-    Ok(AiReply { query, thoughts: extract_gemini_thoughts(&json), notes })
+    Ok(AiReply { query, thoughts: extract_gemini_thoughts(&json), notes , tool_calls: Vec::new() })
+}
+
+/// What to tell a local agent about MQLens's own tools.
+///
+/// An agent that does not know the tools exist writes a query from the field list
+/// alone and cannot say why it might be wrong; one that does not know they are
+/// *missing* can imply it checked. Both states are stated outright so the answer
+/// says which it was.
+/// What can honestly be said about the agent's reach to MQLens's own tools.
+///
+/// Three states, not two. "The server is off" and "I did not hand this command a
+/// config" are different facts: a user who followed the `claude mcp add` flow in
+/// Settings has an agent that reaches `mqlens` without `{mcp_config}`, and telling
+/// it the server is switched off would talk it out of an inspection it could
+/// actually do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpReach {
+    /// The server is not running. Nothing can reach it.
+    Off,
+    /// This command was handed a config, so the tools are there.
+    Injected,
+    /// The server is up, but whether *this* agent can see it is unknown.
+    Unknown,
+}
+
+pub fn mcp_availability_note(
+    reach: McpReach,
+    connection: Option<&str>,
+    connection_id: Option<&str>,
+    database: Option<&str>,
+    collection: &str,
+) -> String {
+    // Named outright. Told to inspect but not *where*, an agent picks a namespace
+    // itself, and two connections can hold collections of the same name — so the
+    // query comes back looking right and built from another environment's data.
+    // The id, not just the name: two profiles may share a display name, and the
+    // tools take an id anyway — so naming it removes the guess entirely rather
+    // than asking the agent to resolve a label that may match two connections.
+    let identified = match connection_id {
+        Some(id) if !id.is_empty() => format!(" Its connection_id is `{id}` — pass that."),
+        _ => String::new(),
+    };
+    let namespace = match (connection, database) {
+        (Some(c), Some(d)) if !c.is_empty() && !d.is_empty() => format!(
+            "\n\nThe question is about `{d}.{collection}` on the connection named \
+             `{c}`, which is the one open in front of the user.{identified} Use exactly \
+             that namespace; do not pick another connection or database, and if the \
+             tools show more than one candidate, say so rather than guessing."
+        ),
+        (_, Some(d)) if !d.is_empty() => format!(
+            "\n\nThe question is about `{d}.{collection}`.{identified} Use exactly that \
+             namespace."
+        ),
+        _ => String::new(),
+    };
+    let body = match reach {
+        McpReach::Injected =>
+        "\n\nMQLens's own tools are available to you over MCP as the `mqlens` server: \
+         list_connections, list_profiles, connect, list_databases, list_collections, \
+         schema_analysis, list_indexes, find, aggregate and explain. Use them before \
+         writing the query — the field list above is a summary of names, not observed \
+         data, so check the real types, indexes and actual values with schema_analysis \
+         and a small find rather than guessing at enum values or formats.",
+        McpReach::Unknown =>
+            "\n\nMQLens may be available to you as the `mqlens` MCP server, if you have \
+             it configured — this request did not hand you a configuration, so it \
+             cannot tell. Check whether those tools are there; if they are, use \
+             schema_analysis and a small find to confirm the real types and values \
+             before writing the query, and if they are not, say in your notes which \
+             parts you could not verify.",
+        McpReach::Off =>
+        "\n\nMQLens's MCP server is switched off, so you cannot sample the collection: \
+         you have the field names above and nothing else. Write the query from them, and \
+         say plainly in your notes which parts you could not verify — an enum value or a \
+         date format you assumed, for instance — so the user knows what to check.",
+    };
+    // The namespace matters either way: without the tools it still tells the agent
+    // which collection the field list belongs to.
+    format!("{body}{namespace}")
+}
+
+/// Where MQLens's own MCP server is listening, for an agent that can reach it.
+///
+/// Loopback only: the server binds `127.0.0.1`, and the token is the whole of its
+/// authentication, so this never belongs anywhere but on this machine.
+///
+/// `token` is the *helper* token and `path` the helper path, never the ones an
+/// external client uses. That separation is what makes the agent's writes go
+/// through the user instead of through a boolean the agent sets itself.
+pub struct McpEndpoint {
+    pub port: u16,
+    pub token: String,
+    pub path: String,
+}
+
+/// The MCP client config for MQLens's own server.
+///
+/// The shape is the one `claude mcp add --transport http` writes itself, rather
+/// than one inferred from documentation — a config an agent cannot parse fails by
+/// silently having no tools, which looks exactly like the problem it was meant to
+/// solve.
+pub fn mcp_config_json(endpoint: &McpEndpoint) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "mqlens": {
+                "type": "http",
+                "url": format!("http://127.0.0.1:{}{}", endpoint.port, endpoint.path),
+                "headers": { "Authorization": format!("Bearer {}", endpoint.token) }
+            }
+        }
+    })
+    .to_string()
+}
+
+/// A temp file holding that config, removed when this drops.
+///
+/// It contains the bearer token, so on Unix it is created `0600` *before* a byte
+/// is written — widening it afterwards would leave a window where any local user
+/// could read the token — and it is deleted however the run ends.
+///
+/// Windows has no equivalent here and inherits the directory's ACLs, which for the
+/// per-user temp directory means the owner alone. That is weaker than an explicit
+/// mode: a machine whose temp directory has been opened up would expose the token,
+/// and this does not defend against that.
+pub struct McpConfigFile(std::path::PathBuf);
+
+impl McpConfigFile {
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for McpConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_mcp_config(endpoint: &McpEndpoint) -> Result<McpConfigFile, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "mqlens-agent-mcp-{}-{}.json",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write as _;
+    let mut file = opts
+        .open(&path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    // Held from here on, so a failure below still removes the file.
+    let guard = McpConfigFile(path);
+    file.write_all(mcp_config_json(endpoint).as_bytes())
+        .map_err(|e| format!("write {}: {e}", guard.0.display()))?;
+    Ok(guard)
 }
 
 /// Parse a command template into (program, args), substituting the literal `{prompt}`
@@ -1129,6 +1484,7 @@ pub fn parse_command_template(
     template: &str,
     prompt: &str,
     model: &str,
+    mcp_config: Option<&str>,
 ) -> Result<(String, Vec<String>), String> {
     let tokens = split_command_line(template)?;
     if tokens.is_empty() {
@@ -1149,7 +1505,13 @@ pub fn parse_command_template(
         // `{prompt}` first and substituting in the pieces keeps it untouched.
         let pieces: Vec<String> = tok
             .split("{prompt}")
-            .map(|piece| piece.replace("{model}", model.trim()))
+            .map(|piece| {
+                let piece = piece.replace("{model}", model.trim());
+                match mcp_config {
+                    Some(path) => piece.replace("{mcp_config}", path),
+                    None => piece,
+                }
+            })
             .collect();
         if pieces.len() > 1 {
             substituted = true;
@@ -1164,22 +1526,44 @@ pub fn parse_command_template(
 
 /// Run a local agent CLI with the given prompt and extract the {filter, sort} JSON
 /// from its stdout. Uses the agent's own local auth; no API key involved.
-pub async fn generate_local(template: &str, prompt: &str, model: &str) -> Result<AiReply, String> {
-    let (program, args) = parse_command_template(template, prompt, model)?;
+pub async fn generate_local(
+    template: &str,
+    prompt: &str,
+    model: &str,
+    mcp: Option<&McpEndpoint>,
+) -> Result<AiReply, String> {
+    // Written only when the command asks for it, so a template that says nothing
+    // about MCP never has a token file created for it.
+    let config = if template.contains("{mcp_config}") {
+        match mcp {
+            Some(endpoint) => Some(write_mcp_config(endpoint)?),
+            None => {
+                return Err(
+                    "This command uses {mcp_config}, but MQLens's MCP server is switched off. \
+                     Turn it on in Settings, or take {mcp_config} out of the command."
+                        .to_string(),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let config_path = config.as_ref().map(|c| c.path().to_string_lossy().to_string());
+    let (program, args) = parse_command_template(template, prompt, model, config_path.as_deref())?;
 
-    let run = tokio::process::Command::new(&program)
+    // Piped and read under a cap rather than collected with `output()`. That
+    // buffers the whole of stdout before any limit can be consulted, so a tool
+    // returning a megabyte per call could exhaust the app before parsing began —
+    // a cap applied afterwards bounds the transcript, not the memory.
+    let mut child = tokio::process::Command::new(&program)
         .args(&args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         // Tokio does not kill a child when the future is dropped; without this a
         // timed-out command keeps running after the UI has given up on it.
         .kill_on_drop(true)
-        .output();
-
-    // Local coding agents (claude-code, codex, …) can take a while to start up
-    // and respond — allow a generous window before giving up.
-    let output = tokio::time::timeout(Duration::from_secs(180), run)
-        .await
-        .map_err(|_| "Local agent timed out after 180s".to_string())?
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!("'{}' not found on PATH. Install it or fix the command in Settings.", program)
@@ -1188,17 +1572,136 @@ pub async fn generate_local(template: &str, prompt: &str, model: &str) -> Result
             }
         })?;
 
+    let mut stdout_pipe = child.stdout.take().ok_or("no stdout pipe")?;
+    let mut stderr_pipe = child.stderr.take().ok_or("no stderr pipe")?;
+
+    // Both concurrently: a child writing a lot to stderr blocks on a full pipe if
+    // only stdout is being drained, and then nothing finishes.
+    let gather = async {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut buf_out = vec![0u8; 64 * 1024];
+        let mut buf_err = vec![0u8; 8 * 1024];
+        let (mut out_done, mut err_done, mut over_cap) = (false, false, false);
+
+        // Both pipes are drained until each reaches EOF, and the cap is checked as
+        // the bytes arrive. Reading them with `try_join!` and killing afterwards
+        // did not work: the join waits for *both* to finish, so a child that
+        // capped stdout and kept writing blocked on the pipe nobody was draining
+        // and the kill was never reached — the run lasted until the 180s timeout
+        // and reported a hang instead of a size.
+        while !(out_done && err_done) {
+            tokio::select! {
+                read = stdout_pipe.read(&mut buf_out), if !out_done => {
+                    let n = read?;
+                    if n == 0 {
+                        out_done = true;
+                    } else if out.len() + n > MAX_AGENT_STDOUT {
+                        over_cap = true;
+                        break;
+                    } else {
+                        out.extend_from_slice(&buf_out[..n]);
+                    }
+                }
+                read = stderr_pipe.read(&mut buf_err), if !err_done => {
+                    let n = read?;
+                    if n == 0 {
+                        err_done = true;
+                    } else if err.len() < MAX_AGENT_STDERR {
+                        // Kept up to the cap and read past it regardless: a child
+                        // blocked on a full stderr pipe never exits either.
+                        let room = MAX_AGENT_STDERR - err.len();
+                        err.extend_from_slice(&buf_err[..n.min(room)]);
+                    }
+                }
+            }
+        }
+
+        if over_cap {
+            // Immediately, while it is still blocked on the pipe we stopped reading.
+            let _ = child.kill().await;
+        }
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err, over_cap))
+    };
+
+    // Local coding agents (claude-code, codex, …) can take a while to start up
+    // and respond — allow a generous window before giving up.
+    let (status, stdout_bytes, stderr_bytes, over_cap) =
+        tokio::time::timeout(Duration::from_secs(180), gather)
+            .await
+            .map_err(|_| "Local agent timed out after 180s".to_string())?
+            .map_err(|e| format!("Failed to read from '{}': {}", program, e))?;
+
+    if over_cap {
+        // No claim about side effects. The agent may already have completed a write
+        // the user approved, and the truncated stream is not evidence either way —
+        // saying "nothing was applied" would be an assurance this cannot make. What
+        // it *can* report is whatever activity survives in the part that was read.
+        let ran = parse_agent_events(&String::from_utf8_lossy(&stdout_bytes))
+            .map(|run| {
+                run.tool_calls
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|names| !names.is_empty());
+        return Err(match ran {
+            Some(names) => format!(
+                "Local agent '{}' produced more than {} MB of output, past what this \
+                 reads, so its answer was not used. It had already run: {}. Check \
+                 whether anything was changed. If its tools are returning whole \
+                 documents, narrow what it is asked to inspect.",
+                program,
+                MAX_AGENT_STDOUT / (1024 * 1024),
+                names
+            ),
+            None => format!(
+                "Local agent '{}' produced more than {} MB of output, past what this \
+                 reads, so its answer was not used. If its tools are returning whole \
+                 documents, narrow what it is asked to inspect.",
+                program,
+                MAX_AGENT_STDOUT / (1024 * 1024)
+            ),
+        });
+    }
+    let output = std::process::Output { status, stdout: stdout_bytes, stderr: stderr_bytes };
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Local agent '{}' failed: {}",
-            program,
-            stderr.trim()
-        ));
+        let failure = format!("Local agent '{}' failed: {}", program, stderr.trim());
+        // A run that failed *after* running tools is exactly when the transcript
+        // matters: those calls happened, some with side effects, and returning
+        // only stderr threw the record of them away. The failure is still an
+        // error — it is reported with the activity attached rather than instead
+        // of it.
+        return match parse_agent_events(&stdout_text) {
+            Some(run) if !run.tool_calls.is_empty() => Err(format!(
+                "{failure}\n\nIt had already run: {}",
+                run.tool_calls
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => Err(failure),
+        };
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (query, notes) = split_json_object(&stdout)?;
-    Ok(AiReply { query, thoughts: None, notes })
+    let stdout = stdout_text;
+    // An agent asked for structured output reports what it ran; everything else
+    // is prose with a JSON object in it, exactly as before.
+    match parse_agent_events(&stdout) {
+        Some(run) => {
+            let (query, notes) = split_json_object(&run.text)?;
+            Ok(AiReply { query, thoughts: None, notes, tool_calls: run.tool_calls })
+        }
+        None => {
+            let (query, notes) = split_json_object(&stdout)?;
+            Ok(AiReply { query, thoughts: None, notes, tool_calls: Vec::new() })
+        }
+    }
 }
 
 pub async fn generate_anthropic(
