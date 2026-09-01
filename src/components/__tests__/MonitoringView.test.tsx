@@ -172,11 +172,11 @@ describe('MonitoringView', () => {
     // Healthy secondary: sub-threshold lag, no warning class.
     const okLag = screen.getByTestId('cluster-lag-db2:27017');
     expect(okLag).toHaveTextContent('0.8s');
-    expect(okLag.className).not.toMatch(/amber|red/);
-    // Lagging secondary (42s >= 10s): amber warning.
+    expect(okLag.className).not.toMatch(/text-warning|text-destructive/);
+    // Lagging secondary (42s >= 10s): the theme's warning token.
     const warnLag = screen.getByTestId('cluster-lag-db3:27017');
     expect(warnLag).toHaveTextContent('42');
-    expect(warnLag.className).toMatch(/amber/);
+    expect(warnLag.className).toMatch(/text-warning/);
     // Down/unreachable member: unhealthy styling and no bogus lag.
     expect(screen.getByTestId('cluster-member-db4:27017').className).toMatch(/destructive/);
     expect(screen.getByTestId('cluster-lag-db4:27017')).toHaveTextContent('n/a');

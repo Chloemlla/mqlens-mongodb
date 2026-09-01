@@ -257,7 +257,7 @@ const EXEMPT_HITS: Record<string, string[]> = {
     // KIND_STYLES' `label` property holds a Tailwind text-color className,
     // not a display label — an unlucky property-name collision with the
     // detector's `label:` heuristic, not translatable prose.
-    "label: 'text-emerald-700 dark:text-emerald-300'",
+    "label: 'text-success'",
     "label: 'text-destructive'",
     "label: 'text-primary'",
   ],

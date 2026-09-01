@@ -52,13 +52,46 @@ export function hslComponentsToHex(components: string): string {
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
 
-function readToken(name: string, fallback: string): string {
+/**
+ * How a token name becomes a hex colour for Monaco.
+ *
+ * Injectable because reading the DOM is not safe at the moment these themes are
+ * built. React runs child effects before parent ones, so an editor asking the
+ * computed styles for `--input` gets the value from BEFORE ThemeProvider
+ * applied the new theme — empty on first mount, and the previous theme's colour
+ * on every switch after. Measured, with a provider setting the variable and a
+ * child reading it:
+ *
+ *     reads seen by the child: ["", "DARK"]   // switching to the light theme
+ *
+ * That is the whole of #282: an editor themed one step behind the app, falling
+ * back to a hardcoded default when it had nothing to read at all — which is why
+ * presets like nord, solarized and high-contrast never reached it, and why
+ * changing the default made the symptom swap ends rather than go away.
+ *
+ * Callers that hold the theme config pass `tokenResolverFor` instead, which
+ * answers from the config itself and cannot be out of step with it.
+ */
+export type MonacoTokenResolver = (name: string, fallback: string) => string;
+
+/** Last-resort resolver: reads the DOM. Correct only once styles have settled. */
+export const cssTokenResolver: MonacoTokenResolver = (name, fallback) => {
   if (typeof document === "undefined") return fallback;
   const raw = getComputedStyle(document.documentElement)
     .getPropertyValue(`--${name}`)
     .trim();
   if (!raw) return fallback;
   return hslComponentsToHex(raw);
+};
+
+/** Resolver over a token map — the theme config's own values, no DOM involved. */
+export function tokenResolverFor(
+  tokens: Record<string, string>
+): MonacoTokenResolver {
+  return (name, fallback) => {
+    const raw = tokens[name];
+    return raw ? hslComponentsToHex(raw) : fallback;
+  };
 }
 
 export function getMqlensMonacoThemeId(): MqlensMonacoThemeId {
@@ -80,90 +113,73 @@ export function getMqlensMonacoThemeId(): MqlensMonacoThemeId {
  * the JavaScript query and shell editors, which are meant to keep the inherited
  * VS/VS Dark palette. Monaco wants hex without the leading `#`.
  */
-export function syntaxRules(): { token: string; foreground: string }[] {
+export function syntaxRules(
+  resolve: MonacoTokenResolver = cssTokenResolver
+): { token: string; foreground: string }[] {
   return DOC_SYNTAX_TOKENS.map(({ token, cssToken, fallback }) => ({
     token: `${token}${DOC_TOKEN_POSTFIX}`,
-    foreground: readToken(cssToken, fallback).replace("#", ""),
+    foreground: resolve(cssToken, fallback).replace("#", ""),
   }));
 }
 
-export function registerMqlensMonacoThemes(monaco: Monaco): void {
-  if (registered) return;
+/**
+ * Both theme definitions, from one place.
+ *
+ * They used to be spelled out twice — once to register and once to refresh —
+ * which is how a colour can be corrected in one and left stale in the other.
+ */
+function defineThemes(monaco: Monaco, resolve: MonacoTokenResolver): void {
+  const rules = syntaxRules(resolve);
 
-  const lightTheme: MqlensMonacoThemeId = "mqlens-light";
-  const darkTheme: MqlensMonacoThemeId = "mqlens-dark";
-
-  monaco.editor.defineTheme(lightTheme, {
+  monaco.editor.defineTheme("mqlens-light", {
     base: "vs",
     inherit: true,
-    rules: syntaxRules(),
+    rules,
     colors: {
-      "editor.background": readToken("input", "#ffffff"),
-      "editor.foreground": readToken("foreground", "#1a1a1a"),
-      "editorLineNumber.foreground": readToken("muted-foreground", "#6b7280"),
-      "editor.selectionBackground": readToken("accent", "#e5e7eb"),
-      "editor.inactiveSelectionBackground": readToken("muted", "#f3f4f6"),
-      "editorCursor.foreground": readToken("primary", "#2563eb"),
-      "editorWidget.background": readToken("popover", "#ffffff"),
-      "editorWidget.border": readToken("border", "#d1d5db"),
+      "editor.background": resolve("input", "#ffffff"),
+      "editor.foreground": resolve("foreground", "#1a1a1a"),
+      "editorLineNumber.foreground": resolve("muted-foreground", "#6b7280"),
+      "editor.selectionBackground": resolve("accent", "#e5e7eb"),
+      "editor.inactiveSelectionBackground": resolve("muted", "#f3f4f6"),
+      "editorCursor.foreground": resolve("primary", "#2563eb"),
+      "editorWidget.background": resolve("popover", "#ffffff"),
+      "editorWidget.border": resolve("border", "#d1d5db"),
     },
   });
 
-  monaco.editor.defineTheme(darkTheme, {
+  monaco.editor.defineTheme("mqlens-dark", {
     base: "vs-dark",
     inherit: true,
-    rules: syntaxRules(),
+    rules,
     colors: {
-      "editor.background": readToken("input", "#1e1e1e"),
-      "editor.foreground": readToken("foreground", "#d4d4d4"),
-      "editorLineNumber.foreground": readToken("muted-foreground", "#858585"),
-      "editor.selectionBackground": readToken("accent", "#264f78"),
-      "editor.inactiveSelectionBackground": readToken("muted", "#2a2d2e"),
-      "editorCursor.foreground": readToken("primary", "#569cd6"),
-      "editorWidget.background": readToken("popover", "#252526"),
-      "editorWidget.border": readToken("border", "#454545"),
+      "editor.background": resolve("input", "#1e1e1e"),
+      "editor.foreground": resolve("foreground", "#d4d4d4"),
+      "editorLineNumber.foreground": resolve("muted-foreground", "#858585"),
+      "editor.selectionBackground": resolve("accent", "#264f78"),
+      "editor.inactiveSelectionBackground": resolve("muted", "#2a2d2e"),
+      "editorCursor.foreground": resolve("primary", "#569cd6"),
+      "editorWidget.background": resolve("popover", "#252526"),
+      "editorWidget.border": resolve("border", "#454545"),
     },
   });
-
-  registered = true;
-  monaco.editor.setTheme(getMqlensMonacoThemeId());
 }
 
-export function refreshMqlensMonacoTheme(monaco: Monaco): void {
-  const lightTheme: MqlensMonacoThemeId = "mqlens-light";
-  const darkTheme: MqlensMonacoThemeId = "mqlens-dark";
+export function registerMqlensMonacoThemes(
+  monaco: Monaco,
+  resolve: MonacoTokenResolver = cssTokenResolver,
+  themeId: MqlensMonacoThemeId = getMqlensMonacoThemeId()
+): void {
+  if (registered) return;
+  defineThemes(monaco, resolve);
+  registered = true;
+  monaco.editor.setTheme(themeId);
+}
 
-  monaco.editor.defineTheme(lightTheme, {
-    base: "vs",
-    inherit: true,
-    rules: syntaxRules(),
-    colors: {
-      "editor.background": readToken("input", "#ffffff"),
-      "editor.foreground": readToken("foreground", "#1a1a1a"),
-      "editorLineNumber.foreground": readToken("muted-foreground", "#6b7280"),
-      "editor.selectionBackground": readToken("accent", "#e5e7eb"),
-      "editor.inactiveSelectionBackground": readToken("muted", "#f3f4f6"),
-      "editorCursor.foreground": readToken("primary", "#2563eb"),
-      "editorWidget.background": readToken("popover", "#ffffff"),
-      "editorWidget.border": readToken("border", "#d1d5db"),
-    },
-  });
-
-  monaco.editor.defineTheme(darkTheme, {
-    base: "vs-dark",
-    inherit: true,
-    rules: syntaxRules(),
-    colors: {
-      "editor.background": readToken("input", "#1e1e1e"),
-      "editor.foreground": readToken("foreground", "#d4d4d4"),
-      "editorLineNumber.foreground": readToken("muted-foreground", "#858585"),
-      "editor.selectionBackground": readToken("accent", "#264f78"),
-      "editor.inactiveSelectionBackground": readToken("muted", "#2a2d2e"),
-      "editorCursor.foreground": readToken("primary", "#569cd6"),
-      "editorWidget.background": readToken("popover", "#252526"),
-      "editorWidget.border": readToken("border", "#454545"),
-    },
-  });
-
-  monaco.editor.setTheme(getMqlensMonacoThemeId());
+export function refreshMqlensMonacoTheme(
+  monaco: Monaco,
+  resolve: MonacoTokenResolver = cssTokenResolver,
+  themeId: MqlensMonacoThemeId = getMqlensMonacoThemeId()
+): void {
+  defineThemes(monaco, resolve);
+  monaco.editor.setTheme(themeId);
 }

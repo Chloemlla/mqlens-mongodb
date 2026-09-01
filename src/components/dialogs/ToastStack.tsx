@@ -42,10 +42,10 @@ const KIND_STYLES: Record<
   { shell: string; icon: string; progress: string; label: string }
 > = {
   success: {
-    shell: 'border-emerald-500/35 bg-emerald-500/10 shadow-emerald-500/10',
-    icon: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400',
-    progress: 'bg-emerald-500/70',
-    label: 'text-emerald-700 dark:text-emerald-300',
+    shell: 'border-success/35 bg-success/10 shadow-success/10',
+    icon: 'bg-success/15 text-success',
+    progress: 'bg-success/70',
+    label: 'text-success',
   },
   error: {
     shell: 'border-destructive/40 bg-destructive/10 shadow-destructive/10',
