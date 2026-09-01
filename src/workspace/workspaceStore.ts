@@ -131,6 +131,52 @@ export function subscribeAiProvidersChanged(listener: () => void): Promise<Unlis
   return listen('ai-providers-changed', () => listener());
 }
 
+/** A write MQLens's own agent has asked to make, awaiting the user's answer. */
+export interface McpWriteRequest {
+  id: string;
+  tool: string;
+  summary: string;
+  /**
+   * The run that asked, or `null` when MQLens cannot tell — an external MCP
+   * client with no run of its own, or two runs at once. A named run is shown only
+   * by the panel that started it; an unnamed one may be answered anywhere, since
+   * it is the app asking its user rather than a conversation asking.
+   */
+  requester: string | null;
+}
+
+/**
+ * Subscribe to writes MQLens's own agent asks for.
+ *
+ * The tool call is parked in the backend until `mcp_resolve_write` carries an
+ * answer back, and refuses on its own after two minutes — so a missed event
+ * costs a refusal, never an unintended write.
+ *
+ * Every webview receives it: that is what `emit` does. The request carries the id
+ * of the panel that asked, and panels ignore the rest — deterministic in a way
+ * that picking the right `EventTarget` variant is not, and able to tell apart two
+ * panes of one window, which a window label cannot.
+ */
+export function subscribeMcpWriteRequest(
+  listener: (request: McpWriteRequest) => void
+): Promise<UnlistenFn> {
+  return listen<McpWriteRequest>('mcp-write-request', (event) => listener(event.payload));
+}
+
+/**
+ * Subscribe to a request the backend has finished with, however it ended.
+ *
+ * The request goes to every webview but is answered in one, so the others held a
+ * prompt that had already been decided — and since a panel shows the oldest
+ * first, that dead prompt hid live ones behind it. Emitted for a refusal and a
+ * timeout too, so this clears them rather than waiting out the local TTL.
+ */
+export function subscribeMcpWriteSettled(
+  listener: (id: string) => void
+): Promise<UnlistenFn> {
+  return listen<{ id: string }>('mcp-write-settled', (event) => listener(event.payload.id));
+}
+
 /** Wire shape of the `connections-changed` broadcast (src-tauri/src/state.rs's `ConnectionsChangedPayload`). */
 export interface ConnectionEntry {
   id: string;

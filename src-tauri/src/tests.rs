@@ -99,7 +99,7 @@ mod tests {
     fn the_model_placeholder_is_substituted_as_its_own_argument() {
         use crate::ai::parse_command_template;
         let (prog, args) =
-            parse_command_template("ollama run {model} {prompt}", "find users", "llama3:latest").unwrap();
+            parse_command_template("ollama run {model} {prompt}", "find users", "llama3:latest", None).unwrap();
         assert_eq!(prog, "ollama");
         assert_eq!(args, ["run", "llama3:latest", "find users"]);
     }
@@ -494,7 +494,7 @@ mod tests {
     fn a_quoted_template_keeps_its_argument_whole() {
         use crate::ai::parse_command_template;
         let (prog, args) =
-            parse_command_template(r#""/opt/My Agents/run" --prompt={prompt}"#, "find users", "").unwrap();
+            parse_command_template(r#""/opt/My Agents/run" --prompt={prompt}"#, "find users", "", None).unwrap();
         assert_eq!(prog, "/opt/My Agents/run");
         assert_eq!(args, ["--prompt=find users"]);
     }
@@ -506,7 +506,7 @@ mod tests {
         // the prompt appended as an extra argument.
         use crate::ai::parse_command_template;
         let (prog, args) =
-            parse_command_template("agent --model={model} --prompt={prompt}", "find users", "m1").unwrap();
+            parse_command_template("agent --model={model} --prompt={prompt}", "find users", "m1", None).unwrap();
         assert_eq!(prog, "agent");
         assert_eq!(args, ["--model=m1", "--prompt=find users"]);
     }
@@ -516,14 +516,14 @@ mod tests {
         use crate::ai::parse_command_template;
         // An empty argument would make the CLI run its default model silently,
         // which is not what the user configured.
-        let err = parse_command_template("ollama run {model} {prompt}", "p", "").unwrap_err();
+        let err = parse_command_template("ollama run {model} {prompt}", "p", "", None).unwrap_err();
         assert!(err.contains("{model}"), "{err}");
     }
 
     #[test]
     fn templates_without_the_model_placeholder_are_unchanged() {
         use crate::ai::parse_command_template;
-        let (prog, args) = parse_command_template("claude -p {prompt}", "find users", "ignored").unwrap();
+        let (prog, args) = parse_command_template("claude -p {prompt}", "find users", "ignored", None).unwrap();
         assert_eq!(prog, "claude");
         assert_eq!(args, ["-p", "find users"]);
     }
@@ -593,10 +593,10 @@ mod tests {
     fn the_prompt_text_is_never_scanned_for_placeholders() {
         use crate::ai::parse_command_template;
         // The prompt is user content and may say "{model}" literally.
-        let (_, args) = parse_command_template("agent --model={model} {prompt}", r#"find "{model}""#, "m1").unwrap();
+        let (_, args) = parse_command_template("agent --model={model} {prompt}", r#"find "{model}""#, "m1", None).unwrap();
         assert_eq!(args, ["--model=m1", r#"find "{model}""#]);
         // …and a prompt containing "{prompt}" is not re-expanded either.
-        let (_, args) = parse_command_template("agent {prompt}", "say {prompt}", "").unwrap();
+        let (_, args) = parse_command_template("agent {prompt}", "say {prompt}", "", None).unwrap();
         assert_eq!(args, ["say {prompt}"]);
     }
 
@@ -729,6 +729,336 @@ mod tests {
     }
 
     #[test]
+    fn the_dispatch_distinguishes_all_three_reaches() {
+        // `mcp_availability_note` is tested on its own, and passed while the call
+        // site collapsed "no config injected" back into "server off" — the same
+        // shape of gap as the credentials wiring. Computing the reach needs a live
+        // AppHandle, so this pins the call site.
+        let src = include_str!("lib.rs");
+        let call = src.find("ai::mcp_availability_note(").expect("the note's call site");
+        let arm = src[..call].rfind("LocalCli =>").expect("its match arm");
+        let dispatch = &src[arm..call];
+        for state in ["McpReach::Off", "McpReach::Injected", "McpReach::Unknown"] {
+            assert!(dispatch.contains(state), "the dispatch must distinguish {state}");
+        }
+        // Injected is the only one that may be concluded from the command text.
+        assert!(
+            dispatch.contains("contains(\"{mcp_config}\")"),
+            "injection is decided by the command carrying the placeholder"
+        );
+    }
+
+    #[test]
+    fn the_agents_endpoint_is_wired_to_the_helper_credentials() {
+        // `helper_access` and `mcp_config_json` are each tested on their own, and
+        // both passed while `lib.rs` still handed over the *external* token — the
+        // wiring between them was the untested part, and it is the part that was
+        // vulnerable. Exercising it properly needs a live `AppHandle`, so this
+        // pins the call site instead.
+        let src = include_str!("lib.rs");
+        // Anchored on the call itself: `ProviderKind::LocalCli` also appears in
+        // the model-listing helper, and matching that one proves nothing.
+        let call = src.find("ai::generate_local(").expect("the local-agent dispatch");
+        // From the arm that precedes the call to the call itself — a fixed window
+        // of characters was not enough, and `ProviderKind::LocalCli` also appears
+        // in the model-listing helper, so matching the first one proves nothing.
+        let arm = src[..call].rfind("LocalCli =>").expect("its match arm");
+        let dispatch = &src[arm..call];
+        assert!(
+            dispatch.contains("mcp::helper_access("),
+            "the agent's endpoint must come from helper_access"
+        );
+        assert!(
+            dispatch.contains("mcp::helper_path()"),
+            "and its path from helper_path"
+        );
+        // The external token reaches the frontend for display; it must never be
+        // what the agent is handed.
+        assert!(
+            !dispatch.contains("get_status_impl"),
+            "the agent must not be given the external token"
+        );
+    }
+
+    #[test]
+    fn the_mcp_config_is_the_shape_the_agent_expects() {
+        // Not inferred: this is what `claude mcp add --transport http` writes
+        // itself. A config an agent cannot parse fails by silently having no
+        // tools, which looks exactly like the problem it is meant to solve.
+        use crate::ai::{mcp_config_json, McpEndpoint};
+        let json: serde_json::Value = serde_json::from_str(&mcp_config_json(&McpEndpoint {
+            port: 8765,
+            token: "helper-tok".into(),
+            path: crate::mcp::helper_path().to_string(),
+        }))
+        .unwrap();
+        let server = &json["mcpServers"]["mqlens"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["headers"]["Authorization"], "Bearer helper-tok");
+        // Loopback, always: the token is the whole of the server's authentication.
+        let url = server["url"].as_str().unwrap();
+        assert!(url.starts_with("http://127.0.0.1:8765"), "{url}");
+        // The helper route, never the one external clients use — that separation
+        // is what puts the agent's writes in front of the user.
+        assert!(url.ends_with("/helper/mcp"), "{url}");
+        assert_ne!(url, "http://127.0.0.1:8765/mcp");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_mcp_config_file_is_private_and_does_not_outlive_the_run() {
+        // It holds the bearer token, so it is created 0600 before a byte is
+        // written and removed however the run ends.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("agent");
+        // The stub prints the file's mode to STDOUT, where the reply can see it.
+        // An earlier version sent it to stderr, which `generate_local` discards on
+        // success — so the test claimed to check 0600 and checked nothing.
+        // `stat` differs between macOS and Linux, and the ORDER matters: GNU's
+        // `-f` means "filesystem status" and *succeeds*, printing filesystem info,
+        // so trying it first never falls through on Linux. macOS rejects `-c`
+        // outright, so asking for the GNU spelling first fails cleanly there.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nCFG=\"$1\"\n\
+             echo \"mode=$(stat -c %a \"$CFG\" 2>/dev/null || stat -f %Lp \"$CFG\")\"\n\
+             cat \"$CFG\"\necho '{\"queryType\":\"find\",\"filter\":{}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let endpoint = crate::ai::McpEndpoint {
+            port: 8765,
+            token: "tok-abc".into(),
+            path: crate::mcp::helper_path().to_string(),
+        };
+        let reply = crate::ai::generate_local(
+            &format!("{} {{mcp_config}} {{prompt}}", stub.to_string_lossy()),
+            "anything",
+            "",
+            Some(&endpoint),
+        )
+        .await
+        .expect("the stub answers");
+        let notes = reply.notes.as_deref().unwrap_or("").to_string();
+        // The agent really received the config: it echoed it back...
+        assert!(notes.contains("mqlens"), "{notes}");
+        assert!(notes.contains("Bearer tok-abc"), "the token reaches the agent: {notes}");
+        // ...and it was readable by nobody else.
+        assert!(notes.contains("mode=600"), "config must be 0600: {notes}");
+
+        // Nothing of ours is left afterwards. The prefix is distinctive on purpose:
+        // an earlier draft used `mqlens-mcp-` and matched another test's directory.
+        let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("mqlens-agent-mcp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "config file left behind: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_command_wanting_mcp_says_so_when_the_server_is_off() {
+        // Silently running without the tools is how an agent ends up guessing at
+        // values it never sampled.
+        let err = crate::ai::generate_local("some-agent {mcp_config} {prompt}", "hi", "", None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("switched off"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_is_told_whether_mqlens_tools_are_reachable() {
+        use crate::ai::mcp_availability_note;
+        let on = mcp_availability_note(crate::ai::McpReach::Injected, Some("prod"), Some("conn-7"), Some("shop"), "orders");
+        assert!(on.contains("schema_analysis"), "{on}");
+        assert!(on.contains("not observed data") || on.contains("observed"), "{on}");
+        let off = mcp_availability_note(crate::ai::McpReach::Off, Some("prod"), Some("conn-7"), Some("shop"), "orders");
+        assert!(off.contains("switched off"), "{off}");
+        // ...and told to say what it could not check, rather than implying it did.
+        assert!(off.contains("could not verify"), "{off}");
+
+        // The third state, which is the honest one when the server is up but this
+        // command was handed no config: the user may have configured the agent
+        // globally via `claude mcp add`, and claiming the server is off would talk
+        // it out of an inspection it can actually do.
+        let unknown = mcp_availability_note(
+            crate::ai::McpReach::Unknown,
+            Some("prod"),
+            Some("conn-7"),
+            Some("shop"),
+            "orders",
+        );
+        assert!(unknown.contains("may be available"), "{unknown}");
+        assert!(!unknown.contains("switched off"), "must not claim it is off: {unknown}");
+        // Still told to report what it could not check, either way.
+        assert!(unknown.contains("could not verify"), "{unknown}");
+        // ...and only the genuinely-off case says so.
+        assert!(off.contains("switched off"), "{off}");
+        assert!(!on.contains("switched off"), "{on}");
+
+        // Both name the namespace outright: told to inspect but not *where*, an
+        // agent picks one itself, and two connections can hold `shop.orders`.
+        for note in [&on, &off] {
+            assert!(note.contains("`shop.orders`"), "{note}");
+            assert!(note.contains("`prod`"), "{note}");
+            // The id as well as the name: two profiles can share a display name,
+            // and the tools take an id, so this is the value the agent can use.
+            assert!(note.contains("`conn-7`"), "{note}");
+        }
+        // Without a connection name it still says which collection is meant.
+        let partial = mcp_availability_note(crate::ai::McpReach::Injected, None, Some("conn-7"), Some("shop"), "orders");
+        assert!(partial.contains("`shop.orders`"), "{partial}");
+        // And says nothing misleading when the tab has no database yet.
+        let bare = mcp_availability_note(crate::ai::McpReach::Injected, None, None, None, "orders");
+        assert!(!bare.contains("Use exactly that namespace"), "{bare}");
+    }
+
+    #[test]
+    fn an_agents_event_stream_yields_its_answer_and_what_it_ran() {
+        // The fixture is a real `claude -p --output-format stream-json` run,
+        // captured rather than hand-written: a parser tested only against output
+        // invented to match it proves nothing about the format it will meet.
+        use crate::ai::parse_agent_events;
+        let run = parse_agent_events(include_str!("../tests/fixtures/claude_stream_json.jsonl"))
+            .expect("a stream of events is recognised as one");
+
+        // The agent's own summary of the turn is the answer.
+        assert_eq!(run.text, "6");
+
+        assert_eq!(run.tool_calls.len(), 1, "{:?}", run.tool_calls);
+        let call = &run.tool_calls[0];
+        assert_eq!(call.name, "Bash");
+        assert!(
+            call.input.as_deref().unwrap_or("").contains("ls -A"),
+            "{:?}",
+            call.input
+        );
+        // The result is matched back to the call it belongs to by `tool_use_id`.
+        assert!(
+            call.output.as_deref().unwrap_or("").contains('6'),
+            "{:?}",
+            call.output
+        );
+        assert!(!call.failed);
+    }
+
+    #[test]
+    fn the_chat_store_cannot_hold_what_a_tool_returned() {
+        // An agent told to sample the collection runs `find`, and the result holds
+        // real documents. `chats.json` is plain JSON on disk, so the stored shape
+        // has nowhere to put them — the same rule attachments follow.
+        let from_panel = serde_json::json!({
+            "id": "m1", "role": "assistant", "text": "ok",
+            "toolCalls": [{
+                "name": "find",
+                "input": "{\"filter\":{\"email\":\"real.person@example.com\"}}",
+                "output": "[{\"_id\":1,\"email\":\"real.person@example.com\",\"ssn\":\"123-45-6789\"}]",
+                "failed": false
+            }]
+        });
+        let msg: crate::chats::ChatMessage = serde_json::from_value(from_panel).unwrap();
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].name, "find");
+
+        let on_disk = serde_json::to_string(&msg).unwrap();
+        assert!(on_disk.contains("find"), "the call itself is still recorded");
+        for leaked in ["real.person@example.com", "123-45-6789", "ssn", "filter"] {
+            assert!(!on_disk.contains(leaked), "{leaked} must not reach the store: {on_disk}");
+        }
+    }
+
+    #[test]
+    fn a_long_agent_run_is_bounded_in_what_it_keeps() {
+        // A transcript entry, not a log: an agent that ran hundreds of tools, or
+        // one whose tool returned a whole file, must not put either in the panel.
+        use crate::ai::parse_agent_events;
+        let mut stream = String::new();
+        for i in 0..60 {
+            stream.push_str(&format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t{i}","name":"Bash","input":{{"n":{i}}}}}]}}}}"#
+            ));
+            stream.push('\n');
+            // A result far larger than anything worth showing.
+            stream.push_str(&format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t{i}","content":"{}"}}]}}}}"#,
+                "x".repeat(9000)
+            ));
+            stream.push('\n');
+        }
+        let run = parse_agent_events(&stream).expect("a stream");
+        assert_eq!(run.tool_calls.len(), 50, "kept calls are capped");
+        let out = run.tool_calls[0].output.as_deref().unwrap();
+        assert!(out.chars().count() <= 2_001, "output clipped: {} chars", out.chars().count());
+        assert!(out.ends_with('…'), "clipping is visible rather than silent");
+    }
+
+    #[test]
+    fn ordinary_agent_output_is_left_as_text() {
+        // A custom command emits whatever it emits, and today that is prose with
+        // a JSON object in it. Treating that as an event stream would break every
+        // setup that works now.
+        use crate::ai::parse_agent_events;
+        assert!(parse_agent_events("Looking at the fields...\n{\"queryType\":\"find\"}").is_none());
+        assert!(parse_agent_events("").is_none());
+        // A single JSON line is an answer, not a stream.
+        assert!(parse_agent_events("{\"type\":\"find\",\"filter\":{}}").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_agent_reporting_events_has_its_tool_calls_carried_through() {
+        // End to end through the subprocess path: the fixture test above pins the
+        // *format*, this pins that `generate_local` actually routes through it.
+        // The captured run answered "6", which is not a query object, so the stub
+        // emits the same verified shapes with a JSON answer instead.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("agent");
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"schema_analysis","input":{"collection":"orders"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"state: DONE | PENDING"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"{\"queryType\":\"find\",\"filter\":{\"state\":\"DONE\"}}"}"#,
+            "\n",
+        );
+        std::fs::write(&stub, format!("#!/bin/sh\ncat <<'EOF'\n{stream}EOF\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let reply = crate::ai::generate_local(
+            &format!("{} {{prompt}}", stub.to_string_lossy()),
+            "which orders are done",
+            "",
+            None,
+        )
+        .await
+        .expect("the stub answers");
+
+        assert!(
+            reply.query.contains("\"state\":\"DONE\""),
+            "{}",
+            reply.query
+        );
+        assert_eq!(reply.tool_calls.len(), 1, "{:?}", reply.tool_calls);
+        assert_eq!(reply.tool_calls[0].name, "schema_analysis");
+        assert!(reply.tool_calls[0]
+            .output
+            .as_deref()
+            .unwrap_or("")
+            .contains("DONE"));
+        // The events are not left in `notes` as prose once they are understood.
+        assert!(
+            reply.notes.as_deref().unwrap_or("").is_empty(),
+            "events should not also arrive as prose: {:?}",
+            reply.notes
+        );
+    }
+
+    #[test]
     fn images_are_validated_before_any_request() {
         use crate::ai::{validate_images, ImageAttachment, MAX_IMAGES};
         validate_images(&[]).unwrap();
@@ -832,9 +1162,9 @@ mod tests {
     fn a_reply_omits_what_it_does_not_have() {
         // The frontend treats a missing key and null the same, but the JSON the
         // panel stores should not carry `"thoughts": null` for every message.
-        let r = crate::ai::AiReply { query: "{}".into(), thoughts: None, notes: None };
+        let r = crate::ai::AiReply { query: "{}".into(), thoughts: None, notes: None, tool_calls: Vec::new() };
         assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"query":"{}"}"#);
-        let r = crate::ai::AiReply { query: "{}".into(), thoughts: Some("t".into()), notes: None };
+        let r = crate::ai::AiReply { query: "{}".into(), thoughts: Some("t".into()), notes: None, tool_calls: Vec::new() };
         assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"query":"{}","thoughts":"t"}"#);
     }
 
@@ -3845,7 +4175,7 @@ mod tests {
 
         // {prompt} becomes a single argv element, even with spaces/quotes/shell metachars.
         let (prog, args) =
-            parse_command_template("claude -p {prompt}", "find users; rm -rf / $(whoami)", "").unwrap();
+            parse_command_template("claude -p {prompt}", "find users; rm -rf / $(whoami)", "", None).unwrap();
         assert_eq!(prog, "claude");
         assert_eq!(
             args,
@@ -3856,12 +4186,12 @@ mod tests {
         );
 
         // No {prompt} placeholder -> append prompt as final arg.
-        let (prog, args) = parse_command_template("codex exec", "hi there", "").unwrap();
+        let (prog, args) = parse_command_template("codex exec", "hi there", "", None).unwrap();
         assert_eq!(prog, "codex");
         assert_eq!(args, vec!["exec".to_string(), "hi there".to_string()]);
 
         // Empty template is an error.
-        assert!(parse_command_template("   ", "x", "").is_err());
+        assert!(parse_command_template("   ", "x", "", None).is_err());
     }
 
     #[tokio::test]
@@ -3872,6 +4202,7 @@ mod tests {
             "definitely-not-a-real-binary-xyz -p {prompt}",
             "find active users",
             "", // no {model} in this template
+            None,
         )
         .await;
         assert!(res.is_err());
@@ -5149,6 +5480,7 @@ mod shell_tab_state_tests {
         AppState::new()
     }
 
+
     #[test]
     fn a_closed_window_is_remembered_so_a_pending_start_can_abandon_itself() {
         // Closing a window destroys the renderer that would have cancelled a
@@ -5551,6 +5883,68 @@ mod shell_tab_state_tests {
 }
 
 
+/// Which conversation a live local-agent run belongs to, so a write the agent
+/// asks for can be put to whichever window is showing that chat.
+mod requester_tests {
+    use crate::state::AppState;
+
+    #[test]
+    fn a_live_run_is_recorded_under_the_conversation_that_asked() {
+        // The conversation is the address a write is put to. A run id is only
+        // meaningful to the webview that minted it, and a tab can be moved or
+        // detached to another window mid-run — so the destination panel could not
+        // recognise it, the source no longer mounted the tab, and the write timed
+        // out with nobody able to approve it.
+        let st = AppState::new();
+        {
+            let _run =
+                crate::RequesterGuard::set(&st, Some("run-1".into()), Some("chat-42".into()));
+            let live = st.mcp_helper_requesters.lock().unwrap();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].run, "run-1");
+            assert_eq!(live[0].conversation, "chat-42");
+        }
+        assert!(
+            st.mcp_helper_requesters.lock().unwrap().is_empty(),
+            "the guard retires its own entry however the run ends"
+        );
+    }
+
+    #[test]
+    fn two_runs_in_one_conversation_retire_independently() {
+        // Tracking by conversation instead of by run would strand a live run:
+        // whichever guard dropped would retire the *first* entry for that chat,
+        // not its own. The second guard is the one dropped here for exactly that
+        // reason — dropping the first cannot tell the two apart, since removing
+        // either the first-matching or its own entry leaves the same list.
+        let st = AppState::new();
+        let _first = crate::RequesterGuard::set(&st, Some("run-a".into()), Some("chat-42".into()));
+        let second = crate::RequesterGuard::set(&st, Some("run-b".into()), Some("chat-42".into()));
+        assert_eq!(st.mcp_helper_requesters.lock().unwrap().len(), 2);
+        drop(second);
+        let live = st.mcp_helper_requesters.lock().unwrap();
+        assert_eq!(live.len(), 1, "only its own entry");
+        assert_eq!(
+            live[0].run, "run-a",
+            "the run still going must keep its entry"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_conversation_is_left_unaddressed() {
+        // Recording the run alone would make it the single live requester while
+        // giving `confirm_write` no address to emit. Leaving the list empty falls
+        // through to the unaddressed case, where any window may answer — the same
+        // place two concurrent runs land.
+        let st = AppState::new();
+        let _run = crate::RequesterGuard::set(&st, Some("run-1".into()), None);
+        assert!(
+            st.mcp_helper_requesters.lock().unwrap().is_empty(),
+            "a run that cannot be addressed must not claim to be the requester"
+        );
+    }
+}
+
 mod chat_claim_tests {
     use crate::chats::{claim_chat, release_chat, release_window_chats};
 
@@ -5699,6 +6093,7 @@ mod chat_store_tests {
                 query: None,
                 error: None,
                 thoughts: None,
+                tool_calls: Vec::new(),
                 attachments: None,
             })
             .collect();
@@ -5723,6 +6118,7 @@ mod chat_store_tests {
             query: None,
             error: None,
             thoughts: None,
+            tool_calls: Vec::new(),
             attachments: None,
         };
 
@@ -5747,6 +6143,7 @@ mod chat_store_tests {
             query: None,
             error: None,
             thoughts: None,
+            tool_calls: Vec::new(),
             attachments: None,
         };
         let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
@@ -5772,6 +6169,7 @@ mod chat_store_tests {
             query: None,
             error: None,
             thoughts: None,
+            tool_calls: Vec::new(),
             attachments: None,
         };
         let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
@@ -5859,6 +6257,7 @@ mod chat_store_tests {
             query: None,
             error: None,
             thoughts: None,
+            tool_calls: Vec::new(),
             attachments: None,
         }];
 

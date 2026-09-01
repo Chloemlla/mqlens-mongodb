@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
-import { History, Paperclip, Plus, RefreshCw, Sparkles, Trash2, User, X } from 'lucide-react';
+import { AlertCircle, History, Paperclip, Plus, RefreshCw, Sparkles, Trash2, User, Wrench, X } from 'lucide-react';
 import {
   Select,
   SelectContent,
@@ -19,7 +19,15 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
-import { subscribeAiProvidersChanged } from '../workspace/workspaceStore';
+import {
+  answerWriteRequest,
+  subscribeWriteRequests,
+  writeRequestsWhere,
+} from '../lib/mcpWriteRequests';
+import {
+  subscribeAiProvidersChanged,
+  type McpWriteRequest,
+} from '../workspace/workspaceStore';
 import { buildRunnableCommand, type GeneratedQuery } from '../lib/mongoCommand';
 import {
   getPendingChatRequest,
@@ -55,6 +63,16 @@ export interface ChatMessage {
   thoughts?: string;
   /** Images that went with a user turn — shape only, never the bytes. */
   attachments?: { mediaType: string; bytes: number }[];
+  /** What a local agent ran to produce this answer. */
+  toolCalls?: AgentToolCall[];
+}
+
+/** One tool a local agent ran, as reported by its own event stream. */
+export interface AgentToolCall {
+  name: string;
+  input?: string;
+  output?: string;
+  failed?: boolean;
 }
 
 /** What `generate_mql_query` returns: the query JSON plus optional reasoning. */
@@ -62,6 +80,7 @@ interface AiReply {
   query: string;
   thoughts?: string;
   notes?: string;
+  toolCalls?: AgentToolCall[];
 }
 
 /** One pickable provider from settings, keys withheld. */
@@ -257,6 +276,7 @@ const composerClassName = cn(
 );
 
 export const AIChatPanel: React.FC<AIChatPanelProps> = ({
+  connectionId,
   connectionName,
   databaseName,
   collectionName,
@@ -474,6 +494,24 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   const [loadingCliModels, setLoadingCliModels] = useState(false);
   /** Run a CLI provider's models command, because the user asked for it. */
   const [modelsFailed, setModelsFailed] = useState(false);
+  /**
+   * Writes the agent has asked for and the user has not answered.
+   *
+   * A queue rather than one slot: two requests can arrive close together, and
+   * replacing the first would leave its tool call parked until it times out with
+   * nobody having seen what it wanted to do.
+   */
+  /**
+   * Writes the agent has asked for, read from the store rather than held here.
+   *
+   * The panel is unmounted when the user switches tabs while its request keeps
+   * running, and the backend gives up after two minutes — neither of which a
+   * queue inside the component can survive or notice. See `mcpWriteRequests`.
+   */
+
+  const [writeRequests, setWriteRequests] = useState<McpWriteRequest[]>([]);
+
+
   const loadCliModels = async () => {
     if (!chatProviderId) return;
     setModelsFailed(false);
@@ -779,6 +817,27 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     onChatIdChange?.(id);
   };
 
+  useEffect(() => {
+    const refresh = () =>
+      setWriteRequests(
+        writeRequestsWhere((requester: string | null) => {
+          // Nobody in particular: an external client, or two runs at once. Any
+          // window may answer — it is the app asking, not a conversation.
+          if (requester === null) return true;
+          // Addressed by conversation, so this holds in whichever window is
+          // showing that chat — including one the tab was moved to mid-run.
+          return requester === activeChatIdRef.current;
+        })
+      );
+    refresh();
+    return subscribeWriteRequests(refresh);
+    // Re-runs when the conversation changes, not only when the store notifies:
+    // opening a History item does not touch the store, so without this the list
+    // kept whatever it held and a prompt stayed answerable from a conversation it
+    // did not belong to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChatId]);
+
   // Claimed on mount and NOT released on unmount. An inactive tab is unmounted
   // but still points at its conversation, so releasing here would let another
   // tab take one that is still spoken for. The claim ends when the tab stops
@@ -959,6 +1018,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       text: reply.text,
       ...(reply.error ? { error: true } : { query: reply.query as GeneratedQuery | undefined }),
       ...(reply.thoughts ? { thoughts: reply.thoughts } : {}),
+      ...(reply.toolCalls?.length ? { toolCalls: reply.toolCalls } : {}),
     };
     await saveChat({
       ...stored,
@@ -978,6 +1038,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         text: reply.text,
         ...(reply.error ? { error: true } : { query: reply.query as GeneratedQuery | undefined }),
         ...(reply.thoughts ? { thoughts: reply.thoughts } : {}),
+        ...(reply.toolCalls?.length ? { toolCalls: reply.toolCalls } : {}),
       },
     ]);
   };
@@ -1051,12 +1112,26 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     // must not land in whichever conversation happens to be open when it
     // arrives — it would be shown there AND persisted under that chat's id.
     const askedIn = activeChatIdRef.current;
+    // Identifies this run to the backend for the length of it, so its entry is
+    // retired when it ends and two runs in one conversation stay distinguishable.
+    // The conversation, sent alongside, is what a write is addressed to.
+    const runId = `run-${Math.random().toString(36).slice(2)}-${Date.now()}`;
 
     const run = async (): Promise<PendingChatReply> => {
       const reply = await invoke<AiReply>('generate_mql_query', {
         prompt: text,
         collection: collectionName,
         fields,
+        // The tab's namespace, so an agent with the tools inspects the collection
+        // the user is actually looking at rather than one of the same name elsewhere.
+        database: databaseName ?? undefined,
+        connectionName: connectionName ?? undefined,
+        connectionId: connectionId ?? undefined,
+        requesterId: runId,
+        // What a write is addressed to. The run id identifies this run to the
+        // backend; the conversation is what any window showing it can recognise,
+        // including one the tab is moved to while the agent is still going.
+        conversationId: askedIn,
         history,
         target: variant === 'shell' ? 'shell' : 'editor',
         images: images.map((i) => ({ media_type: i.mediaType, data: i.data })),
@@ -1104,6 +1179,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         text: parsed.explanation ?? t('aiChatPanel.fallbackExplanation'),
         query,
         ...(thoughts && { thoughts }),
+        ...(reply.toolCalls?.length && { toolCalls: reply.toolCalls }),
       };
     };
 
@@ -1139,6 +1215,9 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       }
       appendReply(reply);
     } finally {
+      // The backend retires the run's own entry when the command returns, so
+      // nothing more can be addressed to it. A write already waiting is refused
+      // by the backend on silence.
       setIsChatLoading(false);
     }
   };
@@ -1336,6 +1415,43 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                   </div>
                 )}
 
+                {m.toolCalls && m.toolCalls.length > 0 && (
+                  <details className="w-[92%] text-[10.5px]" data-testid="chat-tool-calls">
+                    <summary className="cursor-pointer select-none text-muted-foreground">
+                      {t('aiChatPanel.toolCalls', { count: m.toolCalls.length })}
+                    </summary>
+                    <div className="mt-1 flex flex-col gap-1">
+                      {m.toolCalls.map((call, i) => (
+                        <div
+                          key={i}
+                          className="rounded border border-border bg-muted/40 p-1.5"
+                          data-testid={`chat-tool-call-${i}`}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <Wrench size={10} className="shrink-0 text-muted-foreground" />
+                            <span className="font-mono text-[10.5px] text-foreground">{call.name}</span>
+                            {call.failed && (
+                              <span className="text-[9px] uppercase text-destructive">
+                                {t('aiChatPanel.toolFailed')}
+                              </span>
+                            )}
+                          </div>
+                          {call.input && (
+                            <pre className="mt-1 max-h-[120px] overflow-auto whitespace-pre-wrap font-mono text-[9.5px] leading-relaxed text-muted-foreground">
+                              {call.input}
+                            </pre>
+                          )}
+                          {call.output && (
+                            <pre className="mt-1 max-h-[120px] overflow-auto whitespace-pre-wrap border-t border-border pt-1 font-sans text-[9.5px] leading-relaxed text-muted-foreground">
+                              {call.output}
+                            </pre>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+
                 {m.thoughts && (
                   <details className="w-[92%] text-[10.5px]" data-testid="chat-thoughts">
                     <summary className="cursor-pointer select-none text-muted-foreground">
@@ -1450,6 +1566,51 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                   </button>
                 </div>
               ))}
+            </div>
+          )}
+          {/* What the agent wants to change, described by MQLens from the call
+              itself rather than by the agent — an agent that can be talked into
+              a delete can be talked into describing it as something else. */}
+          {writeRequests.length > 0 && (
+            <div
+              className="flex flex-col gap-1.5 rounded-lg border border-destructive/40 bg-destructive/5 p-2"
+              data-testid="chat-write-request"
+            >
+              <div className="flex items-center gap-1.5">
+                <AlertCircle size={12} className="shrink-0 text-destructive" />
+                <span className="text-[11px] font-medium text-foreground">
+                  {t('aiChatPanel.writeRequestTitle')}
+                </span>
+              </div>
+              {/* The operation itself, pretty-printed. Taller than a one-line
+                  summary on purpose: the filter is the thing that has to be read
+                  before answering, not scrolled past. */}
+              <div className="font-mono text-[10px] text-foreground">{writeRequests[0].tool}</div>
+              <pre className="max-h-[220px] overflow-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-muted-foreground">
+                {writeRequests[0].summary}
+              </pre>
+              <div className="flex gap-1.5">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  className="h-6 px-2 text-[10.5px]"
+                  onClick={() => answerWriteRequest(writeRequests[0].id, true)}
+                  data-testid="chat-write-allow"
+                >
+                  {t('aiChatPanel.writeRequestAllow')}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-[10.5px]"
+                  onClick={() => answerWriteRequest(writeRequests[0].id, false)}
+                  data-testid="chat-write-refuse"
+                >
+                  {t('aiChatPanel.writeRequestRefuse')}
+                </Button>
+              </div>
             </div>
           )}
           {imageNote && (

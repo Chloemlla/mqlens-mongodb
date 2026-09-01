@@ -104,8 +104,127 @@ function containsLong(v: any): boolean {
   if (Array.isArray(v)) return v.some(containsLong);
   return Object.values(v).some(containsLong);
 }
-function serializeQuery(v: any): any {
-  return EJSON.serialize(v, { relaxed: !containsLong(v) });
+
+// Regex options MongoDB understands, passed through untouched.
+const BSON_REGEX_FLAGS = 'imxlsu';
+
+// JS-only flags that cannot change which documents match, so dropping them is
+// safe. `g` ("keep scanning after the first hit") and `d` (capture-index
+// metadata) both describe how a JS engine walks a string, not what the pattern
+// accepts — the set of strings the regex matches is identical without them.
+//
+// Every other JS-only flag is NOT safe to drop, and is rejected below instead.
+// `y` (sticky) anchors the match at lastIndex, so a fresh `/foo/y` matches only
+// at position 0 while the reconstructed `/foo/` matches anywhere — silently
+// running a BROADER query than the user wrote. `v` (unicodeSets) changes how
+// character classes parse, so removing it can reinterpret the pattern outright.
+// Quietly widening a filter is the failure mode this whole path exists to
+// avoid, so where the semantics cannot be preserved we refuse rather than
+// guess. Rejecting is no worse than before: these already failed, just with a
+// BSON error nobody could act on.
+//
+// Of these only `y` is reachable today — the parser's own regex lexer rejects
+// `d` and `v` as invalid flags before we ever see them. They are listed anyway
+// so that a parser upgrade cannot silently turn `d` into a rejection or `v`
+// into a semantics change.
+const DROPPABLE_REGEX_FLAGS = 'gd';
+
+// Real BSON instances, by their `_bsontype` tag. Checked against this set
+// rather than for any truthy `_bsontype`, because a user's own document may
+// legitimately contain a field called `_bsontype` — `{meta: {_bsontype: "x",
+// name: /a/g}}` would otherwise be mistaken for a BSON scalar and skipped,
+// leaving the nested regex unnormalised for EJSON to reject. (UUID reports as
+// Binary, which it subclasses.)
+const BSON_TYPE_NAMES = new Set([
+  'Binary', 'BSONRegExp', 'BSONSymbol', 'Code', 'DBRef', 'Decimal128',
+  'Double', 'Int32', 'Long', 'MaxKey', 'MinKey', 'ObjectId', 'Timestamp',
+]);
+
+/**
+ * Drop regex flags BSON cannot carry, reporting which ones went.
+ *
+ * `{name: /test/g}` is the query a user brings over from mongosh or Compass,
+ * and it used to fail the whole find with "The regular expression option [g]
+ * is not supported" — thrown by EJSON, the only strict validator in the stack.
+ *
+ * Compass runs that query by handing the native RegExp straight to the driver,
+ * whose serializer rewrites `g` to `s` (dotAll). So it runs, but matches by
+ * different rules than it reads — `.` starts crossing newlines — and Compass
+ * then fails to save it to history for exactly the reason we failed here,
+ * swallowing that error into a debug log.
+ *
+ * Neither behaviour is worth copying. `g` means "keep scanning after the first
+ * hit", which is meaningless when the server is selecting documents, so the
+ * flag is dropped rather than translated: the pattern keeps the semantics the
+ * user wrote. The caller gets the dropped flags so the query bar can say so,
+ * instead of the query quietly meaning something else.
+ *
+ * Only plain containers are rebuilt. BSON instances (ObjectId, Long, Binary,
+ * …) and Dates pass through by reference, and an untouched subtree keeps its
+ * original identity, so `containsLong` still walks the same graph.
+ */
+function normalizeRegexFlags(v: any, dropped: Set<string>): any {
+  if (v === null || typeof v !== 'object') return v;
+  // Tag-based, not `instanceof`: the query parser evaluates in a sandbox, so a
+  // value coming back out of it need not share this realm's prototypes.
+  const tag = Object.prototype.toString.call(v);
+  if (tag === '[object RegExp]') {
+    const flags: unknown = (v as RegExp).flags;
+    // No flag string to reason about — leave it exactly as it is.
+    if (typeof flags !== 'string') return v;
+    const unsafe = [...flags].find(
+      (f) => !BSON_REGEX_FLAGS.includes(f) && !DROPPABLE_REGEX_FLAGS.includes(f)
+    );
+    if (unsafe) {
+      throw new ShellDocError(
+        'unsupportedRegexFlag',
+        `MongoDB does not support the regular expression flag [${unsafe}]`,
+        { flag: unsafe }
+      );
+    }
+    const kept = [...flags].filter((f) => BSON_REGEX_FLAGS.includes(f)).join('');
+    if (kept === flags) return v;
+    for (const f of flags) if (!kept.includes(f)) dropped.add(f);
+    // `kept` is a subset of flags JS already accepted, so this cannot throw.
+    return new RegExp((v as RegExp).source, kept);
+  }
+  const bsontype: unknown = (v as { _bsontype?: unknown })._bsontype;
+  if (tag === '[object Date]' || (typeof bsontype === 'string' && BSON_TYPE_NAMES.has(bsontype))) {
+    return v;
+  }
+  if (Array.isArray(v)) {
+    let changed = false;
+    const out = v.map((item) => {
+      const next = normalizeRegexFlags(item, dropped);
+      if (next !== item) changed = true;
+      return next;
+    });
+    return changed ? out : v;
+  }
+  let changed = false;
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v)) {
+    const next = normalizeRegexFlags(val, dropped);
+    if (next !== val) changed = true;
+    out[k] = next;
+  }
+  return changed ? out : v;
+}
+
+/**
+ * What the parser had to change to make a query expressible as BSON.
+ *
+ * Not errors — the query still runs — but the user is told rather than left
+ * with a filter that means something slightly different from what they typed.
+ */
+export interface ShellDocNotices {
+  /** Regex flags dropped because BSON has no equivalent, e.g. `['g']`. */
+  droppedRegexFlags: string[];
+}
+
+function serializeQuery(v: any, dropped: Set<string>): any {
+  const normalized = normalizeRegexFlags(v, dropped);
+  return EJSON.serialize(normalized, { relaxed: !containsLong(normalized) });
 }
 /**
  * The two parse failures this module raises ITSELF, as stable codes.
@@ -118,14 +237,20 @@ function serializeQuery(v: any): any {
  * come from the underlying parser carry no code and still fall back to their
  * own message, which no amount of work here can localise.
  */
-export type ShellDocErrorCode = 'invalidQuery' | 'queryMustBeObject';
+export type ShellDocErrorCode =
+  | 'invalidQuery'
+  | 'queryMustBeObject'
+  | 'unsupportedRegexFlag';
 
 export class ShellDocError extends SyntaxError {
   readonly code: ShellDocErrorCode;
-  constructor(code: ShellDocErrorCode, message: string) {
+  /** Interpolation values for the translated message, e.g. `{ flag: 'y' }`. */
+  readonly params?: Record<string, string>;
+  constructor(code: ShellDocErrorCode, message: string, params?: Record<string, string>) {
     super(message);
     this.name = 'ShellDocError';
     this.code = code;
+    this.params = params;
   }
 }
 
@@ -134,7 +259,13 @@ export function shellDocErrorKey(err: unknown): string | null {
   const code = (err as ShellDocError | undefined)?.code;
   if (code === 'invalidQuery') return 'documentViewer.errors.invalidQuery';
   if (code === 'queryMustBeObject') return 'documentViewer.errors.queryMustBeObject';
+  if (code === 'unsupportedRegexFlag') return 'documentViewer.errors.unsupportedRegexFlag';
   return null;
+}
+
+/** Interpolation values to pass alongside `shellDocErrorKey`, if any. */
+export function shellDocErrorParams(err: unknown): Record<string, string> | undefined {
+  return (err as ShellDocError | undefined)?.params;
 }
 
 /**
@@ -322,6 +453,231 @@ function endOfRegex(text: string, start: number): number {
   return -1;
 }
 
+/** The range a BSON 64-bit long can hold. Outside it, there is nothing to preserve into. */
+const I64_MAX = 9223372036854775807n;
+const I64_MIN = -9223372036854775808n;
+
+/**
+ * Rewrite integer literals a JS number cannot hold into `NumberLong("…")`.
+ *
+ * The query parser evaluates a bare literal as a JS `number`, so anything past
+ * 2^53 is rounded before we ever see it: `{counter: 9007199254740993}` reached
+ * the server as `…992` and matched a different document, with no error and
+ * nothing on screen to say so (#317). The loss happens during parsing, so the
+ * only place to fix it is before parsing — hence a text pass.
+ *
+ * `NumberLong` is the right target rather than a workaround: the backend
+ * already produces a BSON Int64 for such a literal (serde_json reads it
+ * exactly, then bson maps it to Int64), so this restores the type the query
+ * always should have had. shellDoc then serializes canonically, because
+ * `containsLong` sees a Long, and the value survives to the server intact.
+ *
+ * Deliberately narrow — it only touches literals that are BOTH unrepresentable
+ * as a double AND expressible as a long:
+ *
+ * - Values inside strings and regex literals are the user's data, so those are
+ *   copied verbatim, exactly as `normalizePastedQuery` treats them.
+ * - Anything with a `.`, an exponent, or a `0x`/`0b`/`0o`/`n` suffix is left
+ *   alone. Those spell a double (or a form the parser handles itself) on
+ *   purpose, and rewriting them would change the user's chosen type.
+ * - Safe integers are left alone, so ordinary numbers keep serializing as they
+ *   always have — no `{a: 42}` suddenly becoming a long.
+ * - Object keys (`{123: 1}`) are skipped: a key is not a value, and
+ *   `NumberLong("…")` is not valid there.
+ * - Values beyond the i64 range are left alone. They cannot be a BSON long, so
+ *   there is no lossless form to rewrite them into; they stay as they are
+ *   rather than being silently truncated into a different wrong number.
+ */
+/**
+ * Characters after which a fresh value may begin: `{a: N}`, `[N]`, `[1, N]`.
+ *
+ * Note what is NOT here. `(` is excluded so `NumberLong(9007199254740993)`
+ * keeps its own argument instead of becoming `NumberLong(NumberLong("…"))`,
+ * and arithmetic operators are excluded so an operand is left alone.
+ */
+const VALUE_STARTS_AFTER = ':,[';
+
+/**
+ * Characters that can follow a complete value: `{a: N}`, `[N]`, `[N, 1]`.
+ *
+ * The mirror of VALUE_STARTS_AFTER, and needed for the same reason from the
+ * other side. Checking only what precedes a literal caught `{a: 1 + N}` but
+ * not `{a: N + 1}`, where the literal is the LEFT operand — that became
+ * `NumberLong("…") + 1`, and JS concatenated the long's toString into the
+ * string "90071992547409931", turning a numeric query into a string one
+ * without a word (#318 review).
+ *
+ * It also subsumes the property-key case: `:` is not here, so `{123: 1}` is
+ * left alone by the same rule rather than a second special case.
+ */
+const VALUE_ENDS_BEFORE = ',}])';
+
+/**
+ * Where does the literal we are about to read sit, and may we rewrite it?
+ *
+ * Rewriting anywhere a big integer appears is wrong, because the text around
+ * it decides what it means. Three ways that bit (#318 review):
+ *
+ * - `{a: 1 - 9007199254740992}` — a spaced binary minus read as a sign, which
+ *   ate the operator and left `{a: 1 NumberLong("-…")}`, so a valid query
+ *   stopped parsing entirely.
+ * - `{a: 1 + 9007199254740992}` — an operand rewritten into a Long, leaving
+ *   the parser to do arithmetic on an object.
+ * - `{a: NumberLong(9007199254740993)}` — an argument rewritten inside the
+ *   very constructor that was already asking for a long.
+ *
+ * So this only says yes in value position, where a literal can stand alone.
+ * Anywhere else the pre-existing behaviour is kept: an arithmetic operand
+ * still rounds, which is worse than exact but far better than not parsing.
+ */
+function classifyNumberPlacement(
+  last: string,
+  prev: string,
+  out: string
+): 'plain' | 'signed' | 'skip' {
+  const startsValue = (ch: string) => ch === '' || VALUE_STARTS_AFTER.includes(ch);
+  if (last === '-') {
+    // A minus is a sign only when nothing that could end an operand precedes
+    // it; otherwise this is subtraction and the minus is not ours to take.
+    //
+    // It also has to still be at the end of the emitted text, since folding it
+    // into the literal means deleting it from there. A comment sitting between
+    // the two (`-/* note */5`) would make that deletion miss, so those are left
+    // alone rather than mangled — an exotic spelling of a rare case.
+    return startsValue(prev) && /-\s*$/.test(out) ? 'signed' : 'skip';
+  }
+  return startsValue(last) ? 'plain' : 'skip';
+}
+
+/** End of the comment starting at `i`, or -1 when none starts there. */
+function endOfComment(text: string, i: number): number {
+  if (text[i] !== '/') return -1;
+  if (text[i + 1] === '/') {
+    const nl = text.indexOf('\n', i);
+    return nl === -1 ? text.length : nl;
+  }
+  if (text[i + 1] === '*') {
+    const end = text.indexOf('*/', i + 2);
+    return end === -1 ? text.length : end + 2;
+  }
+  return -1;
+}
+
+/**
+ * First index at or after `from` holding something syntactically meaningful —
+ * whitespace and comments are both skipped.
+ *
+ * Looking only past whitespace is what let `{a: 1, 9007199254740992 /* n *\/: 1}`
+ * be mistaken for a value and rewritten into `NumberLong("…"): 1`, which is not
+ * a property key and stopped the query parsing (#318 review).
+ */
+function skipTrivia(text: string, from: number): number {
+  let k = from;
+  for (;;) {
+    while (k < text.length && /\s/.test(text[k])) k++;
+    const end = endOfComment(text, k);
+    if (end === -1) return k;
+    k = end;
+  }
+}
+
+export function preserveBigIntegers(text: string): string {
+  let out = '';
+  let i = 0;
+  // The last two *syntactically meaningful* characters emitted — whitespace and
+  // comments do not count. Placement has to be judged on these rather than on
+  // the tail of `out`, because scanning `out` back would trip over the very
+  // things this pass copies verbatim (a `//` inside a URL string, a comment
+  // between the delimiter and the value).
+  let lastMeaningful = '';
+  let prevMeaningful = '';
+  const remember = (ch: string) => {
+    prevMeaningful = lastMeaningful;
+    lastMeaningful = ch;
+  };
+  while (i < text.length) {
+    const c = text[i];
+    // Verbatim: a string's contents are data, not syntax.
+    if (c === '"' || c === "'") {
+      out += c;
+      i++;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          out += text[i] + (text[i + 1] ?? '');
+          i += 2;
+          continue;
+        }
+        out += text[i];
+        if (text[i] === c) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      remember('"');
+      continue;
+    }
+    // Comments are copied through but leave no syntactic trace, so they must
+    // be recognised BEFORE the regex branch — `/*` otherwise reads as a regex
+    // opener, and the closing `/` then looks like the token before the value,
+    // which left `{counter: /* note */ 9007199254740993}` unrewritten and
+    // still rounding (#318 review).
+    const commentEnd = endOfComment(text, i);
+    if (commentEnd !== -1) {
+      out += text.slice(i, commentEnd);
+      i = commentEnd;
+      continue;
+    }
+    // Verbatim: digits inside a pattern are part of the pattern.
+    if (c === '/' && startsRegex(lastMeaningful)) {
+      const end = endOfRegex(text, i);
+      if (end !== -1) {
+        out += text.slice(i, end);
+        i = end;
+        remember('/');
+        continue;
+      }
+    }
+    if (c >= '0' && c <= '9') {
+      const prev = out[out.length - 1] ?? '';
+      // A digit run only starts a literal at a token boundary — `a1` and
+      // `1.5`'s tail are continuations, not new numbers.
+      if (!/[A-Za-z0-9_$.]/.test(prev)) {
+        let j = i;
+        while (j < text.length && text[j] >= '0' && text[j] <= '9') j++;
+        const digits = text.slice(i, j);
+        const after = text[j] ?? '';
+        const isPlainInteger = !/[.eExXbBoOn_]/.test(after);
+        // Whatever follows must be able to end a value. One rule covers both a
+        // property key (`{123: 1}` — `:` cannot end a value) and a literal used
+        // as the left operand of an expression (`{a: N + 1}` — nor can `+`).
+        const next = text[skipTrivia(text, j)] ?? '';
+        const endsValue = next === '' || VALUE_ENDS_BEFORE.includes(next);
+        if (isPlainInteger && endsValue && !Number.isSafeInteger(Number(digits))) {
+          const placement = classifyNumberPlacement(lastMeaningful, prevMeaningful, out);
+          if (placement !== 'skip') {
+            // A unary minus comes along inside the long, so the parser is
+            // never asked to negate a Long object.
+            const literal = (placement === 'signed' ? '-' : '') + digits;
+            const value = BigInt(literal);
+            if (value >= I64_MIN && value <= I64_MAX) {
+              if (placement === 'signed') out = out.replace(/-\s*$/, '');
+              out += `NumberLong("${literal}")`;
+              i = j;
+              remember('0');
+              continue;
+            }
+          }
+        }
+      }
+    }
+    out += c;
+    if (!/\s/.test(c)) remember(c);
+    i++;
+  }
+  return out;
+}
+
 /** Drop `;` off the end, but only when it is not inside a string. */
 function stripTrailingSemicolons(text: string): string {
   let cut = text.length;
@@ -354,8 +710,8 @@ function stripTrailingSemicolons(text: string): string {
   return cut === text.length ? text : text.slice(0, cut);
 }
 
-export function parseShellJson(text: string): any {
-  const trimmed = normalizePastedQuery(text).trim();
+export function parseShellJson(text: string, notices?: ShellDocNotices): any {
+  const trimmed = preserveBigIntegers(normalizePastedQuery(text)).trim();
   if (!trimmed) return {};
   // parseFilter signals "unparseable / not a valid query" by returning an empty
   // string rather than throwing (e.g. `{ _id }`, a half-typed field). Surface
@@ -369,18 +725,39 @@ export function parseShellJson(text: string): any {
     }
     return result;
   };
+  // Collected per attempt: the braceless retry below re-parses from scratch, so
+  // notices from an attempt that then failed must not leak into the result.
+  const dropped = new Set<string>();
+  const commit = () => {
+    if (notices) notices.droppedRegexFlags = [...dropped];
+  };
   try {
-    return serializeQuery(attempt(trimmed));
+    const out = serializeQuery(attempt(trimmed), dropped);
+    commit();
+    return out;
   } catch (err) {
     // A braceless field list like `foo: 1` isn't a valid standalone expression;
     // wrap it into an object and retry. Bare values (a `$count` stage body of
     // `"n"`, a number, an array) parse on the first try, so they never reach
     // here. Anything still unparseable re-throws the original error.
     if (!/^[{[]/.test(trimmed)) {
+      dropped.clear();
       try {
-        return serializeQuery(attempt(`{${trimmed}}`));
-      } catch {
-        /* fall through to re-throw the original error */
+        const out = serializeQuery(attempt(`{${trimmed}}`), dropped);
+        commit();
+        return out;
+      } catch (retryErr) {
+        // The wrapped retry got further than the original attempt: it parsed,
+        // and failed only because the value cannot be represented in BSON.
+        // That is the diagnosis worth showing — re-throwing the original
+        // "not a valid expression" error would hide the real reason.
+        if (
+          retryErr instanceof ShellDocError &&
+          retryErr.code === 'unsupportedRegexFlag'
+        ) {
+          throw retryErr;
+        }
+        /* otherwise fall through to re-throw the original error */
       }
     }
     throw err;
@@ -394,9 +771,12 @@ export function parseShellJson(text: string): any {
 // here lets the live validation flag the field and Run stay disabled. Empty
 // input is a valid empty query ({}). Not for aggregation stage bodies, which
 // can legitimately be non-objects (e.g. a `$count` body of "n").
-export function parseQueryObject(text: string): any {
-  const parsed = parseShellJson(text);
+export function parseQueryObject(text: string, notices?: ShellDocNotices): any {
+  const parsed = parseShellJson(text, notices);
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    // The query is rejected, so anything we noticed about it is moot — leaving
+    // it set would caption a filter that never ran.
+    if (notices) notices.droppedRegexFlags = [];
     throw new ShellDocError('queryMustBeObject', 'Query must be an object');
   }
   return parsed;

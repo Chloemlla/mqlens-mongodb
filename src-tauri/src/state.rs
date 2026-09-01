@@ -76,12 +76,46 @@ impl<T> LockExt<T> for std::sync::Mutex<T> {
     }
 }
 
+/// One in-flight local-agent run, and the conversation that started it.
+///
+/// The write is addressed to the *conversation*, not to the run. A run id is only
+/// meaningful inside the webview that minted it, and a tab can be moved or
+/// detached to another window while its agent is still going: the destination
+/// panel could not recognise the run and filtered the prompt out, while the source
+/// no longer mounted that tab, so no window could approve the write and it timed
+/// out. A conversation id travels with the tab, so whichever window is showing it
+/// is the one that gets asked.
+pub struct HelperRun {
+    /// Identifies this run for its own lifetime, so a guard removes only its own
+    /// entry and two runs in one conversation stay distinguishable.
+    pub run: String,
+    /// The chat the question was asked in — the address a write is put to.
+    pub conversation: String,
+}
+
 pub struct AppState {
     /// Held across every load → merge → save of the settings file. Several
     /// components write settings independently (the form, theme, locale, shell
     /// path, providers); without one lock the last writer wins with the stale
     /// copy it loaded.
     pub settings_write: Mutex<()>,
+    /// Writes MQLens's own agent has asked for and the user has not answered yet,
+    /// keyed by request id. The MCP tool call is parked on the receiving half
+    /// until the panel sends a decision or the wait times out.
+    pub mcp_write_confirms: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// The panels whose agents are running right now, one entry per run.
+    ///
+    /// `rmcp` gives a tool handler no view of the request, so a write cannot be
+    /// traced back to a run on its own — the set of live runs is all there is. One
+    /// run means the write belongs to it. None means no agent is running and the
+    /// write is refused. More than one cannot be attributed, and is refused too:
+    /// picking a panel would put someone else's delete in front of the wrong
+    /// person, which is worse than making the agent ask in its reply.
+    ///
+    /// A list rather than a single slot: two panels can run at once, and a slot
+    /// let the later run overwrite the earlier and then clear it on the way out,
+    /// leaving the survivor unable to confirm anything.
+    pub mcp_helper_requesters: Mutex<Vec<HelperRun>>,
     pub connections: Mutex<HashMap<String, Client>>,
     pub mocks: Mutex<HashMap<String, bool>>,
     pub mock_indexes: Mutex<HashMap<String, Vec<IndexInfo>>>,
@@ -201,6 +235,8 @@ impl AppState {
             audit: Arc::new(Mutex::new(None)),
             audit_degraded: Mutex::new(None),
             settings_write: Mutex::new(()),
+            mcp_write_confirms: Mutex::new(HashMap::new()),
+            mcp_helper_requesters: Mutex::new(Vec::new()),
             audit_pending: Arc::new(Mutex::new(Vec::new())),
             audit_generation: Arc::new(AtomicU64::new(0)),
         }

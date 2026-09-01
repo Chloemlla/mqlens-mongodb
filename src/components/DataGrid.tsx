@@ -369,6 +369,12 @@ const RenderTreeNode: React.FC<{ node: ExplainNode }> = ({ node }) => {
 
 // Lightweight, data-only descriptor for one rendered JSON line (no React nodes,
 // so building thousands of them stays cheap; content is rendered lazily per row).
+/** One end of a selection: the row it sits on and how far into that row. */
+interface JsonEndpoint {
+  row: number;
+  offset: number;
+}
+
 interface JsonLine {
   num: number;
   depth: number;
@@ -477,6 +483,9 @@ const JsonRow = ({
         line.isDocRoot && line.docIndex > 0 && 'border-t border-border',
         findHighlightClass(line.num)
       )}
+      // Lets a copy reconstruct the selected range from the line data even
+      // after virtualization has unmounted the rows it started on (#311).
+      data-json-line={index}
       data-doc-even={line.docIndex % 2 === 0}
       onContextMenu={(e) => openCtxMenu(e, documents[line.docIndex], line.kind === 'scalar' ? line.keyName ?? undefined : undefined, line.value)}
     >
@@ -1048,6 +1057,195 @@ export const DataGrid: React.FC<DataGridProps> = ({
     }
   };
 
+  // ── Copying a selection that scrolled (#311) ──────────────────────────────
+  //
+  // The JSON view is virtualized, so dragging a selection downwards unmounts
+  // the rows it started on. The browser's selection lives in the DOM, so those
+  // rows are simply gone by the time Cmd+C runs and only the last screenful is
+  // copied — silently, which is the worst part: the paste looks like a
+  // successful copy of the wrong thing.
+  //
+  // The extent is therefore recorded as the drag happens, while both ends are
+  // still mounted, and the copy is rebuilt from the line data rather than from
+  // the DOM.
+  const jsonViewRef = React.useRef<HTMLDivElement | null>(null);
+  // The two ends of the selection, each remembered independently at the last
+  // row it was seen on. Modelling the ends rather than a min/max span is what
+  // lets the range CONTRACT: during a drag the anchor is fixed and only the
+  // focus moves, so a span that could only grow kept lines the user had dragged
+  // back over and deselected, and then copied them (#319 review).
+  const jsonSelectionRef = React.useRef<{
+    anchor: JsonEndpoint | null;
+    focus: JsonEndpoint | null;
+  }>({ anchor: null, focus: null });
+
+  /**
+   * The row an endpoint sits on, plus how far into that row's text it falls.
+   *
+   * The offset is what lets a partial endpoint be trimmed later. Without it the
+   * rebuild had only row numbers, so a drag starting mid-value and ending
+   * mid-value put the leading key and trailing text of both endpoint lines on
+   * the clipboard as well (#319 review).
+   *
+   * Counting characters across the row's text nodes works because a row's
+   * rendered text is exactly `jsonLineText`: the gutter's line number is a
+   * ::before pseudo-element and the fold control and row actions are icons, so
+   * none of them contribute text.
+   */
+  const jsonEndpointOf = (node: Node | null, offset: number): JsonEndpoint | null => {
+    const el = node instanceof Element ? node : (node?.parentElement ?? null);
+    const row = el?.closest('[data-json-line]') ?? null;
+    const index = Number(row?.getAttribute('data-json-line'));
+    if (!row || !Number.isInteger(index)) return null;
+    // Measure with a Range rather than counting text nodes by hand, because
+    // `offset` means different things depending on what `node` is: characters
+    // when it is a text node, but a CHILD INDEX when the boundary lands on an
+    // element — which happens readily, e.g. clicking in the padding to the
+    // right of a row's text. Range.setEnd applies each rule correctly, and the
+    // text before that point is then just the range's length.
+    //
+    // Hand-counting had to guess at the element case and chose either the start
+    // or the end of the line, so an endpoint there could drop the final line or
+    // pull in a whole one nobody selected (#322 review).
+    const range = document.createRange();
+    range.selectNodeContents(row);
+    try {
+      range.setEnd(node!, offset);
+    } catch {
+      // Boundary outside this row, so nothing meaningful to measure.
+      return { row: index, offset: 0 };
+    }
+    return { row: index, offset: range.toString().length };
+  };
+
+  /**
+   * Both ends of the live selection, each resolved on its own.
+   *
+   * Resolving them independently is the crux of this mechanism rather than
+   * defensive coding. Once the drag passes the first window, the row holding
+   * the anchor is exactly what react-window unmounts — so requiring both to
+   * resolve threw away every update from the moment tracking started to
+   * matter, freezing the range at the first screenful (#319 review).
+   */
+  const selectedJsonEnds = (): {
+    anchor: JsonEndpoint | null;
+    focus: JsonEndpoint | null;
+  } | null => {
+    const selection = document.getSelection();
+    const container = jsonViewRef.current;
+    if (!selection || selection.isCollapsed || !container) return null;
+    const endpoint = (node: Node | null, offset: number) =>
+      node && container.contains(node) ? jsonEndpointOf(node, offset) : null;
+    const ends = {
+      anchor: endpoint(selection.anchorNode, selection.anchorOffset),
+      focus: endpoint(selection.focusNode, selection.focusOffset),
+    };
+    if (ends.anchor || ends.focus) return ends;
+    // Neither end sits on a row, which is what a select-all looks like: its
+    // endpoints land on <body>, outside the view entirely. Only treat that as
+    // "everything" once the selection is confirmed to ENCLOSE the view —
+    // clamping any unresolvable endpoint to the view's bounds would claim rows
+    // for selections that merely pass nearby, or that live somewhere else in
+    // the UI altogether (#320).
+    if (!enclosesJsonView(selection, container)) return ends;
+    return {
+      anchor: { row: 0, offset: 0 },
+      // Past the end of any line; the copy clamps it to the real length.
+      focus: { row: Math.max(visibleJsonLines.length - 1, 0), offset: Number.MAX_SAFE_INTEGER },
+    };
+  };
+
+  /** Does the selection start at or before the view and end at or after it? */
+  const enclosesJsonView = (selection: Selection, container: HTMLElement): boolean => {
+    if (selection.rangeCount === 0) return false;
+    const contents = document.createRange();
+    contents.selectNodeContents(container);
+    try {
+      const range = selection.getRangeAt(0);
+      return (
+        range.compareBoundaryPoints(Range.START_TO_START, contents) <= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_END, contents) >= 0
+      );
+    } catch {
+      // Ranges in different documents cannot be compared; treat as no match
+      // rather than assuming the view is covered.
+      return false;
+    }
+  };
+
+  /** The two endpoints in document order, or null if neither resolved. */
+  const jsonRangeOf = (ends: { anchor: JsonEndpoint | null; focus: JsonEndpoint | null }) => {
+    const ordered = [ends.anchor, ends.focus]
+      .filter((end): end is JsonEndpoint => end !== null)
+      .sort((a, b) => a.row - b.row || a.offset - b.offset);
+    return ordered.length ? { start: ordered[0], end: ordered[ordered.length - 1] } : null;
+  };
+
+  useEffect(() => {
+    if (viewMode !== 'json') return;
+    // Each end keeps the last place it was seen, so an end that scrolls out of
+    // the DOM is remembered while the other stays free to move in either
+    // direction — extending the selection or pulling it back.
+    const onSelectionChange = () => {
+      const ends = selectedJsonEnds();
+      if (!ends) return;
+      const seen = jsonSelectionRef.current;
+      jsonSelectionRef.current = {
+        anchor: ends.anchor ?? seen.anchor,
+        focus: ends.focus ?? seen.focus,
+      };
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+  }, [viewMode]);
+
+  const handleJsonCopy = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    const tracked = jsonRangeOf(jsonSelectionRef.current);
+    if (!tracked) return;
+    // Stand aside only when the browser can be trusted to copy this exactly,
+    // which takes both signals agreeing.
+    //
+    // The live selection still spanning everything tracked says nothing was
+    // dragged out of range. That alone was the old test, and a select-all slips
+    // straight through it: its span covers the tracked rows on paper while the
+    // DOM holds only a screenful (#320).
+    //
+    // So the rows must also actually be there. react-window renders a
+    // contiguous window, so finding both ends means everything between them is
+    // present too.
+    const ends = selectedJsonEnds();
+    const live = ends && jsonRangeOf(ends);
+    const spansAll = !!live && live.start.row <= tracked.start.row && live.end.row >= tracked.end.row;
+    const container = jsonViewRef.current;
+    const wanted = tracked.end.row - tracked.start.row + 1;
+    const allMounted =
+      !!container &&
+      container.querySelectorAll('[data-json-line]').length >= wanted &&
+      !!container.querySelector(`[data-json-line="${tracked.start.row}"]`) &&
+      !!container.querySelector(`[data-json-line="${tracked.end.row}"]`);
+    if (spansAll && allMounted) return;
+    const text = visibleJsonLines
+      .slice(tracked.start.row, tracked.end.row + 1)
+      .map((line, i) => {
+        const folded = line.foldId !== undefined && collapsedFolds.has(line.foldId);
+        const suffix = folded ? ` … ${line.closeChar ?? ''}${line.hasComma ? ',' : ''}` : '';
+        const body = jsonLineText(line) + suffix;
+        const first = i === 0;
+        const last = tracked.start.row + i === tracked.end.row;
+        const from = first ? Math.min(tracked.start.offset, body.length) : 0;
+        const to = last ? Math.min(tracked.end.offset, body.length) : body.length;
+        // Indentation is added for readability, not copied — on screen it is
+        // padding, so no row's text contains it. That makes it a reasonable
+        // aid for a line taken whole and an intrusion on a line the selection
+        // only clipped, so a trimmed line goes without.
+        const whole = from === 0 && to === body.length;
+        return (whole ? '  '.repeat(line.depth) : '') + body.slice(from, to);
+      })
+      .join('\n');
+    if (!text) return;
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
+  };
   const toggleFold = (id: number) => {
     setCollapsedFolds((prev) => {
       const next = new Set(prev);
@@ -1748,7 +1946,19 @@ export const DataGrid: React.FC<DataGridProps> = ({
             <div>{t('dataGrid.empty.noDocuments')}</div>
           </div>
         ) : viewMode === 'json' ? (
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed" data-testid="json-view">
+          <div
+            ref={jsonViewRef}
+            // A fresh drag starts fresh tracking. Primary button only: a
+            // right-click opens a menu over an existing selection rather than
+            // replacing it, so resetting there threw away the recorded range
+            // just before the copy that needed it (#319 review).
+            onMouseDown={(e) => {
+              if (e.button === 0) jsonSelectionRef.current = { anchor: null, focus: null };
+            }}
+            onCopy={handleJsonCopy}
+            className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed"
+            data-testid="json-view"
+          >
             <div className="min-h-0 flex-1 min-w-0 overflow-auto">
               <List<JsonRowExtra>
                 rowCount={visibleJsonLines.length}

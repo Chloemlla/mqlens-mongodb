@@ -1205,3 +1205,403 @@ describe('find does not leak folds from a stale active index (#280 review round 
     expect(foldState('c')).toBe('closed');
   });
 });
+
+// #311: the JSON view is virtualized, so dragging a selection downwards
+// unmounts the rows it started on. The browser's selection lives in the DOM, so
+// by the time Cmd+C runs only the last screenful is left — and it copies
+// silently, which is the worst part: the paste looks like a successful copy of
+// the wrong thing.
+describe('DataGrid — copying a JSON selection that scrolled (#311)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** A selection anchored on one rendered row and focused on another. */
+  const selectionSpanning = (view: HTMLElement, from: number, to: number) =>
+    ({
+      isCollapsed: false,
+      anchorNode: view.querySelector(`[data-json-line="${from}"]`),
+      focusNode: view.querySelector(`[data-json-line="${to}"]`),
+    }) as unknown as Selection;
+
+  const copyFrom = (view: HTMLElement) => {
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    return setData;
+  };
+
+  it('rebuilds the full range from line data when rows were unmounted', () => {
+    const view = openJsonView();
+    expect(view.querySelectorAll('[data-json-line]').length).toBeGreaterThanOrEqual(4);
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    // The drag reached rows 0-3 while all of them were still mounted.
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 3));
+    document.dispatchEvent(new Event('selectionchange'));
+    // Scrolling has since dropped the top of that range; only 2-3 survive.
+    getSelection.mockReturnValue(selectionSpanning(view, 2, 3));
+
+    const setData = copyFrom(view);
+    expect(setData).toHaveBeenCalledTimes(1);
+    const [mime, text] = setData.mock.calls[0];
+    expect(mime).toBe('text/plain');
+    // All four lines, not just the two the DOM still had.
+    expect(text.split('\n')).toHaveLength(4);
+    expect(text).toContain('"Alice Smith"');
+    getSelection.mockRestore();
+  });
+
+  it('keeps extending after the anchor row is unmounted (#319 review)', () => {
+    // The sequence that actually happens, which the test below it originally
+    // skipped: the drag records a range, THEN scrolling unmounts the row the
+    // anchor sits on, and the drag continues. Resolving the two endpoints
+    // together discarded every update from that point on, so the range froze
+    // at the first screenful — the exact case this feature exists for.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+    // A node the browser is left holding once its row is gone.
+    const detached = document.createElement('span');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 1));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 0 has scrolled away; only the focus end still resolves.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: detached,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = copyFrom(view);
+    expect(setData).toHaveBeenCalledTimes(1);
+    // 0 through 3 — the far end was still picked up with the anchor gone.
+    expect(setData.mock.calls[0][1].split('\n')).toHaveLength(4);
+    getSelection.mockRestore();
+  });
+
+  it('lets the range contract when the drag reverses (#319 review)', () => {
+    // Dragging past a line and then back over it deselects it. A range that
+    // could only grow kept those lines and copied them anyway — silently
+    // adding text the user had explicitly removed, with every row mounted.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 3));
+    document.dispatchEvent(new Event('selectionchange'));
+    // Reversing: the anchor stays on row 0, the focus comes back to row 1.
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 1));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Nothing was lost, so the browser's own copy stands — and it is the
+    // contracted one.
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+  it('keeps the tracked range through a right-click (#319 review)', () => {
+    // Right-clicking opens a menu over an existing selection rather than
+    // replacing it. Resetting on any button threw the range away immediately
+    // before the copy that needed it, so the fix only worked for Cmd+C.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view, { button: 0 });
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 3));
+    document.dispatchEvent(new Event('selectionchange'));
+    getSelection.mockReturnValue(selectionSpanning(view, 2, 3));
+
+    fireEvent.mouseDown(view, { button: 2 });
+
+    const setData = copyFrom(view);
+    expect(setData).toHaveBeenCalledTimes(1);
+    expect(setData.mock.calls[0][1].split('\n')).toHaveLength(4);
+    getSelection.mockRestore();
+  });
+
+  it('leaves the browser alone when the whole selection is still mounted', () => {
+    // Whole-line rebuilding cannot honour a partial line at either end, so it
+    // must not take over a copy the browser can do exactly.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 1, 2));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+  it('starts a fresh extent on the next drag', () => {
+    // Without the mousedown reset the range would only ever grow, so an
+    // unrelated later selection would copy everything since the first one.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 4));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 3, 4));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+  it('ignores a selection that is not in the JSON view', () => {
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+    const outside = document.createElement('div');
+    document.body.appendChild(outside);
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: outside,
+      focusNode: outside,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    outside.remove();
+    getSelection.mockRestore();
+  });
+});
+
+// #319 review: with only row indices recorded, the rebuild emitted whole
+// endpoint lines — so a drag starting mid-value and ending mid-value put the
+// leading key and trailing text of those lines on the clipboard too.
+describe('DataGrid — trimming partial endpoints of a rebuilt copy (#319 review)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={[{ _id: 1, name: 'Alice', city: 'Paris', n: 2 }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** An endpoint at a character offset inside a row's own text. */
+  const endpointIn = (view: HTMLElement, row: number, offset: number) => {
+    const el = view.querySelector(`[data-json-line="${row}"]`)!;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let seen = 0;
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const len = text.textContent?.length ?? 0;
+      if (seen + len >= offset) return { node: text, offset: offset - seen };
+      seen += len;
+    }
+    return { node: el, offset: 0 };
+  };
+
+  it('trims the first and last lines to what was actually selected', () => {
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+    const rowText = (i: number) =>
+      view.querySelector(`[data-json-line="${i}"]`)!.textContent ?? '';
+
+    // Start four characters into row 1 and stop four characters into row 3.
+    const from = endpointIn(view, 1, 4);
+    const to = endpointIn(view, 3, 4);
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: from.node,
+      anchorOffset: from.offset,
+      focusNode: to.node,
+      focusOffset: to.offset,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 1 has since scrolled away, so the rebuild takes over.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: view.querySelector('[data-json-line="3"]'),
+      anchorOffset: 0,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+
+    expect(lines).toHaveLength(3);
+    // The first line starts where the drag did, not at the key.
+    expect(lines[0]).toBe(rowText(1).slice(4));
+    expect(lines[0]).not.toBe(rowText(1));
+    // The last line stops where the drag did, not at the end of the value.
+    expect(lines[2]).toBe(rowText(3).slice(0, 4));
+    getSelection.mockRestore();
+  });
+
+  it('keeps whole lines, indentation included, when the ends are not partial', () => {
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: view.querySelector('[data-json-line="0"]'),
+      anchorOffset: 0,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+      focusOffset: 0,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: view.querySelector('[data-json-line="3"]'),
+      anchorOffset: 0,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    const lines = setData.mock.calls[0][1].split('\n');
+    // Nested rows keep the indent that a whole-line copy should carry.
+    expect(lines[1].startsWith('  ')).toBe(true);
+    getSelection.mockRestore();
+  });
+});
+
+// #322 review: a selection boundary can land on an ELEMENT, in which case its
+// offset counts child nodes rather than characters — clicking in the padding
+// right of a row's text does exactly that. Hand-counting text nodes had to
+// guess there, and chose either the start or the end of the line.
+describe('DataGrid — element selection boundaries (#322 review)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={[{ _id: 1, name: 'Alice', city: 'Paris', n: 2 }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  it('measures a boundary that sits past a row\'s last child', () => {
+    const view = openJsonView();
+    const rowText = (i: number) =>
+      view.querySelector(`[data-json-line="${i}"]`)!.textContent ?? '';
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    const startRow = view.querySelector('[data-json-line="1"]')!;
+    const endRow = view.querySelector('[data-json-line="3"]')!;
+
+    fireEvent.mouseDown(view);
+    // Both ends land on the row elements, offset counting children: 0 children
+    // in at the start, every child in at the end — i.e. the whole of row 3.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: startRow,
+      anchorOffset: 0,
+      focusNode: endRow,
+      focusOffset: endRow.childNodes.length,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 1 scrolls away, so the rebuild takes over.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: endRow,
+      anchorOffset: 0,
+      focusNode: endRow,
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+
+    // The end boundary is past every child of row 3, so that line is whole —
+    // previously the "descendant element" branch was the only one that gave a
+    // non-zero offset, and a boundary on the row itself collapsed to 0, which
+    // truncated the last line to nothing.
+    expect(lines).toHaveLength(3);
+    expect(lines[2].trim()).toBe(rowText(3));
+    getSelection.mockRestore();
+  });
+});
+// #320: a select-all puts its endpoints on <body>, outside the view, so no row
+// resolved, nothing was tracked, and the copy fell through to the browser —
+// which holds only the mounted rows. Same silent truncation as #311, on the
+// more natural way to copy a whole result set.
+describe('DataGrid — select-all copies every row (#320)', () => {
+  const manyDocs = Array.from({ length: 40 }, (_, i) => ({ _id: i, name: `n${i}` }));
+
+  const openJsonView = () => {
+    render(<DataGrid documents={manyDocs} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** A selection whose range encloses the whole document, as Cmd+A produces. */
+  const selectAll = () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.body);
+    return {
+      isCollapsed: false,
+      anchorNode: document.body,
+      anchorOffset: 0,
+      focusNode: document.body,
+      focusOffset: document.body.childNodes.length,
+      rangeCount: 1,
+      getRangeAt: () => range,
+    } as unknown as Selection;
+  };
+
+  it('rebuilds every line, not just the mounted ones', () => {
+    const view = openJsonView();
+    const mounted = view.querySelectorAll('[data-json-line]').length;
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+    // 40 documents is far more than a screenful, so this only passes if the
+    // rebuild reached rows the DOM never held.
+    expect(lines.length).toBeGreaterThan(mounted);
+    expect(lines[0]).toBe('{');
+    getSelection.mockRestore();
+  });
+
+  it('ignores a selection that does not enclose the view', () => {
+    // The trap in the obvious fix: treating any unresolvable endpoint as the
+    // view's bounds would claim rows for selections living elsewhere in the UI.
+    const view = openJsonView();
+    const elsewhere = document.createElement('div');
+    elsewhere.textContent = 'unrelated';
+    document.body.appendChild(elsewhere);
+    const range = document.createRange();
+    range.selectNodeContents(elsewhere);
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: elsewhere,
+      anchorOffset: 0,
+      focusNode: elsewhere,
+      focusOffset: 1,
+      rangeCount: 1,
+      getRangeAt: () => range,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).not.toHaveBeenCalled();
+
+    elsewhere.remove();
+    getSelection.mockRestore();
+  });
+});

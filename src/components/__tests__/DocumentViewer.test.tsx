@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React, { type ReactElement } from 'react';
 import { render as rtlRender, screen, fireEvent, waitFor, act } from '@testing-library/react';
-import { DocumentViewer, builderStateToQuery } from '../DocumentViewer';
+import { DocumentViewer, DocumentViewerContext, builderStateToQuery } from '../DocumentViewer';
 import { DialogProvider } from '../dialogs/DialogProvider';
 
 const render = (ui: ReactElement) => rtlRender(<DialogProvider>{ui}</DialogProvider>);
@@ -159,7 +159,7 @@ describe('DocumentViewer Component', () => {
 
   it('accepts a query pasted with smart quotes, and says why when one will not parse', async () => {
     // The bug: a query copied out of a browser or a chat arrives with `“ ”`,
-    // which reads as correct on screen and was rejected as "Invalid JSON" with
+    // which reads as correct on screen and was rejected as "Invalid query" with
     // no reason given.
     render(
       <DocumentViewer
@@ -175,21 +175,58 @@ describe('DocumentViewer Component', () => {
     const filterInput = screen.getByTestId('query-filter-input');
     fireEvent.change(filterInput, { target: { value: 'domain: “account.test.com”' } });
     await waitFor(() => {
-      expect(screen.queryByText('Invalid JSON')).not.toBeInTheDocument();
+      expect(screen.queryByText('Invalid query')).not.toBeInTheDocument();
     });
 
     // And when something really is wrong, the badge carries the reason.
     fireEvent.change(filterInput, { target: { value: '{invalid' } });
-    const badge = await screen.findByText('Invalid JSON');
+    const badge = await screen.findByText('Invalid query');
     await waitFor(() => expect(badge.getAttribute('title')).toBeTruthy());
 
     // Our own failures have a translated message; only the parser's are stuck
     // in English. A bare `5` is not a query object.
     fireEvent.change(filterInput, { target: { value: '5' } });
     await waitFor(() =>
-      expect(screen.getByText('Invalid JSON').getAttribute('title')).not.toBe(
+      expect(screen.getByText('Invalid query').getAttribute('title')).not.toBe(
         'Query must be an object'
       )
+    );
+  });
+
+  it('runs a /g regex query and says the flag was ignored (#312)', async () => {
+    // The bug: `{"name": /test/g}` was rejected outright, and the badge said
+    // "Invalid JSON" — so the reporter concluded regex was unsupported. It runs
+    // now; `g` just cannot survive the trip to BSON, and the bar says so.
+    render(
+      <DocumentViewer
+        connectionName="test-conn"
+        databaseName="test-db"
+        collectionName="test-coll"
+        onExecute={mockOnExecute}
+        onExplain={mockOnExplain}
+        loading={false}
+      />
+    );
+
+    const filterInput = screen.getByTestId('query-filter-input');
+    fireEvent.change(filterInput, { target: { value: '{"name": /test/g}' } });
+
+    // Advisory, not an error: the query stays valid and Run stays enabled.
+    const notice = await screen.findByTestId('query-notice-badge');
+    expect(notice.getAttribute('title')).toContain('g');
+    expect(screen.queryByTestId('query-invalid-badge')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    await waitFor(() => expect(mockOnExecute).toHaveBeenCalled());
+    const [{ filter }] = mockOnExecute.mock.calls.at(-1)!;
+    expect(JSON.parse(filter)).toEqual({
+      name: { $regularExpression: { pattern: 'test', options: '' } },
+    });
+
+    // A regex with only supported flags draws no notice at all.
+    fireEvent.change(filterInput, { target: { value: '{"name": /test/i}' } });
+    await waitFor(() =>
+      expect(screen.queryByTestId('query-notice-badge')).not.toBeInTheDocument()
     );
   });
 
@@ -210,13 +247,13 @@ describe('DocumentViewer Component', () => {
     // Type invalid JSON
     fireEvent.change(filterInput, { target: { value: '{invalid' } });
     await waitFor(() => {
-      expect(screen.getByText('Invalid JSON')).toBeInTheDocument();
+      expect(screen.getByText('Invalid query')).toBeInTheDocument();
     });
 
     // Fix to valid JSON
     fireEvent.change(filterInput, { target: { value: '{"key": "value"}' } });
     await waitFor(() => {
-      expect(screen.queryByText('Invalid JSON')).not.toBeInTheDocument();
+      expect(screen.queryByText('Invalid query')).not.toBeInTheDocument();
     });
   });
 
@@ -1526,5 +1563,78 @@ describe('page size resync from the pager (#218)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
     expect(onExecute).toHaveBeenCalledWith(expect.objectContaining({ limit: 100 }));
+  });
+});
+
+// #310: typing in the query bar became slow in proportion to how much data was
+// loaded. The results grid consumes DocumentViewerContext and arrives as
+// `children` — a subtree React skips when only DocumentViewer's own state
+// changes — but the provider was handed a fresh object literal every render, so
+// every keystroke re-rendered the whole grid.
+describe('DocumentViewer — typing does not re-render the results (#310)', () => {
+  const Consumer: React.FC<{ onRender: () => void }> = ({ onRender }) => {
+    // Stands in for DataGrid: consumes this context and triggers Explain
+    // through it, which is where the real Explain control lives too.
+    const ctx = React.useContext(DocumentViewerContext);
+    onRender();
+    return (
+      <button data-testid="results-stand-in" onClick={() => ctx?.handleExplain()}>
+        results
+      </button>
+    );
+  };
+
+  const mockOnExecute = vi.fn();
+  const mockOnExplain = vi.fn().mockResolvedValue('{}');
+
+  const renderWithResults = (onRender: () => void) =>
+    render(
+      <DocumentViewer
+        connectionName="test-conn"
+        databaseName="test-db"
+        collectionName="test-coll"
+        onExecute={mockOnExecute}
+        onExplain={mockOnExplain}
+        loading={false}
+      >
+        <Consumer onRender={onRender} />
+      </DocumentViewer>
+    );
+
+  it('leaves the context identity alone across keystrokes', () => {
+    const onRender = vi.fn();
+    renderWithResults(onRender);
+    expect(screen.getByTestId('results-stand-in')).toBeInTheDocument();
+
+    const before = onRender.mock.calls.length;
+    const filterInput = screen.getByTestId('query-filter-input');
+    fireEvent.change(filterInput, { target: { value: '{"a": 1}' } });
+    fireEvent.change(filterInput, { target: { value: '{"a": 12}' } });
+    fireEvent.change(filterInput, { target: { value: '{"a": 123}' } });
+
+    // Three keystrokes, no extra work in the results subtree.
+    expect(onRender.mock.calls.length).toBe(before);
+  });
+
+  it('still notifies consumers when the explain state actually changes', async () => {
+    // The memo must not freeze the value so hard that a real update is missed:
+    // explainLoading is the one field consumers legitimately need to see move.
+    const onRender = vi.fn();
+    renderWithResults(onRender);
+    const before = onRender.mock.calls.length;
+    fireEvent.click(screen.getByTestId('results-stand-in'));
+    await waitFor(() => expect(onRender.mock.calls.length).toBeGreaterThan(before));
+  });
+
+  it('runs the explain that was current when it was invoked', () => {
+    // The stable wrapper reads through a ref, so it must not pin the first
+    // render's closure and explain a stale query.
+    const onRender = vi.fn();
+    renderWithResults(onRender);
+    fireEvent.change(screen.getByTestId('query-filter-input'), {
+      target: { value: '{"tier": "gold"}' },
+    });
+    fireEvent.click(screen.getByTestId('results-stand-in'));
+    expect(mockOnExplain).toHaveBeenCalledWith(JSON.stringify({ tier: 'gold' }));
   });
 });

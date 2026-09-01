@@ -1219,6 +1219,61 @@ fn validate_ai_provider(provider: ai_providers::AiProvider) -> Result<String, St
     }
 }
 
+/// Marks which conversation's agent is running, and clears it however the run
+/// ends.
+struct RequesterGuard<'a> {
+    state: &'a AppState,
+    entry: Option<String>,
+}
+
+impl<'a> RequesterGuard<'a> {
+    /// Records the run under the conversation that started it.
+    ///
+    /// Both or neither: with no conversation there is no address to put a write
+    /// to, and recording the run alone would make it the single live requester
+    /// while giving `confirm_write` nothing to emit. Leaving the list empty
+    /// instead falls through to the unaddressed case, where any window may
+    /// answer — the same place two concurrent runs land, and safe for the same
+    /// reason. In practice only the panel calls this and it sends both; a
+    /// frontend that sends neither simply gets unaddressed prompts.
+    fn set(
+        state: &'a AppState,
+        requester: Option<String>,
+        conversation: Option<String>,
+    ) -> Self {
+        let run = requester.filter(|r| !r.is_empty());
+        let conversation = conversation.filter(|c| !c.is_empty());
+        let entry = match (run, conversation) {
+            (Some(run), Some(conversation)) => {
+                if let Ok(mut live) = state.mcp_helper_requesters.lock() {
+                    live.push(crate::state::HelperRun {
+                        run: run.clone(),
+                        conversation,
+                    });
+                }
+                Some(run)
+            }
+            _ => None,
+        };
+        Self { state, entry }
+    }
+}
+
+impl Drop for RequesterGuard<'_> {
+    fn drop(&mut self) {
+        // Only this run's entry. Clearing the list would strand a panel whose run
+        // is still going, unable to confirm anything for the rest of its life.
+        let Some(id) = self.entry.as_ref() else { return };
+        // By run, not by conversation: two runs in one conversation would
+        // otherwise let the first to finish retire the other's entry.
+        if let Ok(mut live) = self.state.mcp_helper_requesters.lock() {
+            if let Some(pos) = live.iter().position(|r| &r.run == id) {
+                live.remove(pos);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn generate_mql_query(
     app_handle: tauri::AppHandle,
@@ -1226,6 +1281,21 @@ async fn generate_mql_query(
     prompt: String,
     collection: String,
     fields: Vec<String>,
+    // The tab's own namespace. An agent told to inspect the collection has to
+    // know *which* one: two connections can hold same-named collections, and
+    // sampling the wrong environment produces a query that looks right and was
+    // built from someone else's data.
+    database: Option<String>,
+    #[allow(non_snake_case)] connectionName: Option<String>,
+    // The id as well as the name: two profiles may share a display name, and the
+    // MCP tools take an id, so the agent can use this one directly.
+    #[allow(non_snake_case)] connectionId: Option<String>,
+    // Identifies this run, so its own entry can be retired when it ends.
+    #[allow(non_snake_case)] requesterId: Option<String>,
+    // The conversation that asked, which is what a write its agent requests is
+    // addressed to. Not the run: a tab can move to another window mid-run, and a
+    // run id means nothing to the webview it moves to.
+    #[allow(non_snake_case)] conversationId: Option<String>,
     #[allow(non_snake_case)] history: Option<Vec<ai::ChatTurn>>,
     target: Option<String>,
     images: Option<Vec<ai::ImageAttachment>>,
@@ -1325,8 +1395,56 @@ async fn generate_mql_query(
                     provider.name
                 ));
             }
+            // Only a local agent can reach MQLens's own MCP server; an HTTP
+            // provider is asked for one completion and calls nothing.
+            // The helper token and path, never the ones an external client uses:
+            // a write asked for on this route has to be confirmed by the user.
+            let mcp = mcp::helper_access(&state).map(|(port, token)| ai::McpEndpoint {
+                port,
+                token,
+                path: mcp::helper_path().to_string(),
+            });
+            // Available means *reachable by this command*, not merely running. A
+            // command without {mcp_config} is handed no config, so telling its
+            // agent the tools are there invites it to imply it checked something
+            // it never could — which is the failure this note exists to prevent.
+            // Three states. "The server is off" and "I did not hand this command a
+            // config" are different facts, and a user who followed the
+            // `claude mcp add` flow in Settings has an agent that reaches `mqlens`
+            // without `{mcp_config}` — telling it the server is off would talk it
+            // out of an inspection it could actually do.
+            let reach = if mcp.is_none() {
+                ai::McpReach::Off
+            } else if provider.command.contains("{mcp_config}") {
+                ai::McpReach::Injected
+            } else {
+                ai::McpReach::Unknown
+            };
+            let system = format!(
+                "{}{}",
+                system,
+                ai::mcp_availability_note(
+                    reach,
+                    connectionName.as_deref(),
+                    connectionId.as_deref(),
+                    database.as_deref(),
+                    &collection,
+                )
+            );
             let one_prompt = ai::combined_prompt(&system, &history, &prompt);
-            ai::generate_local(&provider.command, &one_prompt, &provider.model).await
+            // Set for the length of the run and cleared after, so a write arriving
+            // between runs is refused rather than offered to whoever is looking.
+            // A guard, not a plain assignment: an early return would otherwise
+            // leave a stale panel owning confirmations it never asked for.
+            let _requester =
+                RequesterGuard::set(&state, requesterId.clone(), conversationId.clone());
+            ai::generate_local(
+                &provider.command,
+                &one_prompt,
+                &provider.model,
+                mcp.as_ref(),
+            )
+            .await
         }
     }
 }
@@ -2902,6 +3020,16 @@ async fn mcp_set_enabled(
     mcp::set_enabled_impl(&state, enabled, port, Some(app_handle)).await
 }
 
+/// The user's answer to a write MQLens's own agent asked to make.
+#[tauri::command]
+async fn mcp_resolve_write(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    approved: bool,
+) -> Result<(), String> {
+    mcp::resolve_write_impl(&state, &id, approved)
+}
+
 #[tauri::command]
 async fn mcp_regenerate_token(state: tauri::State<'_, AppState>) -> Result<mcp::McpStatusUi, String> {
     mcp::regenerate_token_impl(&state)
@@ -3043,6 +3171,7 @@ pub fn run() {
             mcp_get_status,
             mcp_set_enabled,
             mcp_regenerate_token,
+            mcp_resolve_write,
             biometric::biometric_status,
             biometric::biometric_enable,
             biometric::biometric_unlock,

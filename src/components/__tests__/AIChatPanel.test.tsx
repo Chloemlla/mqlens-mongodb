@@ -4,6 +4,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ACCEPTED_IMAGE_TYPES, AIChatPanel } from '../AIChatPanel';
 import { resetChatRequests } from '../../lib/aiChatRequest';
 import { resetOpenChats } from '../../lib/aiChatStore';
+import {
+  resetWriteRequestsForTests,
+  startWriteRequests,
+  WRITE_REQUEST_TTL_MS,
+} from '../../lib/mcpWriteRequests';
 
 const invokeMock = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
@@ -11,8 +16,26 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invokeMock
 // broadcast. Captured here so a test can fire it, and so the real `listen` is
 // not reached in jsdom.
 const providerListeners: Array<() => void> = [];
+const writeRequestListeners: Array<
+  (r: { id: string; tool: string; summary: string; requester: string | null }) => void
+> = [];
+const writeSettledListeners: Array<(id: string) => void> = [];
 vi.mock('../../workspace/workspaceStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../workspace/workspaceStore')>()),
+  subscribeMcpWriteRequest: (fn: (r: any) => void) => {
+    writeRequestListeners.push(fn);
+    return Promise.resolve(() => {
+      const i = writeRequestListeners.indexOf(fn);
+      if (i >= 0) writeRequestListeners.splice(i, 1);
+    });
+  },
+  subscribeMcpWriteSettled: (fn: (id: string) => void) => {
+    writeSettledListeners.push(fn);
+    return Promise.resolve(() => {
+      const i = writeSettledListeners.indexOf(fn);
+      if (i >= 0) writeSettledListeners.splice(i, 1);
+    });
+  },
   subscribeAiProvidersChanged: (fn: () => void) => {
     providerListeners.push(fn);
     return Promise.resolve(() => {
@@ -185,6 +208,10 @@ describe('AIChatPanel', () => {
   beforeEach(() => {
     resetChatRequests();
     resetOpenChats();
+    // Module state, so it outlives a test unless it is cleared.
+    resetWriteRequestsForTests();
+    writeRequestListeners.length = 0;
+    writeSettledListeners.length = 0;
     chatStore = [];
     chatClaims = {};
     localStorage.clear();
@@ -838,6 +865,31 @@ JSON.stringify({ explanation: 'Here are the results.', queryType: 'find', filter
       clipboardData: { items: [{ kind: 'file', type, getAsFile: () => file }] },
     });
   };
+  /**
+   * A backend whose generation is held open, so a write request can arrive while
+   * the run is still going — which is the only time one can.
+   */
+  const heldRun = () => {
+    let release: (v: unknown) => void = () => {};
+    invokeMock.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'ai_provider_options') return Promise.resolve(OPTIONS);
+      if (cmd === 'list_ai_models_for') return Promise.resolve([]);
+      if (cmd.endsWith('_chat') || cmd.endsWith('_chats')) return Promise.resolve(chatBackend(cmd, args));
+      if (cmd === 'generate_mql_query') return new Promise((res) => { release = res; });
+      return Promise.resolve(null);
+    });
+    return () => release({ query: JSON.stringify({ queryType: 'find', filter: {} }) });
+  };
+
+  /**
+   * The address a write from this panel's run is put to: the conversation it was
+   * asked in, taken from its last request. Not the run id — that identifies the
+   * run to the backend and means nothing to a webview the tab may move to.
+   */
+  const lastRequesterId = () =>
+    (invokeMock.mock.calls.filter((c) => c[0] === 'generate_mql_query').at(-1)?.[1] as any)
+      ?.conversationId as string;
+
   const send = (text: string) => {
     fireEvent.change(screen.getByTestId('chat-input'), { target: { value: text } });
     fireEvent.click(screen.getByTestId('chat-send-btn'));
@@ -1415,6 +1467,260 @@ JSON.stringify({ explanation: 'Here are the results.', queryType: 'find', filter
     send('try again');
     await waitFor(() =>
       expect(screen.queryByTestId('chat-pending-images')).not.toBeInTheDocument(),
+    );
+  });
+
+  it('shows what a local agent ran, above its thinking', async () => {
+    // A local agent does real work before answering. That used to arrive as
+    // undifferentiated prose in the Thinking block; now the calls are their own.
+    invokeMock.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'ai_provider_options') return Promise.resolve(OPTIONS);
+      if (cmd === 'list_ai_models_for') return Promise.resolve([]);
+      if (cmd.endsWith('_chat') || cmd.endsWith('_chats')) return Promise.resolve(chatBackend(cmd, args));
+      if (cmd === 'generate_mql_query') {
+        return Promise.resolve({
+          query: JSON.stringify({ explanation: 'From the schema.', queryType: 'find', filter: { state: 'DONE' } }),
+          toolCalls: [
+            { name: 'schema_analysis', input: '{"collection":"orders"}', output: 'state: DONE | PENDING' },
+            { name: 'list_indexes', output: 'none', failed: true },
+          ],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+    send('which orders are done');
+
+    const block = await screen.findByTestId('chat-tool-calls');
+    expect(block).toHaveTextContent(/2 tools/);
+    expect(screen.getByTestId('chat-tool-call-0')).toHaveTextContent('schema_analysis');
+    expect(screen.getByTestId('chat-tool-call-0')).toHaveTextContent('DONE | PENDING');
+    // A failed call is marked as one rather than looking like it worked.
+    expect(screen.getByTestId('chat-tool-call-1')).toHaveTextContent('list_indexes');
+    expect(screen.getByTestId('chat-tool-call-1')).toHaveTextContent(/failed/i);
+  });
+
+  it('asks before the agent writes, and carries a refusal as a refusal', async () => {
+    // The write tools are gated on a flag the agent supplies itself, so for
+    // MQLens's own agent the person has to answer. A prompt that quietly approved
+    // would look identical on screen — hence asserting the payload, not the click.
+    heldRun(); // left open: a write can only arrive while the run is going
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+    expect(writeRequestListeners).not.toHaveLength(0);
+    // A write only happens while the agent is running, and the panel identifies
+    // itself when it starts one — so a request has to have been made first.
+    send('which orders are old');
+    await waitFor(() => expect(lastRequesterId()).toBeTruthy());
+
+    await act(async () => {
+      const mine = lastRequesterId();
+      writeRequestListeners.forEach((fn) =>
+        fn({ id: 'w1', tool: 'delete_many', summary: 'shop.orders where {"state":"OLD"}', requester: mine }),
+      );
+    });
+
+    const prompt = await screen.findByTestId('chat-write-request');
+    // MQLens's own description of the call, so the agent cannot relabel it.
+    expect(prompt).toHaveTextContent('delete_many');
+    expect(prompt).toHaveTextContent('shop.orders');
+
+    fireEvent.click(screen.getByTestId('chat-write-refuse'));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('mcp_resolve_write', { id: 'w1', approved: false }),
+    );
+    expect(screen.queryByTestId('chat-write-request')).not.toBeInTheDocument();
+  });
+
+  it('stops showing a write the backend has already given up on', async () => {
+    // The backend refuses after two minutes. A queue that kept the dead prompt
+    // showed it forever and, because only the first is rendered, hid every live
+    // request behind it — so later writes timed out without ever being seen.
+    heldRun(); // left open: a write can only arrive while the run is going
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+    send('which orders are old');
+    await waitFor(() => expect(lastRequesterId()).toBeTruthy());
+    const mine = lastRequesterId();
+
+    await act(async () => {
+      writeRequestListeners.forEach((fn) =>
+        fn({ id: 'stale', tool: 'delete_many', summary: 'old', requester: mine }),
+      );
+    });
+    // It must be visible first, or the disappearance below proves nothing.
+    expect(await screen.findByTestId('chat-write-request')).toBeInTheDocument();
+
+    // Past the backend's deadline. The store stamps arrival with `Date.now`, so
+    // moving that is what ages the entry; the sweep then drops it.
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + WRITE_REQUEST_TTL_MS + 1_000;
+      await act(async () => {
+        // Something unrelated, only to trigger a re-read. Clicking Refuse would
+        // remove the entry by id and prove nothing about expiry.
+        writeRequestListeners.forEach((fn) =>
+          fn({ id: 'other', tool: 'insert_one', summary: 'x', requester: 'someone-else' }),
+        );
+      });
+      await waitFor(() =>
+        expect(screen.queryByTestId('chat-write-request')).not.toBeInTheDocument(),
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('will not let a write be approved from a different conversation', async () => {
+    // Opening a History item does not stop the run, and the answer is still filed
+    // under the conversation that asked — so a write belonging to it must not be
+    // answerable from the one now on screen.
+    chatStore = [{
+      id: 'other', title: 'other chat', messages: [{ id: 'm1', role: 'user', text: 'hi' }],
+      connectionName: 'Local', database: 'test-db', collection: 'users', variant: 'editor',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    }];
+    heldRun(); // left open: a write can only arrive while the run is going
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+    send('which orders are old');
+    await waitFor(() => expect(lastRequesterId()).toBeTruthy());
+    const run = lastRequesterId();
+
+    await act(async () => {
+      writeRequestListeners.forEach((fn) =>
+        fn({ id: 'w1', tool: 'delete_many', summary: 'shop.orders', requester: run }),
+      );
+    });
+    expect(await screen.findByTestId('chat-write-request')).toBeInTheDocument();
+
+    // The user opens a different conversation while the run continues.
+    fireEvent.click(screen.getByTestId('ai-chat-history-btn'));
+    fireEvent.click(await screen.findByText('other chat'));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId('chat-write-request')).not.toBeInTheDocument(),
+    );
+  });
+
+  it('ignores a write request addressed to another panel', async () => {
+    // Every webview receives the event; only the panel whose agent asked should
+    // offer it. Otherwise someone looking at a different connection can approve a
+    // delete they had no part in asking for.
+    mockPickerBackend({ query: '{}' });
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+
+    await act(async () => {
+      writeRequestListeners.forEach((fn) =>
+        fn({ id: 'w9', tool: 'delete_many', summary: 'someone else\'s', requester: 'another-panel' }),
+      );
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByTestId('chat-write-request')).not.toBeInTheDocument();
+  });
+
+  it('queues a second write request rather than losing it', async () => {
+    // Two can arrive close together; replacing the first would leave its tool
+    // call parked until it timed out with nobody having seen it.
+    heldRun(); // left open: a write can only arrive while the run is going
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+    send('which orders are old');
+    await waitFor(() => expect(lastRequesterId()).toBeTruthy());
+
+    await act(async () => {
+      const mine = lastRequesterId();
+      writeRequestListeners.forEach((fn) => fn({ id: 'w1', tool: 'delete_many', summary: 'first', requester: mine }));
+      writeRequestListeners.forEach((fn) => fn({ id: 'w2', tool: 'insert_one', summary: 'second', requester: mine }));
+    });
+
+    expect(await screen.findByTestId('chat-write-request')).toHaveTextContent('first');
+    fireEvent.click(screen.getByTestId('chat-write-allow'));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('mcp_resolve_write', { id: 'w1', approved: true }),
+    );
+    // The second is still there to be answered.
+    await waitFor(() =>
+      expect(screen.getByTestId('chat-write-request')).toHaveTextContent('second'),
+    );
+  });
+
+  it('drops a request another window has answered, revealing the live one', async () => {
+    // The request reaches every webview and is answered in one. The others kept
+    // showing it, and since only the oldest is displayed that already-decided
+    // prompt hid the next live request behind it until its TTL ran out.
+    heldRun();
+    renderPanel('editor');
+    await screen.findByTestId('ai-chat-provider-select');
+    send('which orders are old');
+    await waitFor(() => expect(lastRequesterId()).toBeTruthy());
+
+    await act(async () => {
+      const mine = lastRequesterId();
+      writeRequestListeners.forEach((fn) => fn({ id: 'w1', tool: 'delete_many', summary: 'answered elsewhere', requester: mine }));
+      writeRequestListeners.forEach((fn) => fn({ id: 'w2', tool: 'insert_one', summary: 'still waiting', requester: mine }));
+    });
+    expect(await screen.findByTestId('chat-write-request')).toHaveTextContent('answered elsewhere');
+
+    // Answered in the other window: this one is only told it is settled, and
+    // must not have called the backend itself.
+    expect(writeSettledListeners).not.toHaveLength(0);
+    await act(async () => {
+      writeSettledListeners.forEach((fn) => fn('w1'));
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId('chat-write-request')).toHaveTextContent('still waiting'),
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith('mcp_resolve_write', expect.anything());
+  });
+
+  it('lets a panel that never started the run answer for its conversation', async () => {
+    // A tab can be moved or detached to another window while its agent is still
+    // going. Addressed by run, the destination panel did not recognise the id and
+    // filtered the prompt out, while the source no longer mounted the tab — so no
+    // window could approve the write and it timed out. This panel stands in for
+    // the destination: it shows the conversation but never sent the request.
+    chatStore = [{
+      id: 'chat-42', title: 'moved chat', messages: [{ id: 'm1', role: 'user', text: 'hi' }],
+      connectionName: 'Local', database: 'test-db', collection: 'users', variant: 'editor',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    }];
+    startWriteRequests();
+    await act(async () => {});
+    await act(async () => {
+      writeRequestListeners.forEach((fn) =>
+        fn({ id: 'w7', tool: 'delete_many', summary: 'shop.orders', requester: 'chat-42' }),
+      );
+    });
+
+    renderPanel('editor', { chatId: 'chat-42' });
+    expect(await screen.findByTestId('chat-write-request')).toHaveTextContent('shop.orders');
+  });
+
+  it('recovers a write that arrived before any panel was mounted', async () => {
+    // An external MCP client's write is confirmed too, and it does not come from
+    // a panel. With the listener started lazily by the panel, such a request was
+    // broadcast to nobody and could only fail when the backend gave up two
+    // minutes later. `App` starts it instead, so opening the chat still finds it.
+    startWriteRequests();
+    await act(async () => {});
+    expect(writeRequestListeners).not.toHaveLength(0);
+
+    // Unaddressed, as an external client's write always is.
+    await act(async () => {
+      writeRequestListeners.forEach((fn) =>
+        fn({ id: 'ext1', tool: 'delete_many', summary: 'from an external client', requester: null }),
+      );
+    });
+
+    // Only now does any UI exist. The prompt does not depend on a provider
+    // being configured — the write is already parked in the backend.
+    renderPanel('editor');
+    expect(await screen.findByTestId('chat-write-request')).toHaveTextContent(
+      'from an external client',
     );
   });
 

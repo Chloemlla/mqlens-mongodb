@@ -5,7 +5,7 @@ import { QueryEditor } from './QueryEditor';
 import { FindQueryBar } from './FindQueryBar';
 import { useCollectionSchema } from '../lib/useCollectionSchema';
 import { collectionRef, type GeneratedQuery } from '../lib/mongoCommand';
-import { parseShellJson, parseQueryObject, shellDocErrorKey } from '../lib/shellDoc';
+import { parseShellJson, parseQueryObject, shellDocErrorKey, shellDocErrorParams, type ShellDocNotices } from '../lib/shellDoc';
 import {
   loadCollectionQueries,
   saveQuery,
@@ -793,7 +793,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         // Our own parse failures carry a code and get a translated message;
         // errors from the underlying parser only have an English message.
         shellDocErrorKey(e)
-          ? td(shellDocErrorKey(e)!)
+          ? td(shellDocErrorKey(e)!, shellDocErrorParams(e))
           : td('documentViewer.errors.invalidJsonSyntax', { message: e.message }),
       );
     }
@@ -904,25 +904,38 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   // The reason, not just the fact. A query that fails on a character the user
   // cannot see — a smart quote, a zero-width space pasted in from a browser —
-  // reads as correct on screen, and a bare "Invalid JSON" gives them nothing
+  // reads as correct on screen, and a bare "Invalid query" gives them nothing
   // to act on.
   const [filterError, setFilterError] = useState<string | null>(null);
+  // The query is fine and will run, but it does not mean quite what it says —
+  // a regex flag BSON cannot carry was dropped on the way to the server. Kept
+  // separate from `filterError` so it never blocks Run.
+  const [filterNotice, setFilterNotice] = useState<string | null>(null);
 
   useEffect(() => {
     try {
+      const notices: ShellDocNotices = { droppedRegexFlags: [] };
       if (filterQuery.trim()) {
-        parseQueryObject(filterQuery);
+        parseQueryObject(filterQuery, notices);
       }
       setIsFilterValid(true);
       setFilterError(null);
+      setFilterNotice(
+        notices.droppedRegexFlags.length
+          ? td('documentViewer.notices.regexFlagsIgnored', {
+              flags: notices.droppedRegexFlags.join(', '),
+            })
+          : null
+      );
     } catch (err) {
       setIsFilterValid(false);
+      setFilterNotice(null);
       // Our own parse failures carry a code and have a translated message;
       // only the underlying parser's errors are stuck in English. Same rule
       // the Run and Explain paths follow.
       const key = shellDocErrorKey(err);
       setFilterError(
-        key ? td(key) : err instanceof Error ? err.message : String(err)
+        key ? td(key, shellDocErrorParams(err)) : err instanceof Error ? err.message : String(err)
       );
     }
     // `td` too: switching the interface language re-renders this component but
@@ -1349,7 +1362,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         // Our own parse failures carry a code and get a translated message;
         // errors from the underlying parser only have an English message.
         shellDocErrorKey(e)
-          ? td(shellDocErrorKey(e)!)
+          ? td(shellDocErrorKey(e)!, shellDocErrorParams(e))
           : td('documentViewer.errors.invalidJsonSyntax', { message: e.message }),
       );
     }
@@ -1420,11 +1433,36 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       // `disabled` guard, only the trigger does — so this path has to map our
       // own parse errors to a translated message like the two above it.
       const key = shellDocErrorKey(e);
-      setError(key ? td(key) : e.message || String(e));
+      setError(key ? td(key, shellDocErrorParams(e)) : e.message || String(e));
     } finally {
       setExplainLoading(false);
     }
   };
+
+  // The context value must keep its identity while the user types.
+  //
+  // The results grid consumes this context, and it arrives as `children` — a
+  // subtree React would otherwise skip re-rendering when only this component's
+  // own state changes. Handing over a fresh `{ handleExplain, explainLoading }`
+  // on every render defeated exactly that: each keystroke gave every consumer a
+  // new value, so the whole grid re-rendered per character and typing slowed in
+  // proportion to how much data was loaded (#310).
+  //
+  // A plain useCallback would not help. `handleExplain` reads the query text,
+  // so it genuinely differs on every keystroke and honest dependencies would
+  // change its identity just as often. Keeping the newest implementation in a
+  // ref lets the exposed function stay constant instead, leaving `explainLoading`
+  // — which only flips when an explain actually runs — as the one thing that
+  // can wake a consumer.
+  const handleExplainRef = useRef(handleExplain);
+  useEffect(() => {
+    handleExplainRef.current = handleExplain;
+  });
+  const stableHandleExplain = React.useCallback(() => handleExplainRef.current(), []);
+  const documentViewerContextValue = useMemo(
+    () => ({ handleExplain: stableHandleExplain, explainLoading }),
+    [stableHandleExplain, explainLoading]
+  );
 
   const handleClearField = (field: 'filter' | 'projection' | 'sort') => {
     if (field === 'filter') setFilterQuery('');
@@ -1851,6 +1889,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 }}
                 filterInvalid={!isFilterValid}
                 filterError={filterError}
+                filterNotice={filterNotice}
                 projectionInvalid={!isProjectionValid}
                 sortInvalid={!isSortValid}
                 fields={fields}
@@ -2003,7 +2042,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
             </div>
 
-          <DocumentViewerContext.Provider value={{ handleExplain, explainLoading }}>
+          <DocumentViewerContext.Provider value={documentViewerContextValue}>
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
               {children}
             </div>
@@ -2396,6 +2435,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               <AIChatPanel
                 variant="editor"
                 embedded
+                connectionId={connectionId}
                 connectionName={connectionName}
                 databaseName={databaseName}
                 collectionName={collectionName}
