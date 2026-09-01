@@ -60,6 +60,11 @@ interface DataGridProps {
    *  props to keep the old self-managed behaviour (MongoShell does). */
   viewMode?: ViewMode;
   onViewModeChange?: (mode: ViewMode) => void;
+  /** Which results tab is showing. Owned by the caller for the same reason as
+   *  viewMode above — the grid remounts on every run, so a tab kept here is a
+   *  choice the user loses (#281). Omit both to self-manage. */
+  activeTab?: ResultsTab;
+  onActiveTabChange?: (tab: ResultsTab) => void;
   /**
    * Drop the control bar — the Results/Explain tabs, the view-mode switcher and
    * the row actions — and render the documents alone.
@@ -83,6 +88,9 @@ interface DataGridProps {
 }
 
 export type ViewMode = 'table' | 'tree' | 'json' | 'chart';
+
+/** Which pane of the results area is showing. */
+export type ResultsTab = 'results' | 'explain' | 'query';
 
 interface ExplainNode {
   name: string;
@@ -549,6 +557,8 @@ export const DataGrid: React.FC<DataGridProps> = ({
   onPageChange,
   onPageSizeChange,
   viewMode: controlledViewMode,
+  activeTab: controlledActiveTab,
+  onActiveTabChange,
   onViewModeChange,
   onCreateSuggestedIndex,
   connectionMode,
@@ -653,7 +663,17 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setUncontrolledViewMode(mode);
     onViewModeChange?.(mode);
   };
-  const [activeTab, setActiveTab] = useState<'results' | 'explain' | 'query'>('results');
+  // Which results tab is showing, owned by the caller for the same reason
+  // `viewMode` is: the grid remounts on every run, so state kept here is state
+  // the user loses. Left uncontrolled it behaves as before, for callers with
+  // nothing to persist it to.
+  const [uncontrolledActiveTab, setUncontrolledActiveTab] =
+    useState<ResultsTab>('results');
+  const activeTab = controlledActiveTab ?? uncontrolledActiveTab;
+  const setActiveTab = (tab: ResultsTab) => {
+    setUncontrolledActiveTab(tab);
+    onActiveTabChange?.(tab);
+  };
   // Chromeless callers have no tabs to switch and no explain plan to show.
   const effectiveTab = chromeless ? 'results' : activeTab;
 
@@ -800,8 +820,23 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setCollapsedFolds(new Set());
   }, [documents]);
 
-  // Automatically switch to explain tab when a new explain result is received
+  // Switch to the explain tab when a NEW plan arrives — not merely because one
+  // exists.
+  //
+  // Without the mount guard this fired every time the grid remounted, which is
+  // once per run. A plan is not cleared when a query re-runs, so after a single
+  // visit to Explain every subsequent run reopened it and the Results tab had
+  // to be clicked again each time (#281). The results effect below was already
+  // guarded this way and so could not push back.
+  // Only skipped for a controlled caller, which owns the tab: overriding the
+  // choice it just handed us is the bug. An uncontrolled caller has expressed
+  // no preference, so opening a plan it passed at mount stays helpful.
+  const skipMountExplainSwitch = React.useRef(controlledActiveTab !== undefined);
   useEffect(() => {
+    if (skipMountExplainSwitch.current) {
+      skipMountExplainSwitch.current = false;
+      return;
+    }
     if (explainResult) {
       setActiveTab('explain');
     }

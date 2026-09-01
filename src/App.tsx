@@ -31,7 +31,7 @@ import {
   renameShellSession,
   retargetShellSessionDatabase,
 } from './lib/mongoshSession';
-import { DataGrid, type ViewMode } from './components/DataGrid';
+import { DataGrid, type ViewMode, type ResultsTab } from './components/DataGrid';
 import { ConnectionManager } from './components/ConnectionManager';
 import { WatchPanel } from './components/WatchPanel';
 import { SettingsView, type SettingsTabId, MONGO_TOOLS_DIR_KEY } from './components/SettingsModal';
@@ -147,6 +147,9 @@ export interface QueryTab {
   // Results view mode, kept on the tab so it survives the grid remounting on
   // every run and the tab being switched away (#218).
   viewMode?: ViewMode;
+  // Which results tab is showing, kept on the tab for the same reason as
+  // viewMode: the grid remounts on every run (#281).
+  resultsTab?: ResultsTab;
   // What the results pager last asked for. The values travel with the revision
   // so the builder can never observe a new revision beside a stale page size —
   // see DocumentViewer's pagerRequest prop.
@@ -699,6 +702,9 @@ function Workspace() {
   }, []);
   const handleViewModeChange = useCallback((tabId: string, mode: ViewMode) => {
     setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, viewMode: mode } : t)));
+  }, []);
+  const handleResultsTabChange = useCallback((tabId: string, resultsTab: ResultsTab) => {
+    setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, resultsTab } : t)));
   }, []);
   const handleChatMessagesChange = useCallback((tabId: string, messages: ChatMessage[]) => {
     const prev = tabChatCache.current.get(tabId);
@@ -4199,6 +4205,8 @@ function Workspace() {
                     limit={tab.lastQuery?.limit ?? 50}
                     viewMode={tab.viewMode ?? 'json'}
                     onViewModeChange={(mode) => handleViewModeChange(tab.id, mode)}
+                    activeTab={tab.resultsTab ?? 'results'}
+                    onActiveTabChange={(t) => handleResultsTabChange(tab.id, t)}
                     onCreateSuggestedIndex={s => handleCreateSuggestedIndex(tab, s)}
                     {...(!tab.lastAggregate ? {
                       onPageChange: (newSkip: number) => handlePageChange(tab, newSkip),

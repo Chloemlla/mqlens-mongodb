@@ -1605,3 +1605,59 @@ describe('DataGrid — select-all copies every row (#320)', () => {
     getSelection.mockRestore();
   });
 });
+
+// #281: after one visit to Explain, every subsequent run reopened it — the
+// Results tab had to be clicked again each time. The grid remounts on every run
+// (the pane renders `{loading ? <spinner/> : <DataGrid/>}`), a plan is not
+// cleared when a query re-runs, and the explain auto-switch had no mount guard,
+// so it fired on each remount while the results effect was already guarded.
+describe('DataGrid — the explain tab does not hijack later runs (#281)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  it('stays on results when the grid remounts with an existing plan', () => {
+    const { unmount } = render(
+      <DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />
+    );
+    unmount();
+    // The remount a re-run causes, with the plan still hanging around.
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />);
+    expect(screen.getByTestId('json-view')).toBeInTheDocument();
+  });
+
+  it('still opens explain when a plan actually arrives', () => {
+    // The guard must not cost the behaviour it guards: a plan showing up after
+    // mount is a real event and should switch.
+    const onActiveTabChange = vi.fn();
+    const { rerender } = render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={null}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    rerender(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+
+  it('reports the tab the user picks so it can outlive the grid', () => {
+    const onActiveTabChange = vi.fn();
+    render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /explain/i }));
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+});
