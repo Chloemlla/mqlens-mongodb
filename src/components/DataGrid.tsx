@@ -1136,10 +1136,41 @@ export const DataGrid: React.FC<DataGridProps> = ({
     if (!selection || selection.isCollapsed || !container) return null;
     const endpoint = (node: Node | null, offset: number) =>
       node && container.contains(node) ? jsonEndpointOf(node, offset) : null;
-    return {
+    const ends = {
       anchor: endpoint(selection.anchorNode, selection.anchorOffset),
       focus: endpoint(selection.focusNode, selection.focusOffset),
     };
+    if (ends.anchor || ends.focus) return ends;
+    // Neither end sits on a row, which is what a select-all looks like: its
+    // endpoints land on <body>, outside the view entirely. Only treat that as
+    // "everything" once the selection is confirmed to ENCLOSE the view —
+    // clamping any unresolvable endpoint to the view's bounds would claim rows
+    // for selections that merely pass nearby, or that live somewhere else in
+    // the UI altogether (#320).
+    if (!enclosesJsonView(selection, container)) return ends;
+    return {
+      anchor: { row: 0, offset: 0 },
+      // Past the end of any line; the copy clamps it to the real length.
+      focus: { row: Math.max(visibleJsonLines.length - 1, 0), offset: Number.MAX_SAFE_INTEGER },
+    };
+  };
+
+  /** Does the selection start at or before the view and end at or after it? */
+  const enclosesJsonView = (selection: Selection, container: HTMLElement): boolean => {
+    if (selection.rangeCount === 0) return false;
+    const contents = document.createRange();
+    contents.selectNodeContents(container);
+    try {
+      const range = selection.getRangeAt(0);
+      return (
+        range.compareBoundaryPoints(Range.START_TO_START, contents) <= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_END, contents) >= 0
+      );
+    } catch {
+      // Ranges in different documents cannot be compared; treat as no match
+      // rather than assuming the view is covered.
+      return false;
+    }
   };
 
   /** The two endpoints in document order, or null if neither resolved. */
@@ -1171,12 +1202,28 @@ export const DataGrid: React.FC<DataGridProps> = ({
   const handleJsonCopy = (e: React.ClipboardEvent<HTMLDivElement>) => {
     const tracked = jsonRangeOf(jsonSelectionRef.current);
     if (!tracked) return;
+    // Stand aside only when the browser can be trusted to copy this exactly,
+    // which takes both signals agreeing.
+    //
+    // The live selection still spanning everything tracked says nothing was
+    // dragged out of range. That alone was the old test, and a select-all slips
+    // straight through it: its span covers the tracked rows on paper while the
+    // DOM holds only a screenful (#320).
+    //
+    // So the rows must also actually be there. react-window renders a
+    // contiguous window, so finding both ends means everything between them is
+    // present too.
     const ends = selectedJsonEnds();
     const live = ends && jsonRangeOf(ends);
-    // Step in only when rows really were lost. While everything the user
-    // selected is still mounted, the browser's own copy is exact and ours can
-    // only approximate it.
-    if (live && live.start.row <= tracked.start.row && live.end.row >= tracked.end.row) return;
+    const spansAll = !!live && live.start.row <= tracked.start.row && live.end.row >= tracked.end.row;
+    const container = jsonViewRef.current;
+    const wanted = tracked.end.row - tracked.start.row + 1;
+    const allMounted =
+      !!container &&
+      container.querySelectorAll('[data-json-line]').length >= wanted &&
+      !!container.querySelector(`[data-json-line="${tracked.start.row}"]`) &&
+      !!container.querySelector(`[data-json-line="${tracked.end.row}"]`);
+    if (spansAll && allMounted) return;
     const text = visibleJsonLines
       .slice(tracked.start.row, tracked.end.row + 1)
       .map((line, i) => {
