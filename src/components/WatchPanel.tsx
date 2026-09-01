@@ -40,12 +40,12 @@ const VIEW_CAP = 1_000;
  * the strongest signals (green and red) and the edits sit between them.
  */
 const OPERATION_STYLES: Record<string, { badge: string; rail: string }> = {
-  insert: { badge: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400', rail: 'bg-emerald-500' },
-  update: { badge: 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400', rail: 'bg-amber-500' },
-  replace: { badge: 'border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400', rail: 'bg-sky-500' },
-  delete: { badge: 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400', rail: 'bg-rose-500' },
-  drop: { badge: 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400', rail: 'bg-rose-500' },
-  rename: { badge: 'border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-400', rail: 'bg-violet-500' },
+  insert: { badge: 'border-success/40 bg-success/10 text-success', rail: 'bg-success' },
+  update: { badge: 'border-warning/40 bg-warning/10 text-warning', rail: 'bg-warning' },
+  replace: { badge: 'border-chart-1/40 bg-chart-1/10 text-chart-1', rail: 'bg-chart-1' },
+  delete: { badge: 'border-destructive/40 bg-destructive/10 text-destructive', rail: 'bg-destructive' },
+  drop: { badge: 'border-destructive/40 bg-destructive/10 text-destructive', rail: 'bg-destructive' },
+  rename: { badge: 'border-chart-4/40 bg-chart-4/10 text-chart-4', rail: 'bg-chart-4' },
   invalidate: { badge: 'border-muted-foreground/40 bg-muted text-muted-foreground', rail: 'bg-muted-foreground' },
 };
 

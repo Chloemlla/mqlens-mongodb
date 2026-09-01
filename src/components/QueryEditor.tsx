@@ -5,7 +5,7 @@ import type { Surface } from '../lib/mongoCompletions';
 import type { SchemaMap } from '../lib/useCollectionSchema';
 import { useMonacoTheme, useMonacoFontSize, useMonacoScale } from '../lib/useMonacoTheme';
 import { useThemeOptional } from '@/hooks/use-theme';
-import { registerMqlensMonacoThemes, refreshMqlensMonacoTheme } from '../lib/monacoAppTheme';
+import { attachMonaco } from '../lib/monacoAppTheme';
 import { cn } from '@/lib/utils';
 import {
   clampQueryBarHeight,
@@ -81,14 +81,6 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   const uiScale = useMonacoScale();
   const multiLineFontSize = useMonacoFontSize(12);
   const themeCtx = useThemeOptional();
-  const presetId = themeCtx?.config.presetId;
-
-  useEffect(() => {
-    const monaco = monacoRef.current;
-    if (!monaco) return;
-    refreshMqlensMonacoTheme(monaco);
-    monaco.editor.setTheme(theme);
-  }, [theme, presetId]);
 
   // Row height is user-configurable (Settings → Appearance) and shared by the
   // query, projection and sort rows so the bar stays symmetric. It's stored as
@@ -234,8 +226,9 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
       }}
       onMount={(ed, monaco: Monaco) => {
         monacoRef.current = monaco;
-        registerMqlensMonacoThemes(monaco);
-        monaco.editor.setTheme(theme);
+        // Themes are owned by ThemeProvider; announcing this instance is all an
+        // editor needs to do, and it gets themed immediately from current state.
+        attachMonaco(monaco);
         registerMongoCompletionProvider(monaco);
 
         // ⌘/Ctrl+Enter always runs; plain Enter is bound below for single-line fields.

@@ -1765,7 +1765,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         </Badge>
                       )}
                       <span
-                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-success"
                         aria-label={t('connection.connectedAriaLabel')}
                       />
                     </div>
@@ -2592,13 +2592,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                     size={11}
                                     className={cn(
                                       'shrink-0',
-                                      isConnected ? 'text-emerald-500' : 'text-muted-foreground',
+                                      isConnected ? 'text-success' : 'text-muted-foreground',
                                     )}
                                   />
                                   <span className="min-w-0 truncate">{profile.name}</span>
                                   {isConnected && (
                                     <span
-                                      className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                                      className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-success"
                                       aria-label={t('connection.connectedAriaLabel')}
                                     />
                                   )}
@@ -2624,7 +2624,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                             size={11}
                             className={cn(
                               'shrink-0',
-                              isConnected ? 'text-emerald-500' : 'text-muted-foreground',
+                              isConnected ? 'text-success' : 'text-muted-foreground',
                             )}
                           />
                           <span className="min-w-0 truncate">{profile.name}</span>
