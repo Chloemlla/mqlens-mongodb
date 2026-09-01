@@ -477,6 +477,9 @@ const JsonRow = ({
         line.isDocRoot && line.docIndex > 0 && 'border-t border-border',
         findHighlightClass(line.num)
       )}
+      // Lets a copy reconstruct the selected range from the line data even
+      // after virtualization has unmounted the rows it started on (#311).
+      data-json-line={index}
       data-doc-even={line.docIndex % 2 === 0}
       onContextMenu={(e) => openCtxMenu(e, documents[line.docIndex], line.kind === 'scalar' ? line.keyName ?? undefined : undefined, line.value)}
     >
@@ -1046,6 +1049,105 @@ export const DataGrid: React.FC<DataGridProps> = ({
       case 'close':
         return `${line.bracket || '}'}${comma}`;
     }
+  };
+
+  // ── Copying a selection that scrolled (#311) ──────────────────────────────
+  //
+  // The JSON view is virtualized, so dragging a selection downwards unmounts
+  // the rows it started on. The browser's selection lives in the DOM, so those
+  // rows are simply gone by the time Cmd+C runs and only the last screenful is
+  // copied — silently, which is the worst part: the paste looks like a
+  // successful copy of the wrong thing.
+  //
+  // The extent is therefore recorded as the drag happens, while both ends are
+  // still mounted, and the copy is rebuilt from the line data rather than from
+  // the DOM.
+  const jsonViewRef = React.useRef<HTMLDivElement | null>(null);
+  // The two ends of the selection, each remembered independently at the last
+  // row it was seen on. Modelling the ends rather than a min/max span is what
+  // lets the range CONTRACT: during a drag the anchor is fixed and only the
+  // focus moves, so a span that could only grow kept lines the user had dragged
+  // back over and deselected, and then copied them (#319 review).
+  const jsonSelectionRef = React.useRef<{ anchor: number | null; focus: number | null }>({
+    anchor: null,
+    focus: null,
+  });
+
+  const jsonLineIndexOf = (node: Node | null): number | null => {
+    const el = node instanceof Element ? node : (node?.parentElement ?? null);
+    const attr = el?.closest('[data-json-line]')?.getAttribute('data-json-line');
+    if (attr == null) return null;
+    const index = Number(attr);
+    return Number.isInteger(index) ? index : null;
+  };
+
+  /**
+   * The row each end of the live selection sits on, or null where it cannot be
+   * resolved.
+   *
+   * Each end is resolved on its own, which is the crux of this mechanism rather
+   * than defensive coding. Once the drag passes the first window, the row
+   * holding the anchor is exactly what react-window unmounts — so requiring
+   * both ends to resolve threw away every update from the moment tracking
+   * started to matter, freezing the range at the first screenful (#319 review).
+   *
+   * An end the browser has relocated to a surviving ancestor resolves to no row
+   * and is reported as null rather than guessed at; the caller keeps the last
+   * row that end was actually seen on.
+   */
+  const selectedJsonEnds = (): { anchor: number | null; focus: number | null } | null => {
+    const selection = document.getSelection();
+    const container = jsonViewRef.current;
+    if (!selection || selection.isCollapsed || !container) return null;
+    const rowOf = (node: Node | null) =>
+      node && container.contains(node) ? jsonLineIndexOf(node) : null;
+    return { anchor: rowOf(selection.anchorNode), focus: rowOf(selection.focusNode) };
+  };
+
+  const jsonRangeOf = (ends: { anchor: number | null; focus: number | null }) => {
+    const rows = [ends.anchor, ends.focus].filter((row): row is number => row !== null);
+    return rows.length ? { min: Math.min(...rows), max: Math.max(...rows) } : null;
+  };
+
+  useEffect(() => {
+    if (viewMode !== 'json') return;
+    // Each end keeps the last row it was seen on, so an end that scrolls out of
+    // the DOM is remembered while the other stays free to move in either
+    // direction — extending the selection or pulling it back.
+    const onSelectionChange = () => {
+      const ends = selectedJsonEnds();
+      if (!ends) return;
+      const seen = jsonSelectionRef.current;
+      jsonSelectionRef.current = {
+        anchor: ends.anchor ?? seen.anchor,
+        focus: ends.focus ?? seen.focus,
+      };
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+  }, [viewMode]);
+
+  const handleJsonCopy = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    const tracked = jsonRangeOf(jsonSelectionRef.current);
+    if (!tracked) return;
+    const ends = selectedJsonEnds();
+    const live = ends && jsonRangeOf(ends);
+    // Step in only when rows really were lost. While everything the user
+    // selected is still mounted, the browser's own copy is better than ours:
+    // it honours a partial line at either end, which whole-line rebuilding
+    // cannot.
+    if (live && live.min <= tracked.min && live.max >= tracked.max) return;
+    const text = visibleJsonLines
+      .slice(tracked.min, tracked.max + 1)
+      .map((line) => {
+        const folded = line.foldId !== undefined && collapsedFolds.has(line.foldId);
+        const suffix = folded ? ` … ${line.closeChar ?? ''}${line.hasComma ? ',' : ''}` : '';
+        return '  '.repeat(line.depth) + jsonLineText(line) + suffix;
+      })
+      .join('\n');
+    if (!text) return;
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
   };
 
   const toggleFold = (id: number) => {
@@ -1748,7 +1850,19 @@ export const DataGrid: React.FC<DataGridProps> = ({
             <div>{t('dataGrid.empty.noDocuments')}</div>
           </div>
         ) : viewMode === 'json' ? (
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed" data-testid="json-view">
+          <div
+            ref={jsonViewRef}
+            // A fresh drag starts fresh tracking. Primary button only: a
+            // right-click opens a menu over an existing selection rather than
+            // replacing it, so resetting there threw away the recorded range
+            // just before the copy that needed it (#319 review).
+            onMouseDown={(e) => {
+              if (e.button === 0) jsonSelectionRef.current = { anchor: null, focus: null };
+            }}
+            onCopy={handleJsonCopy}
+            className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed"
+            data-testid="json-view"
+          >
             <div className="min-h-0 flex-1 min-w-0 overflow-auto">
               <List<JsonRowExtra>
                 rowCount={visibleJsonLines.length}
