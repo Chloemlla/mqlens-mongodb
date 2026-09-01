@@ -60,6 +60,11 @@ interface DataGridProps {
    *  props to keep the old self-managed behaviour (MongoShell does). */
   viewMode?: ViewMode;
   onViewModeChange?: (mode: ViewMode) => void;
+  /** Which results tab is showing. Owned by the caller for the same reason as
+   *  viewMode above — the grid remounts on every run, so a tab kept here is a
+   *  choice the user loses (#281). Omit both to self-manage. */
+  activeTab?: ResultsTab;
+  onActiveTabChange?: (tab: ResultsTab) => void;
   /**
    * Drop the control bar — the Results/Explain tabs, the view-mode switcher and
    * the row actions — and render the documents alone.
@@ -83,6 +88,9 @@ interface DataGridProps {
 }
 
 export type ViewMode = 'table' | 'tree' | 'json' | 'chart';
+
+/** Which pane of the results area is showing. */
+export type ResultsTab = 'results' | 'explain' | 'query';
 
 interface ExplainNode {
   name: string;
@@ -549,6 +557,8 @@ export const DataGrid: React.FC<DataGridProps> = ({
   onPageChange,
   onPageSizeChange,
   viewMode: controlledViewMode,
+  activeTab: controlledActiveTab,
+  onActiveTabChange,
   onViewModeChange,
   onCreateSuggestedIndex,
   connectionMode,
@@ -653,7 +663,17 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setUncontrolledViewMode(mode);
     onViewModeChange?.(mode);
   };
-  const [activeTab, setActiveTab] = useState<'results' | 'explain' | 'query'>('results');
+  // Which results tab is showing, owned by the caller for the same reason
+  // `viewMode` is: the grid remounts on every run, so state kept here is state
+  // the user loses. Left uncontrolled it behaves as before, for callers with
+  // nothing to persist it to.
+  const [uncontrolledActiveTab, setUncontrolledActiveTab] =
+    useState<ResultsTab>('results');
+  const activeTab = controlledActiveTab ?? uncontrolledActiveTab;
+  const setActiveTab = (tab: ResultsTab) => {
+    setUncontrolledActiveTab(tab);
+    onActiveTabChange?.(tab);
+  };
   // Chromeless callers have no tabs to switch and no explain plan to show.
   const effectiveTab = chromeless ? 'results' : activeTab;
 
@@ -800,20 +820,47 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setCollapsedFolds(new Set());
   }, [documents]);
 
-  // Automatically switch to explain tab when a new explain result is received
+  // Switch to the explain tab when a NEW plan arrives — not merely because one
+  // exists.
+  //
+  // Without the mount guard this fired every time the grid remounted, which is
+  // once per run. A plan is not cleared when a query re-runs, so after a single
+  // visit to Explain every subsequent run reopened it and the Results tab had
+  // to be clicked again each time (#281). The results effect below was already
+  // guarded this way and so could not push back.
+  // Both switches below compare against the previous value rather than counting
+  // mounts.
+  //
+  // A one-shot flag looks equivalent and is not: StrictMode runs each effect
+  // twice on mount, and the first setup spends the flag, so the replayed setup
+  // sees a guard that is already gone and fires anyway. That put this bug
+  // straight back for anyone running the app in development (#325 review).
+  // Comparing values is idempotent — a replay is simply not a change — so the
+  // guard survives however many times React chooses to run the effect.
+  //
+  // The seed carries the earlier decision. A controlled caller owns the tab, so
+  // mount must not override the choice it just handed us; an uncontrolled one
+  // has expressed no preference, and its long-standing contract is that a plan
+  // passed at mount opens it.
+  const lastExplainResult = React.useRef<string | null | undefined>(
+    controlledActiveTab !== undefined ? explainResult : undefined
+  );
   useEffect(() => {
+    const previous = lastExplainResult.current;
+    lastExplainResult.current = explainResult;
+    if (previous === explainResult) return;
     if (explainResult) {
       setActiveTab('explain');
     }
   }, [explainResult]);
 
-  // Automatically switch to results tab when new query results (documents) are loaded (skipping mount)
-  const isFirstRender = React.useRef(true);
+  // Switch to results when a new set of documents arrives — seeded with the
+  // current set so arriving at one does not count as a change.
+  const lastDocuments = React.useRef(documents);
   useEffect(() => {
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
+    const previous = lastDocuments.current;
+    lastDocuments.current = documents;
+    if (previous === documents) return;
     setActiveTab('results');
   }, [documents]);
 
