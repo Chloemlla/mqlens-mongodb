@@ -1483,7 +1483,7 @@ function Workspace() {
         };
         setTabs(prev => [...prev, newTab as QueryTab]);
       } else {
-        setTabs(prev => prev.map(t => t.id === tabId ? { ...t, loading: true, error: null } : t));
+        setTabs(prev => prev.map(t => t.id === tabId ? { ...t, loading: true, error: null, resultsTab: 'results' } : t));
       }
       dispatchWorkspace({ type: 'open_tab', tabId }, newTab ? { tab: newTab } : undefined);
 
@@ -2985,7 +2985,11 @@ function Workspace() {
 
   const handleExecuteQuery = async (tab: QueryTab, query: { filter: string; sort: string; projection: string; limit: number; skip: number }) => {
     // Update the tab's loading state
-    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null } : t));
+    // Back to Results for a run: the user asked for rows, so show them. The
+    // grid remounts while loading, and the tab now outlives that remount, so
+    // without this a run started from Explain would hide its own results
+    // behind the plan (#325 review).
+    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null, resultsTab: 'results' } : t));
 
     try {
       const resultStrs = await invoke<string[]>('execute_mql_query', {
@@ -3093,7 +3097,11 @@ function Workspace() {
       }
     }
 
-    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null } : t));
+    // Back to Results for a run: the user asked for rows, so show them. The
+    // grid remounts while loading, and the tab now outlives that remount, so
+    // without this a run started from Explain would hide its own results
+    // behind the plan (#325 review).
+    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null, resultsTab: 'results' } : t));
 
     try {
       const resultStrs = await invoke<string[]>('execute_aggregate', {

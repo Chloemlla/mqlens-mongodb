@@ -1661,3 +1661,30 @@ describe('DataGrid — the explain tab does not hijack later runs (#281)', () =>
     expect(onActiveTabChange).toHaveBeenCalledWith('explain');
   });
 });
+
+// #325 review: the tab now outlives the loading remount, so a run started from
+// Explain would have kept showing the plan and hidden its own results — the
+// documents effect deliberately skips mount, so nothing would correct it.
+describe('DataGrid — a run started from Explain shows its results (#325 review)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  it('shows rows when the caller resets the tab for a run', () => {
+    // Sitting on Explain.
+    const { unmount } = render(
+      <DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />
+    );
+    expect(screen.getByTestId('explain-panel')).toBeInTheDocument();
+    // A run: the grid unmounts while loading, and App resets the tab because
+    // the user asked for rows.
+    unmount();
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />);
+    expect(screen.getByTestId('json-view')).toBeInTheDocument();
+  });
+
+  it('would hide them if the caller kept the tab on explain', () => {
+    // Pins why the App-side reset is required rather than optional: the grid
+    // honours the tab it is given, and nothing here switches back.
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />);
+    expect(screen.queryByTestId('json-view')).not.toBeInTheDocument();
+  });
+});
