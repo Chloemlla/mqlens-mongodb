@@ -6,7 +6,7 @@ import type { TFunction } from 'i18next';
 import { shellToEjson } from '../lib/shellDoc';
 import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { DOC_LANGUAGE_ID, registerDocLanguage } from '../lib/monacoDocLanguage';
-import { registerMqlensMonacoThemes, refreshMqlensMonacoTheme } from '../lib/monacoAppTheme';
+import { attachMonaco } from '../lib/monacoAppTheme';
 import { useEscapeClose } from '../lib/useEscapeClose';
 import {
   Dialog,
@@ -58,26 +58,13 @@ export const DocumentEditModal: React.FC<DocumentEditModalProps> = ({
     NonNullable<React.ComponentProps<typeof Editor>['onMount']>
   >[1] | null>(null);
 
-  // `refreshMqlensMonacoTheme` builds *both* theme ids from whatever CSS
-  // variables are live at the time, so they are only correct immediately after a
-  // refresh. QueryEditor re-runs it on every theme change; without the same here
-  // the dialog kept the previous mode's colours — a dark editor in light mode —
-  // whenever the mode changed with no query editor mounted to refresh them.
-  //
-  // Gated on `isOpen`, and the handle is dropped on close: this component stays
-  // mounted while the dialog is shut, so an ungated effect redefined the global
-  // Monaco themes on every App render. That is wasted work, it can fight
-  // QueryEditor's own refresh, and it measurably destabilised unrelated tests.
+  // Themes are owned by ThemeProvider now, so there is nothing to refresh
+  // here. This used to redefine the GLOBAL themes from whatever CSS variables
+  // were live, which could overwrite a correct definition another editor had
+  // just made — the "can fight" the old comment warned about (#324 review).
   useEffect(() => {
-    if (!isOpen) {
-      monacoRef.current = null;
-      return;
-    }
-    const monaco = monacoRef.current;
-    if (!monaco) return;
-    refreshMqlensMonacoTheme(monaco);
-    monaco.editor.setTheme(theme);
-  }, [isOpen, theme]);
+    if (!isOpen) monacoRef.current = null;
+  }, [isOpen]);
   const monacoFontSize = useMonacoFontSize(12.5);
   useEscapeClose(isOpen, onClose);
 
@@ -152,8 +139,9 @@ export const DocumentEditModal: React.FC<DocumentEditModalProps> = ({
                 registerDocLanguage(monaco);
                 // The theme's token colours come from the same design tokens the
                 // grid uses, so both must be registered before the editor paints.
-                registerMqlensMonacoThemes(monaco);
-                refreshMqlensMonacoTheme(monaco);
+                // Themes are owned by ThemeProvider; announcing the instance is
+                // enough, and it is themed immediately from current state.
+                attachMonaco(monaco);
               }}
               options={{
                 minimap: { enabled: false },

@@ -1,12 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Editor, { type Monaco, type OnMount } from '@monaco-editor/react';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
 import type { Surface } from '../lib/mongoCompletions';
 import type { SchemaMap } from '../lib/useCollectionSchema';
 import { useMonacoTheme, useMonacoFontSize, useMonacoScale } from '../lib/useMonacoTheme';
 import { useThemeOptional } from '@/hooks/use-theme';
-import { registerMqlensMonacoThemes, refreshMqlensMonacoTheme, tokenResolverFor } from '../lib/monacoAppTheme';
-import { getEffectiveTokens } from '@/lib/themes/apply-theme';
+import { attachMonaco } from '../lib/monacoAppTheme';
 import { cn } from '@/lib/utils';
 import {
   clampQueryBarHeight,
@@ -82,25 +81,6 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   const uiScale = useMonacoScale();
   const multiLineFontSize = useMonacoFontSize(12);
   const themeCtx = useThemeOptional();
-  const presetId = themeCtx?.config.presetId;
-
-  // Resolve Monaco's colours from the theme config rather than the DOM.
-  //
-  // Reading computed styles here is a render too early: React runs child
-  // effects before parent ones, so this fires before ThemeProvider has written
-  // the new variables — empty on first mount, the previous theme's values on
-  // every switch after (#282). The config is the same source ThemeProvider
-  // applies from, so it cannot be out of step with itself.
-  const monacoTokens = useMemo(
-    () => (themeCtx ? tokenResolverFor(getEffectiveTokens(themeCtx.config)) : undefined),
-    [themeCtx?.config]
-  );
-
-  useEffect(() => {
-    const monaco = monacoRef.current;
-    if (!monaco) return;
-    refreshMqlensMonacoTheme(monaco, monacoTokens, theme);
-  }, [theme, presetId, monacoTokens]);
 
   // Row height is user-configurable (Settings → Appearance) and shared by the
   // query, projection and sort rows so the bar stays symmetric. It's stored as
@@ -246,15 +226,9 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
       }}
       onMount={(ed, monaco: Monaco) => {
         monacoRef.current = monaco;
-        // Config-derived here too: at mount the CSS variables have not been
-        // written yet, so a DOM read returns nothing and every colour silently
-        // falls back to the built-in VS palette — which is why presets like
-        // nord and solarized never reached the editor at all (#282).
-        registerMqlensMonacoThemes(monaco, monacoTokens, theme);
-        // Themes register once per app, so a later editor must still be told to
-        // rebuild them from ITS config rather than inherit whatever the first
-        // one left behind.
-        refreshMqlensMonacoTheme(monaco, monacoTokens, theme);
+        // Themes are owned by ThemeProvider; announcing this instance is all an
+        // editor needs to do, and it gets themed immediately from current state.
+        attachMonaco(monaco);
         registerMongoCompletionProvider(monaco);
 
         // ⌘/Ctrl+Enter always runs; plain Enter is bound below for single-line fields.

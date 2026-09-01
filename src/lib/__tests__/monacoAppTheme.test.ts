@@ -4,6 +4,9 @@ import {
   refreshMqlensMonacoTheme,
   registerMqlensMonacoThemes,
   tokenResolverFor,
+  attachMonaco,
+  setMonacoAppTheme,
+  resetMonacoAppThemeForTests,
 } from "../monacoAppTheme";
 
 describe("hslComponentsToHex", () => {
@@ -83,5 +86,52 @@ describe('monaco theme colours come from the config, not the DOM (#282)', () => 
     // same definition path a second editor would get.
     refreshMqlensMonacoTheme(monaco, resolve, 'mqlens-dark');
     expect(defined.get('mqlens-dark')!.colors).toEqual(fromRefresh);
+  });
+});
+
+// #324 review: defineTheme is GLOBAL, so whichever editor called it last won
+// for every editor on screen. Each of QueryEditor, DocumentEditModal and
+// MongoShell refreshed on its own schedule, so one resolving from stale CSS
+// variables silently overwrote the others — and for a preset change within the
+// same mode nothing re-renders afterwards to repair it.
+describe('one owner of the global Monaco themes (#324 review)', () => {
+  const defined: { colors: Record<string, string> }[] = [];
+  const monaco = {
+    editor: {
+      defineTheme: (id: string, theme: { colors: Record<string, string> }) => {
+        if (id === 'mqlens-dark') defined.push(theme);
+      },
+      setTheme: () => {},
+    },
+  } as unknown as Parameters<typeof attachMonaco>[0];
+
+  beforeEach(() => {
+    defined.length = 0;
+    resetMonacoAppThemeForTests();
+  });
+
+  it('themes an editor that attaches after the theme was set', () => {
+    setMonacoAppTheme(tokenResolverFor({ input: '193 100% 12%' }), 'mqlens-dark');
+    attachMonaco(monaco);
+    expect(defined.at(-1)!.colors['editor.background']).toBe(
+      hslComponentsToHex('193 100% 12%')
+    );
+  });
+
+  it('re-themes an already-attached editor when the config changes', () => {
+    attachMonaco(monaco);
+    setMonacoAppTheme(tokenResolverFor({ input: '0 0% 20%' }), 'mqlens-dark');
+    expect(defined.at(-1)!.colors['editor.background']).toBe(hslComponentsToHex('0 0% 20%'));
+  });
+
+  it('a second editor attaching cannot undo the current theme', () => {
+    // The race: another editor mounting used to redefine the themes from the
+    // DOM, discarding what the config-derived pass had just written.
+    setMonacoAppTheme(tokenResolverFor({ input: '193 100% 12%' }), 'mqlens-dark');
+    attachMonaco(monaco);
+    attachMonaco(monaco);
+    expect(defined.at(-1)!.colors['editor.background']).toBe(
+      hslComponentsToHex('193 100% 12%')
+    );
   });
 });

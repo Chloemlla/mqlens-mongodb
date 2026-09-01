@@ -2,10 +2,12 @@ import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "r
 import { invoke } from "@tauri-apps/api/core";
 import {
   applyTheme,
+  getEffectiveTokens,
   applyResponsiveScale,
   exportThemeJson,
   importThemeJson,
 } from "@/lib/themes/apply-theme";
+import { setMonacoAppTheme, tokenResolverFor } from "@/lib/monacoAppTheme";
 import {
   appearanceToThemeConfig,
   readInitialThemeConfig,
@@ -95,6 +97,17 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const mode = applyTheme(config);
+    // Monaco is another output of the same theme, so it is applied from the
+    // same place and the same source. Doing it here rather than in each editor
+    // is what makes the ordering right: a parent's effect runs after its
+    // children's, so by now the CSS variables are written and no editor can
+    // still be looking at the previous theme (#282). And because the themes are
+    // global, having one writer is what stops a second editor overwriting them
+    // from stale values (#324 review).
+    setMonacoAppTheme(
+      tokenResolverFor(getEffectiveTokens(config)),
+      mode === "light" ? "mqlens-light" : "mqlens-dark"
+    );
     setResolvedMode(mode);
   }, [config]);
 

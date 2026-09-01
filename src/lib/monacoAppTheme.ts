@@ -183,3 +183,48 @@ export function refreshMqlensMonacoTheme(
   defineThemes(monaco, resolve);
   monaco.editor.setTheme(themeId);
 }
+
+/**
+ * Single ownership of the global Monaco themes.
+ *
+ * `defineTheme` is global: whichever editor calls it last wins for every editor
+ * on screen. With each of QueryEditor, DocumentEditModal and MongoShell
+ * refreshing on its own schedule, one of them resolving colours from stale CSS
+ * variables silently overwrote the others' correct definitions — and for a
+ * preset change within the same mode nothing re-renders afterwards to repair it
+ * (#324 review). DocumentEditModal's own comment already noted the two "can
+ * fight".
+ *
+ * So editors no longer define themes at all. They announce their Monaco
+ * instance, and ThemeProvider — which already owns applying the theme, and
+ * whose effect runs after its children's — is the only writer.
+ */
+let activeMonaco: Monaco | null = null;
+let currentResolve: MonacoTokenResolver = cssTokenResolver;
+let currentThemeId: MqlensMonacoThemeId = "mqlens-dark";
+
+/** An editor announcing itself; it is themed immediately from current state. */
+export function attachMonaco(monaco: Monaco): void {
+  activeMonaco = monaco;
+  defineThemes(monaco, currentResolve);
+  monaco.editor.setTheme(currentThemeId);
+}
+
+/** The only writer: called by ThemeProvider once per applied config. */
+export function setMonacoAppTheme(
+  resolve: MonacoTokenResolver,
+  themeId: MqlensMonacoThemeId
+): void {
+  currentResolve = resolve;
+  currentThemeId = themeId;
+  if (!activeMonaco) return;
+  defineThemes(activeMonaco, resolve);
+  activeMonaco.editor.setTheme(themeId);
+}
+
+/** Test seam: forget the attached editor and fall back to reading the DOM. */
+export function resetMonacoAppThemeForTests(): void {
+  activeMonaco = null;
+  currentResolve = cssTokenResolver;
+  currentThemeId = "mqlens-dark";
+}
