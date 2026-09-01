@@ -453,6 +453,231 @@ function endOfRegex(text: string, start: number): number {
   return -1;
 }
 
+/** The range a BSON 64-bit long can hold. Outside it, there is nothing to preserve into. */
+const I64_MAX = 9223372036854775807n;
+const I64_MIN = -9223372036854775808n;
+
+/**
+ * Rewrite integer literals a JS number cannot hold into `NumberLong("…")`.
+ *
+ * The query parser evaluates a bare literal as a JS `number`, so anything past
+ * 2^53 is rounded before we ever see it: `{counter: 9007199254740993}` reached
+ * the server as `…992` and matched a different document, with no error and
+ * nothing on screen to say so (#317). The loss happens during parsing, so the
+ * only place to fix it is before parsing — hence a text pass.
+ *
+ * `NumberLong` is the right target rather than a workaround: the backend
+ * already produces a BSON Int64 for such a literal (serde_json reads it
+ * exactly, then bson maps it to Int64), so this restores the type the query
+ * always should have had. shellDoc then serializes canonically, because
+ * `containsLong` sees a Long, and the value survives to the server intact.
+ *
+ * Deliberately narrow — it only touches literals that are BOTH unrepresentable
+ * as a double AND expressible as a long:
+ *
+ * - Values inside strings and regex literals are the user's data, so those are
+ *   copied verbatim, exactly as `normalizePastedQuery` treats them.
+ * - Anything with a `.`, an exponent, or a `0x`/`0b`/`0o`/`n` suffix is left
+ *   alone. Those spell a double (or a form the parser handles itself) on
+ *   purpose, and rewriting them would change the user's chosen type.
+ * - Safe integers are left alone, so ordinary numbers keep serializing as they
+ *   always have — no `{a: 42}` suddenly becoming a long.
+ * - Object keys (`{123: 1}`) are skipped: a key is not a value, and
+ *   `NumberLong("…")` is not valid there.
+ * - Values beyond the i64 range are left alone. They cannot be a BSON long, so
+ *   there is no lossless form to rewrite them into; they stay as they are
+ *   rather than being silently truncated into a different wrong number.
+ */
+/**
+ * Characters after which a fresh value may begin: `{a: N}`, `[N]`, `[1, N]`.
+ *
+ * Note what is NOT here. `(` is excluded so `NumberLong(9007199254740993)`
+ * keeps its own argument instead of becoming `NumberLong(NumberLong("…"))`,
+ * and arithmetic operators are excluded so an operand is left alone.
+ */
+const VALUE_STARTS_AFTER = ':,[';
+
+/**
+ * Characters that can follow a complete value: `{a: N}`, `[N]`, `[N, 1]`.
+ *
+ * The mirror of VALUE_STARTS_AFTER, and needed for the same reason from the
+ * other side. Checking only what precedes a literal caught `{a: 1 + N}` but
+ * not `{a: N + 1}`, where the literal is the LEFT operand — that became
+ * `NumberLong("…") + 1`, and JS concatenated the long's toString into the
+ * string "90071992547409931", turning a numeric query into a string one
+ * without a word (#318 review).
+ *
+ * It also subsumes the property-key case: `:` is not here, so `{123: 1}` is
+ * left alone by the same rule rather than a second special case.
+ */
+const VALUE_ENDS_BEFORE = ',}])';
+
+/**
+ * Where does the literal we are about to read sit, and may we rewrite it?
+ *
+ * Rewriting anywhere a big integer appears is wrong, because the text around
+ * it decides what it means. Three ways that bit (#318 review):
+ *
+ * - `{a: 1 - 9007199254740992}` — a spaced binary minus read as a sign, which
+ *   ate the operator and left `{a: 1 NumberLong("-…")}`, so a valid query
+ *   stopped parsing entirely.
+ * - `{a: 1 + 9007199254740992}` — an operand rewritten into a Long, leaving
+ *   the parser to do arithmetic on an object.
+ * - `{a: NumberLong(9007199254740993)}` — an argument rewritten inside the
+ *   very constructor that was already asking for a long.
+ *
+ * So this only says yes in value position, where a literal can stand alone.
+ * Anywhere else the pre-existing behaviour is kept: an arithmetic operand
+ * still rounds, which is worse than exact but far better than not parsing.
+ */
+function classifyNumberPlacement(
+  last: string,
+  prev: string,
+  out: string
+): 'plain' | 'signed' | 'skip' {
+  const startsValue = (ch: string) => ch === '' || VALUE_STARTS_AFTER.includes(ch);
+  if (last === '-') {
+    // A minus is a sign only when nothing that could end an operand precedes
+    // it; otherwise this is subtraction and the minus is not ours to take.
+    //
+    // It also has to still be at the end of the emitted text, since folding it
+    // into the literal means deleting it from there. A comment sitting between
+    // the two (`-/* note */5`) would make that deletion miss, so those are left
+    // alone rather than mangled — an exotic spelling of a rare case.
+    return startsValue(prev) && /-\s*$/.test(out) ? 'signed' : 'skip';
+  }
+  return startsValue(last) ? 'plain' : 'skip';
+}
+
+/** End of the comment starting at `i`, or -1 when none starts there. */
+function endOfComment(text: string, i: number): number {
+  if (text[i] !== '/') return -1;
+  if (text[i + 1] === '/') {
+    const nl = text.indexOf('\n', i);
+    return nl === -1 ? text.length : nl;
+  }
+  if (text[i + 1] === '*') {
+    const end = text.indexOf('*/', i + 2);
+    return end === -1 ? text.length : end + 2;
+  }
+  return -1;
+}
+
+/**
+ * First index at or after `from` holding something syntactically meaningful —
+ * whitespace and comments are both skipped.
+ *
+ * Looking only past whitespace is what let `{a: 1, 9007199254740992 /* n *\/: 1}`
+ * be mistaken for a value and rewritten into `NumberLong("…"): 1`, which is not
+ * a property key and stopped the query parsing (#318 review).
+ */
+function skipTrivia(text: string, from: number): number {
+  let k = from;
+  for (;;) {
+    while (k < text.length && /\s/.test(text[k])) k++;
+    const end = endOfComment(text, k);
+    if (end === -1) return k;
+    k = end;
+  }
+}
+
+export function preserveBigIntegers(text: string): string {
+  let out = '';
+  let i = 0;
+  // The last two *syntactically meaningful* characters emitted — whitespace and
+  // comments do not count. Placement has to be judged on these rather than on
+  // the tail of `out`, because scanning `out` back would trip over the very
+  // things this pass copies verbatim (a `//` inside a URL string, a comment
+  // between the delimiter and the value).
+  let lastMeaningful = '';
+  let prevMeaningful = '';
+  const remember = (ch: string) => {
+    prevMeaningful = lastMeaningful;
+    lastMeaningful = ch;
+  };
+  while (i < text.length) {
+    const c = text[i];
+    // Verbatim: a string's contents are data, not syntax.
+    if (c === '"' || c === "'") {
+      out += c;
+      i++;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          out += text[i] + (text[i + 1] ?? '');
+          i += 2;
+          continue;
+        }
+        out += text[i];
+        if (text[i] === c) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      remember('"');
+      continue;
+    }
+    // Comments are copied through but leave no syntactic trace, so they must
+    // be recognised BEFORE the regex branch — `/*` otherwise reads as a regex
+    // opener, and the closing `/` then looks like the token before the value,
+    // which left `{counter: /* note */ 9007199254740993}` unrewritten and
+    // still rounding (#318 review).
+    const commentEnd = endOfComment(text, i);
+    if (commentEnd !== -1) {
+      out += text.slice(i, commentEnd);
+      i = commentEnd;
+      continue;
+    }
+    // Verbatim: digits inside a pattern are part of the pattern.
+    if (c === '/' && startsRegex(lastMeaningful)) {
+      const end = endOfRegex(text, i);
+      if (end !== -1) {
+        out += text.slice(i, end);
+        i = end;
+        remember('/');
+        continue;
+      }
+    }
+    if (c >= '0' && c <= '9') {
+      const prev = out[out.length - 1] ?? '';
+      // A digit run only starts a literal at a token boundary — `a1` and
+      // `1.5`'s tail are continuations, not new numbers.
+      if (!/[A-Za-z0-9_$.]/.test(prev)) {
+        let j = i;
+        while (j < text.length && text[j] >= '0' && text[j] <= '9') j++;
+        const digits = text.slice(i, j);
+        const after = text[j] ?? '';
+        const isPlainInteger = !/[.eExXbBoOn_]/.test(after);
+        // Whatever follows must be able to end a value. One rule covers both a
+        // property key (`{123: 1}` — `:` cannot end a value) and a literal used
+        // as the left operand of an expression (`{a: N + 1}` — nor can `+`).
+        const next = text[skipTrivia(text, j)] ?? '';
+        const endsValue = next === '' || VALUE_ENDS_BEFORE.includes(next);
+        if (isPlainInteger && endsValue && !Number.isSafeInteger(Number(digits))) {
+          const placement = classifyNumberPlacement(lastMeaningful, prevMeaningful, out);
+          if (placement !== 'skip') {
+            // A unary minus comes along inside the long, so the parser is
+            // never asked to negate a Long object.
+            const literal = (placement === 'signed' ? '-' : '') + digits;
+            const value = BigInt(literal);
+            if (value >= I64_MIN && value <= I64_MAX) {
+              if (placement === 'signed') out = out.replace(/-\s*$/, '');
+              out += `NumberLong("${literal}")`;
+              i = j;
+              remember('0');
+              continue;
+            }
+          }
+        }
+      }
+    }
+    out += c;
+    if (!/\s/.test(c)) remember(c);
+    i++;
+  }
+  return out;
+}
+
 /** Drop `;` off the end, but only when it is not inside a string. */
 function stripTrailingSemicolons(text: string): string {
   let cut = text.length;
@@ -486,7 +711,7 @@ function stripTrailingSemicolons(text: string): string {
 }
 
 export function parseShellJson(text: string, notices?: ShellDocNotices): any {
-  const trimmed = normalizePastedQuery(text).trim();
+  const trimmed = preserveBigIntegers(normalizePastedQuery(text)).trim();
   if (!trimmed) return {};
   // parseFilter signals "unparseable / not a valid query" by returning an empty
   // string rather than throwing (e.g. `{ _id }`, a half-typed field). Surface

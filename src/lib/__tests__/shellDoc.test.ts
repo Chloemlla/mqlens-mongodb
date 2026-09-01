@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ObjectId, Long, Decimal128, Int32 } from 'bson';
-import { docToShell, shellToEjson, parseShellJson, parseQueryObject, shellDocErrorKey, shellDocErrorParams, type ShellDocNotices } from '../shellDoc';
+import { docToShell, shellToEjson, parseShellJson, parseQueryObject, preserveBigIntegers, shellDocErrorKey, shellDocErrorParams, type ShellDocNotices } from '../shellDoc';
 
 describe('docToShell', () => {
   it('renders EJSON-shaped values as shell constructors', () => {
@@ -398,5 +398,271 @@ describe('parseShellJson — regex flags BSON cannot carry (#312)', () => {
     const notices: ShellDocNotices = { droppedRegexFlags: [] };
     expect(() => parseQueryObject('[/a/g]', notices)).toThrow();
     expect(notices.droppedRegexFlags).toEqual([]);
+  });
+});
+
+// #317: a bare integer past 2^53 was evaluated as a JS number during parsing,
+// so it reached the server rounded — `{counter: 9007199254740993}` became
+// ...992 and matched a different document, with no error and nothing on screen.
+describe('parseShellJson — 64-bit integer literals (#317)', () => {
+  const longAt = (text: string, key = 'counter') =>
+    parseShellJson(text)[key].$numberLong;
+
+  it('keeps an integer past 2^53 exact, in strict JSON and in shell syntax', () => {
+    expect(longAt('{"counter": 9007199254740993}')).toBe('9007199254740993');
+    expect(longAt('{counter: 9007199254740993}')).toBe('9007199254740993');
+  });
+
+  it('keeps a negative one exact, sign and all', () => {
+    expect(longAt('{counter: -9007199254740993}')).toBe('-9007199254740993');
+  });
+
+  it('reaches values nested in arrays and operators', () => {
+    expect(parseShellJson('{a: {$gt: 9007199254740993}}').a.$gt.$numberLong).toBe(
+      '9007199254740993'
+    );
+    expect(parseShellJson('{a: [9007199254740993]}').a[0].$numberLong).toBe(
+      '9007199254740993'
+    );
+  });
+
+  it('works alongside other shell syntax in the same query', () => {
+    // The mixed case is the one a strict-JSON fast path cannot reach, which is
+    // why this is fixed in the parser's input rather than at a call site.
+    const parsed = parseShellJson('{a: 9007199254740993, name: /x/i}');
+    expect(parsed.a.$numberLong).toBe('9007199254740993');
+    expect(parsed.name.$regularExpression.pattern).toBe('x');
+  });
+
+  it('handles the extremes of the 64-bit range', () => {
+    expect(longAt('{counter: 9223372036854775807}')).toBe('9223372036854775807');
+    expect(longAt('{counter: -9223372036854775808}')).toBe('-9223372036854775808');
+  });
+
+  it('leaves ordinary numbers exactly as they were', () => {
+    // The rewrite must be invisible to every query that does not need it —
+    // no `{a: 42}` quietly becoming a long.
+    expect(parseShellJson('{a: 42}')).toEqual({ a: 42 });
+    expect(parseShellJson('{a: 0}')).toEqual({ a: 0 });
+    expect(parseShellJson('{a: 1.5}')).toEqual({ a: 1.5 });
+    expect(parseShellJson('{a: 9007199254740991}')).toEqual({ a: 9007199254740991 });
+  });
+
+  it('leaves values that deliberately spell a double alone', () => {
+    // A fraction or an exponent is the user choosing a double; rewriting it
+    // would change the type they asked for.
+    expect(parseShellJson('{a: 1e30}').a).toBe(1e30);
+    expect(typeof parseShellJson('{a: 9007199254740993.5}').a).toBe('number');
+  });
+
+  it('does not touch digits inside strings or regexes', () => {
+    expect(parseShellJson('{note: "9007199254740993"}')).toEqual({
+      note: '9007199254740993',
+    });
+    expect(parseShellJson('{p: /9007199254740993/}').p.$regularExpression.pattern).toBe(
+      '9007199254740993'
+    );
+  });
+
+  it('leaves a value too large for a 64-bit long alone', () => {
+    // There is no lossless form to rewrite into, so it stays as it is rather
+    // than being truncated into a different wrong number.
+    expect(typeof parseShellJson('{a: 99999999999999999999999999}').a).toBe('number');
+  });
+
+  it('rewrites the value, not a numeric key', () => {
+    // `NumberLong("…")` is not valid in key position. A field name that long
+    // is written quoted in practice, and that path is exact.
+    expect(Object.keys(parseShellJson('{"9007199254740993": 1}'))).toEqual([
+      '9007199254740993',
+    ]);
+  });
+});
+
+// #318 review: the rewrite originally fired wherever a big integer appeared,
+// but the text around a literal decides what it means. Rewriting outside value
+// position ate operators and wrapped constructor arguments in themselves.
+describe('preserveBigIntegers — only rewrites in value position (#318 review)', () => {
+  it('leaves a spaced binary minus intact', () => {
+    // Was rewritten to `{a: 1 NumberLong("-9007199254740992")}`, which stopped
+    // parsing altogether — a valid query broken by a precision fix.
+    expect(preserveBigIntegers('{a: 1 - 9007199254740992}')).toBe(
+      '{a: 1 - 9007199254740992}'
+    );
+    expect(() => parseShellJson('{a: 1 - 9007199254740992}')).not.toThrow();
+  });
+
+  it('leaves other arithmetic operands alone', () => {
+    // Rewriting these would leave the parser doing arithmetic on a Long.
+    expect(preserveBigIntegers('{a: 1 + 9007199254740992}')).toBe(
+      '{a: 1 + 9007199254740992}'
+    );
+  });
+
+  it('does not wrap a constructor argument in another constructor', () => {
+    // `NumberLong(NumberLong("…"))` is not a thing. The quoted spelling is the
+    // exact one, and it is untouched because it is inside a string.
+    expect(preserveBigIntegers('{a: NumberLong(9007199254740993)}')).toBe(
+      '{a: NumberLong(9007199254740993)}'
+    );
+    expect(parseShellJson('{a: NumberLong("9007199254740993")}').a.$numberLong).toBe(
+      '9007199254740993'
+    );
+  });
+
+  it('leaves a parenthesised expression alone', () => {
+    expect(preserveBigIntegers('{a: (9007199254740993)}')).toBe(
+      '{a: (9007199254740993)}'
+    );
+  });
+
+  it('still treats a genuine leading minus as a sign', () => {
+    // The distinction is whether anything that could end an operand precedes
+    // the minus — here it is the `:`, so the minus belongs to the number.
+    expect(preserveBigIntegers('{a: -9007199254740993}')).toBe(
+      '{a: NumberLong("-9007199254740993")}'
+    );
+  });
+
+  it('rewrites after the punctuation that starts a value', () => {
+    expect(preserveBigIntegers('{a: [1, 9007199254740993]}')).toBe(
+      '{a: [1, NumberLong("9007199254740993")]}'
+    );
+    expect(preserveBigIntegers('counter: 9007199254740993')).toBe(
+      'counter: NumberLong("9007199254740993")'
+    );
+  });
+});
+
+// #318 review, round 2: a comment between the delimiter and the value left the
+// literal unrewritten, so a commented query kept rounding silently.
+describe('preserveBigIntegers — comments (#318 review)', () => {
+  const longOf = (text: string, key = 'counter') => parseShellJson(text)[key].$numberLong;
+
+  it('sees past a block comment before the value', () => {
+    expect(longOf('{counter: /* copied from shell */ 9007199254740993}')).toBe(
+      '9007199254740993'
+    );
+  });
+
+  it('sees past a line comment before the value', () => {
+    expect(longOf('{counter: // note\n 9007199254740993}')).toBe('9007199254740993');
+  });
+
+  it('still reads a sign correctly across a comment', () => {
+    expect(parseShellJson('{a: /* c */ -9007199254740993}').a.$numberLong).toBe(
+      '-9007199254740993'
+    );
+  });
+
+  it('does not mistake a comment for an operand when judging a binary minus', () => {
+    expect(preserveBigIntegers('{a: 1 /* c */ - 9007199254740992}')).toBe(
+      '{a: 1 /* c */ - 9007199254740992}'
+    );
+  });
+
+  it('does not mistake // inside a string for a comment', () => {
+    // The reason placement is judged on tracked tokens rather than by scanning
+    // the emitted text backwards: a URL would otherwise look like a comment and
+    // suppress a rewrite that should happen.
+    const parsed = parseShellJson('{url: "http://x.com", counter: 9007199254740993}');
+    expect(parsed.url).toBe('http://x.com');
+    expect(parsed.counter.$numberLong).toBe('9007199254740993');
+  });
+
+  it('still recognises a regex that follows a comment', () => {
+    const parsed = parseShellJson('{a: /* c */ /x/i, b: 9007199254740993}');
+    expect(parsed.a.$regularExpression.pattern).toBe('x');
+    expect(parsed.b.$numberLong).toBe('9007199254740993');
+  });
+});
+
+// #318 review, round 3: the key check only skipped whitespace, so a comment
+// before the colon hid the fact that the digits were a property name.
+describe('preserveBigIntegers — numeric keys with comments (#318 review)', () => {
+  it('leaves a numeric key alone when a comment precedes its colon', () => {
+    // Rewrote to `NumberLong("…"): 1`, which is not a property key, so a valid
+    // query stopped parsing. The value-position guard hid this at the start of
+    // an object; after a comma there is nothing else to catch it.
+    const text = '{a: 1, 9007199254740992 /* note */: 1}';
+    expect(preserveBigIntegers(text)).toBe(text);
+    expect(parseShellJson(text)).toEqual({ a: 1, '9007199254740992': 1 });
+  });
+
+  it('does the same for a line comment before the colon', () => {
+    const text = '{a: 1, 9007199254740992 // n\n: 1}';
+    expect(preserveBigIntegers(text)).toBe(text);
+    expect(parseShellJson(text)).toEqual({ a: 1, '9007199254740992': 1 });
+  });
+
+  it('still rewrites a value that follows a comma and a comment', () => {
+    // The key fix must not swallow the value case that shares the position.
+    expect(
+      parseShellJson('{a: 1, counter: /* c */ 9007199254740993}').counter.$numberLong
+    ).toBe('9007199254740993');
+  });
+});
+
+// #318 review, round 4: the mirror of the binary-minus case. Checking only what
+// PRECEDES a literal caught `{a: 1 + N}` but not `{a: N + 1}`.
+describe('preserveBigIntegers — literal as a left-hand operand (#318 review)', () => {
+  it('leaves a literal that an operator follows alone', () => {
+    // Rewriting made this `NumberLong("…") + 1`, and JS concatenated the long's
+    // toString — the query silently became the STRING "90071992547409931".
+    expect(preserveBigIntegers('{limit: 9007199254740993 + 1}')).toBe(
+      '{limit: 9007199254740993 + 1}'
+    );
+    expect(typeof parseShellJson('{limit: 9007199254740993 + 1}').limit).toBe('number');
+  });
+
+  it('does the same when a comment sits before the operator', () => {
+    expect(preserveBigIntegers('{a: 9007199254740993 /* c */ + 1}')).toBe(
+      '{a: 9007199254740993 /* c */ + 1}'
+    );
+  });
+
+  it('still rewrites where a value legitimately ends', () => {
+    // `}`, `]`, `,` and end-of-input all end a value; a trailing comment is
+    // skipped to find them.
+    expect(parseShellJson('{a: 9007199254740993}').a.$numberLong).toBe('9007199254740993');
+    expect(parseShellJson('{a: [9007199254740993, 1]}').a[0].$numberLong).toBe(
+      '9007199254740993'
+    );
+    expect(parseShellJson('{a: 9007199254740993, b: 1}').a.$numberLong).toBe(
+      '9007199254740993'
+    );
+    expect(parseShellJson('counter: 9007199254740993').counter.$numberLong).toBe(
+      '9007199254740993'
+    );
+    expect(parseShellJson('{a: 9007199254740993 /* trailing */}').a.$numberLong).toBe(
+      '9007199254740993'
+    );
+  });
+});
+
+// #318 review, round 5. Two findings assumed these were supported shell syntax.
+// They are not — the parser rejects both outright, with or without a big
+// integer — so neither query can run and the rewrite cannot be observed.
+//
+// Pinned rather than guarded, the same way the `d`/`v` regex flags are: adding
+// handling for syntax nothing accepts would be dead code that implies support
+// we do not have. If a parser upgrade ever makes these reachable, these tests
+// fail and the decision gets made deliberately instead of by accident.
+describe('parseShellJson — syntax this parser does not accept (#318 review)', () => {
+  it('rejects template literals, integer or not', () => {
+    expect(() => parseShellJson('{note: `hello`}')).toThrow();
+    expect(() => parseShellJson('{note: `[9007199254740993]`}')).toThrow();
+  });
+
+  it('rejects index expressions, integer or not', () => {
+    expect(() => parseShellJson('{a: [1][0]}')).toThrow();
+    expect(() => parseShellJson('{a: [9007199254740993][0] + 1}')).toThrow();
+  });
+
+  it('but does accept the arithmetic the operand rules are built around', () => {
+    // The contrast that makes the two above worth pinning: arithmetic really is
+    // supported, which is why the left/right operand cases were real bugs.
+    expect(parseShellJson('{a: 1 + 2}')).toEqual({ a: 3 });
+    expect(parseShellJson('{a: [1, 2]}')).toEqual({ a: [1, 2] });
   });
 });
