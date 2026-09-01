@@ -1471,3 +1471,59 @@ describe('DataGrid — trimming partial endpoints of a rebuilt copy (#319 review
     getSelection.mockRestore();
   });
 });
+
+// #322 review: a selection boundary can land on an ELEMENT, in which case its
+// offset counts child nodes rather than characters — clicking in the padding
+// right of a row's text does exactly that. Hand-counting text nodes had to
+// guess there, and chose either the start or the end of the line.
+describe('DataGrid — element selection boundaries (#322 review)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={[{ _id: 1, name: 'Alice', city: 'Paris', n: 2 }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  it('measures a boundary that sits past a row\'s last child', () => {
+    const view = openJsonView();
+    const rowText = (i: number) =>
+      view.querySelector(`[data-json-line="${i}"]`)!.textContent ?? '';
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    const startRow = view.querySelector('[data-json-line="1"]')!;
+    const endRow = view.querySelector('[data-json-line="3"]')!;
+
+    fireEvent.mouseDown(view);
+    // Both ends land on the row elements, offset counting children: 0 children
+    // in at the start, every child in at the end — i.e. the whole of row 3.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: startRow,
+      anchorOffset: 0,
+      focusNode: endRow,
+      focusOffset: endRow.childNodes.length,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 1 scrolls away, so the rebuild takes over.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: endRow,
+      anchorOffset: 0,
+      focusNode: endRow,
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+
+    // The end boundary is past every child of row 3, so that line is whole —
+    // previously the "descendant element" branch was the only one that gave a
+    // non-zero offset, and a boundary on the row itself collapsed to 0, which
+    // truncated the last line to nothing.
+    expect(lines).toHaveLength(3);
+    expect(lines[2].trim()).toBe(rowText(3));
+    getSelection.mockRestore();
+  });
+});

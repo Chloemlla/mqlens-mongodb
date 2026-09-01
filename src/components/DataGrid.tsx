@@ -1097,16 +1097,25 @@ export const DataGrid: React.FC<DataGridProps> = ({
     const row = el?.closest('[data-json-line]') ?? null;
     const index = Number(row?.getAttribute('data-json-line'));
     if (!row || !Number.isInteger(index)) return null;
-    let chars = 0;
-    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
-    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
-      if (text === node) return { row: index, offset: chars + offset };
-      chars += text.textContent?.length ?? 0;
+    // Measure with a Range rather than counting text nodes by hand, because
+    // `offset` means different things depending on what `node` is: characters
+    // when it is a text node, but a CHILD INDEX when the boundary lands on an
+    // element — which happens readily, e.g. clicking in the padding to the
+    // right of a row's text. Range.setEnd applies each rule correctly, and the
+    // text before that point is then just the range's length.
+    //
+    // Hand-counting had to guess at the element case and chose either the start
+    // or the end of the line, so an endpoint there could drop the final line or
+    // pull in a whole one nobody selected (#322 review).
+    const range = document.createRange();
+    range.selectNodeContents(row);
+    try {
+      range.setEnd(node!, offset);
+    } catch {
+      // Boundary outside this row, so nothing meaningful to measure.
+      return { row: index, offset: 0 };
     }
-    // An endpoint on an element rather than a text node: its offset counts
-    // child nodes, not characters, so fall back to the whole line instead of
-    // trimming at a position that does not mean what it appears to.
-    return { row: index, offset: node === row ? 0 : chars };
+    return { row: index, offset: range.toString().length };
   };
 
   /**
