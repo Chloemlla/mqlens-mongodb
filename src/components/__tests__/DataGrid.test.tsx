@@ -1527,3 +1527,81 @@ describe('DataGrid — element selection boundaries (#322 review)', () => {
     getSelection.mockRestore();
   });
 });
+// #320: a select-all puts its endpoints on <body>, outside the view, so no row
+// resolved, nothing was tracked, and the copy fell through to the browser —
+// which holds only the mounted rows. Same silent truncation as #311, on the
+// more natural way to copy a whole result set.
+describe('DataGrid — select-all copies every row (#320)', () => {
+  const manyDocs = Array.from({ length: 40 }, (_, i) => ({ _id: i, name: `n${i}` }));
+
+  const openJsonView = () => {
+    render(<DataGrid documents={manyDocs} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** A selection whose range encloses the whole document, as Cmd+A produces. */
+  const selectAll = () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.body);
+    return {
+      isCollapsed: false,
+      anchorNode: document.body,
+      anchorOffset: 0,
+      focusNode: document.body,
+      focusOffset: document.body.childNodes.length,
+      rangeCount: 1,
+      getRangeAt: () => range,
+    } as unknown as Selection;
+  };
+
+  it('rebuilds every line, not just the mounted ones', () => {
+    const view = openJsonView();
+    const mounted = view.querySelectorAll('[data-json-line]').length;
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+    // 40 documents is far more than a screenful, so this only passes if the
+    // rebuild reached rows the DOM never held.
+    expect(lines.length).toBeGreaterThan(mounted);
+    expect(lines[0]).toBe('{');
+    getSelection.mockRestore();
+  });
+
+  it('ignores a selection that does not enclose the view', () => {
+    // The trap in the obvious fix: treating any unresolvable endpoint as the
+    // view's bounds would claim rows for selections living elsewhere in the UI.
+    const view = openJsonView();
+    const elsewhere = document.createElement('div');
+    elsewhere.textContent = 'unrelated';
+    document.body.appendChild(elsewhere);
+    const range = document.createRange();
+    range.selectNodeContents(elsewhere);
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: elsewhere,
+      anchorOffset: 0,
+      focusNode: elsewhere,
+      focusOffset: 1,
+      rangeCount: 1,
+      getRangeAt: () => range,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).not.toHaveBeenCalled();
+
+    elsewhere.remove();
+    getSelection.mockRestore();
+  });
+});
