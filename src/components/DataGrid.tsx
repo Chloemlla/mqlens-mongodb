@@ -828,27 +828,39 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // visit to Explain every subsequent run reopened it and the Results tab had
   // to be clicked again each time (#281). The results effect below was already
   // guarded this way and so could not push back.
-  // Only skipped for a controlled caller, which owns the tab: overriding the
-  // choice it just handed us is the bug. An uncontrolled caller has expressed
-  // no preference, so opening a plan it passed at mount stays helpful.
-  const skipMountExplainSwitch = React.useRef(controlledActiveTab !== undefined);
+  // Both switches below compare against the previous value rather than counting
+  // mounts.
+  //
+  // A one-shot flag looks equivalent and is not: StrictMode runs each effect
+  // twice on mount, and the first setup spends the flag, so the replayed setup
+  // sees a guard that is already gone and fires anyway. That put this bug
+  // straight back for anyone running the app in development (#325 review).
+  // Comparing values is idempotent — a replay is simply not a change — so the
+  // guard survives however many times React chooses to run the effect.
+  //
+  // The seed carries the earlier decision. A controlled caller owns the tab, so
+  // mount must not override the choice it just handed us; an uncontrolled one
+  // has expressed no preference, and its long-standing contract is that a plan
+  // passed at mount opens it.
+  const lastExplainResult = React.useRef<string | null | undefined>(
+    controlledActiveTab !== undefined ? explainResult : undefined
+  );
   useEffect(() => {
-    if (skipMountExplainSwitch.current) {
-      skipMountExplainSwitch.current = false;
-      return;
-    }
+    const previous = lastExplainResult.current;
+    lastExplainResult.current = explainResult;
+    if (previous === explainResult) return;
     if (explainResult) {
       setActiveTab('explain');
     }
   }, [explainResult]);
 
-  // Automatically switch to results tab when new query results (documents) are loaded (skipping mount)
-  const isFirstRender = React.useRef(true);
+  // Switch to results when a new set of documents arrives — seeded with the
+  // current set so arriving at one does not count as a change.
+  const lastDocuments = React.useRef(documents);
   useEffect(() => {
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
+    const previous = lastDocuments.current;
+    lastDocuments.current = documents;
+    if (previous === documents) return;
     setActiveTab('results');
   }, [documents]);
 

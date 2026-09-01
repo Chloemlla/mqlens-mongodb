@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import React from 'react';
 import { render, screen, fireEvent, within } from '@testing-library/react';
 
 // Monaco renders the Query Code panel; mock it as a plain textarea (same shape
@@ -1686,5 +1687,72 @@ describe('DataGrid — a run started from Explain shows its results (#325 review
     // honours the tab it is given, and nothing here switches back.
     render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />);
     expect(screen.queryByTestId('json-view')).not.toBeInTheDocument();
+  });
+});
+
+// #325 review: StrictMode runs every effect twice on mount, and a one-shot
+// guard is spent by the first setup — so the replayed setup saw an already-gone
+// guard and fired anyway. The app mounts under StrictMode in development, so
+// the bug was fully back there.
+//
+// These assert on `onActiveTabChange` rather than on what is rendered. With a
+// controlled tab the rendered panel is unaffected by a stray switch — the
+// controlled prop still wins that render — so the damage travels out through
+// the callback, which is what the caller persists and hands back next time.
+describe('DataGrid — tab guards survive StrictMode replay (#325 review)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  const renderStrict = (ui: React.ReactElement) =>
+    render(<React.StrictMode>{ui}</React.StrictMode>);
+
+  it('does not announce an explain switch when it merely remounts', () => {
+    const onActiveTabChange = vi.fn();
+    renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).not.toHaveBeenCalledWith('explain');
+  });
+
+  it('does not announce a results switch either', () => {
+    // The documents guard had the same shape, so its replay could have pushed
+    // the tab the other way and lost a deliberate Explain selection.
+    const onActiveTabChange = vi.fn();
+    renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="explain"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).not.toHaveBeenCalledWith('results');
+  });
+
+  it('still opens explain when a plan genuinely arrives', () => {
+    const onActiveTabChange = vi.fn();
+    const { rerender } = renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={null}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    rerender(
+      <React.StrictMode>
+        <DataGrid
+          documents={mockDocuments}
+          explainResult={plan}
+          activeTab="results"
+          onActiveTabChange={onActiveTabChange}
+        />
+      </React.StrictMode>
+    );
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
   });
 });
