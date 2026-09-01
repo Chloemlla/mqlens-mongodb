@@ -47,3 +47,46 @@ describe('status colours use theme tokens (#282)', () => {
     expect(styles).toContain('bg-destructive');
   });
 });
+
+// #324 review: `chart-3` holds exactly the same value as `success` in every
+// built-in preset, so mapping rename events to it turned them the same green as
+// inserts — the change-stream table exists to tell operations apart at a
+// glance, and a token swap quietly undid that.
+describe('tokens chosen to differentiate stay visually distinct (#324 review)', () => {
+  const presets = readFileSync('src/lib/themes/presets.ts', 'utf8');
+
+  /** Every value a token takes across the presets file. */
+  const valuesOf = (token: string): string[] => {
+    // Hyphenated token names are quoted object keys in the presets file.
+    const key = token.includes('-') ? `"${token}"` : token;
+    const pattern = new RegExp(`${key}:\\s*"([^"]+)"`, 'g');
+    return [...presets.matchAll(pattern)].map((m) => m[1]);
+  };
+
+  it('gives each change-stream operation its own colour', () => {
+    const source = readFileSync('src/components/WatchPanel.tsx', 'utf8');
+    const styles = source.slice(
+      source.indexOf('const OPERATION_STYLES'),
+      source.indexOf('};', source.indexOf('const OPERATION_STYLES'))
+    );
+    // Distinct tokens only: `delete` and `drop` deliberately share
+    // `destructive`, since both are removals and reading alike is correct.
+    const used = [...new Set([...styles.matchAll(/rail: 'bg-([a-z0-9-]+)'/g)].map((m) => m[1]))];
+    expect(used.length).toBeGreaterThan(3);
+
+    // Compare per base (dark values first, then light) so a collision in either
+    // mode fails, rather than comparing across modes where overlap is expected.
+    const perToken = used.map(valuesOf).filter((values) => values.length > 0);
+    for (let i = 0; i < (perToken[0]?.length ?? 0); i++) {
+      const shades = perToken.map((values) => values[i]).filter(Boolean);
+      expect(new Set(shades).size).toBe(shades.length);
+    }
+  });
+
+  it('confirms the collision that prompted this: chart-3 is success', () => {
+    // Documents why rename uses chart-4. If these ever diverge, chart-3 becomes
+    // usable again and this test says so rather than leaving a stale rule.
+    expect(valuesOf('chart-3')).toEqual(valuesOf('success'));
+    expect(valuesOf('chart-4')).not.toEqual(valuesOf('success'));
+  });
+});

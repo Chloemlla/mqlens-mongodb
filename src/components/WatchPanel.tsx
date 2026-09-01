@@ -45,7 +45,7 @@ const OPERATION_STYLES: Record<string, { badge: string; rail: string }> = {
   replace: { badge: 'border-chart-1/40 bg-chart-1/10 text-chart-1', rail: 'bg-chart-1' },
   delete: { badge: 'border-destructive/40 bg-destructive/10 text-destructive', rail: 'bg-destructive' },
   drop: { badge: 'border-destructive/40 bg-destructive/10 text-destructive', rail: 'bg-destructive' },
-  rename: { badge: 'border-chart-3/40 bg-chart-3/10 text-chart-3', rail: 'bg-chart-3' },
+  rename: { badge: 'border-chart-4/40 bg-chart-4/10 text-chart-4', rail: 'bg-chart-4' },
   invalidate: { badge: 'border-muted-foreground/40 bg-muted text-muted-foreground', rail: 'bg-muted-foreground' },
 };
 
