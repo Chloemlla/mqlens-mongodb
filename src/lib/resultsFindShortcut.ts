@@ -47,16 +47,35 @@ let nextId = 1;
 let lastPointedId: number | null = null;
 let listening = false;
 
-/** Editors and text fields keep their own find/typing behaviour. */
-function eventBelongsToAnEditor(target: EventTarget | null): boolean {
+/**
+ * Anywhere the user types: an editor, a text field, a contenteditable.
+ *
+ * No exceptions — including the find bar's own input, which is a text field
+ * like any other. Every results-pane shortcut owes these the same deference,
+ * because inside one the key means something about its content: Cmd/Ctrl+A in
+ * a query editor means "select this query", and a pane that took it would be
+ * answering for something it does not own.
+ */
+export function isTextEntryContext(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
-  // The find bar's own input is a text field but is not somebody else's: the
-  // shortcut pressed inside it means "search here again", not "leave me alone".
-  if (target.closest(`[${RESULTS_FIND_INPUT_ATTR}]`)) return false;
   if (target.closest(".monaco-editor")) return true;
   const tag = target.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
   return target.closest('[contenteditable="true"]') !== null;
+}
+
+/**
+ * Text entry, as the FIND shortcut sees it — one exception to the above.
+ *
+ * The find bar's own input is a text field but is not somebody else's: Ctrl+F
+ * pressed with the caret already in it means "search here again", not "leave me
+ * alone". That exception belongs to find alone. Select-all in that input means
+ * "select the search text" like in any other field, so it uses the plain
+ * predicate instead (#328 review).
+ */
+function eventBelongsToAnEditor(target: EventTarget | null): boolean {
+  if (target instanceof Element && target.closest(`[${RESULTS_FIND_INPUT_ATTR}]`)) return false;
+  return isTextEntryContext(target);
 }
 
 /** The registered pane containing `node`, if any. */
@@ -88,8 +107,8 @@ function paneContaining(node: EventTarget | null): Pane | undefined {
  *
  * With several panes and no signal at all, nothing opens rather than all of them.
  */
-function targetPane(event: KeyboardEvent): Pane | undefined {
-  const fromTarget = paneContaining(event.target);
+function paneForEventTarget(target: EventTarget | null): Pane | undefined {
+  const fromTarget = paneContaining(target);
   if (fromTarget) return fromTarget;
 
   const fromFocus = paneContaining(document.activeElement);
@@ -97,17 +116,38 @@ function targetPane(event: KeyboardEvent): Pane | undefined {
 
   // Anything else focused belongs to another region, and the key is its business.
   const unfocused =
-    event.target === null ||
-    event.target === document.body ||
-    event.target === document ||
-    event.target === window;
+    target === null ||
+    target === document.body ||
+    target === document ||
+    target === window;
   if (!unfocused) return undefined;
 
   if (lastPointedId !== null) {
     const pane = panes.get(lastPointedId);
     if (pane?.element()) return pane;
   }
-  return panes.size === 1 ? [...panes.values()][0] : undefined;
+  return undefined;
+}
+
+/**
+ * Find is more generous than that: with a single pane on screen and nothing
+ * else indicating one, Cmd/Ctrl+F opens it.
+ *
+ * That generosity suits opening a find bar, which is harmless and obviously
+ * what the user meant. It does not suit a key that replaces the selection:
+ * pressing Cmd/Ctrl+A while working in the sidebar would select results the
+ * user was not looking at. So it stays here, with find, rather than in the
+ * shared resolver (#328 review).
+ */
+function targetPane(event: KeyboardEvent): Pane | undefined {
+  const pane = paneForEventTarget(event.target);
+  if (pane) return pane;
+  const unfocused =
+    event.target === null ||
+    event.target === document.body ||
+    event.target === document ||
+    event.target === window;
+  return unfocused && panes.size === 1 ? [...panes.values()][0] : undefined;
 }
 
 function onKeyDown(event: KeyboardEvent): void {
@@ -137,6 +177,14 @@ function onPointerDown(event: Event): void {
       return;
     }
   }
+  // Pointing somewhere else means the user has left: a pane the user pointed at
+  // ten minutes ago is not where they are now.
+  //
+  // This matters because most of the app is not focusable. Clicking a sidebar
+  // row moves focus nowhere, so the next keypress targets <body> and reads as
+  // "from nothing in particular" — and a remembered pane would answer for it,
+  // selecting results the user had already navigated away from (#328 review).
+  lastPointedId = null;
 }
 
 /**
@@ -169,27 +217,25 @@ export function registerResultsFindTarget(pane: Pane): () => void {
 }
 
 /**
- * The results pane the user is working in, by the same reckoning the shortcut
- * uses: the pane holding focus, else the one last pointed at, else the only one.
+ * The results pane an event is for, by exactly the reckoning the find shortcut
+ * uses — including its most important part, the event's own target.
  *
  * Exposed because "which pane is this for" is not a question about find. A copy
- * has to answer it too — several JSON views listen for the same select-all, and
- * one of them has to be the one that responds (#330 review). Keeping a second
- * notion of the active pane in the grid meant the two could disagree, and they
- * did: this one counts a click anywhere in the pane, its toolbar included, while
- * the grid's counted only clicks in the results body.
+ * has to answer it too, and so does select-all: several JSON views hear the same
+ * document-level event, and one of them has to be the one that responds (#330).
+ * Keeping a second notion of the active pane in the grid meant the two could
+ * disagree, and they did.
  *
- * `null` when nothing indicates a pane and there is more than one, which is the
- * honest answer — the caller decides what to do without a preference.
+ * Taking the target rather than only reading focus is what keeps a pane from
+ * answering for the rest of the app. An event from somewhere else that happens
+ * to be focused belongs to that somewhere else; only an event from nothing in
+ * particular falls back to the pane last pointed at (#328 review).
+ *
+ * `null` when nothing indicates a pane, which is the honest answer — the caller
+ * decides what to do without a preference.
  */
-export function activeResultsPaneElement(): HTMLElement | null {
-  const fromFocus = paneContaining(document.activeElement);
-  if (fromFocus) return fromFocus.element();
-  if (lastPointedId !== null) {
-    const el = panes.get(lastPointedId)?.element();
-    if (el) return el;
-  }
-  return panes.size === 1 ? [...panes.values()][0].element() : null;
+export function resultsPaneElementForEvent(target: EventTarget | null): HTMLElement | null {
+  return paneForEventTarget(target)?.element() ?? null;
 }
 
 /** Reset module state between tests. */

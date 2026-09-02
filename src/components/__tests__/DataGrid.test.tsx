@@ -1571,6 +1571,158 @@ describe('DataGrid — select-all copies every row (#320)', () => {
     } as unknown as Selection;
   };
 
+  // #328 root cause: the app sets `user-select: none` on `body`, and under that
+  // Chromium paints a select-all across the rows while reporting the selection
+  // to script as collapsed and empty. The browser had nothing to copy and
+  // neither did the rebuild, so the clipboard was left untouched.
+  //
+  // These use the real Selection API rather than a mocked one. That is the
+  // point: every earlier test mocked `getSelection()` to return a non-collapsed
+  // range over `document.body` — precisely the state the browser does not
+  // produce — so they passed while the app did nothing at all.
+  describe('the select-all shortcut makes a selection the page can see (#328)', () => {
+    const pressSelectAll = (target: EventTarget) => {
+      const event = new KeyboardEvent('keydown', {
+        key: 'a',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      target.dispatchEvent(event);
+      return event;
+    };
+
+    it('claims the key and selects the view, leaving a real range behind', () => {
+      const view = openJsonView();
+      document.getSelection()?.removeAllRanges();
+
+      const event = pressSelectAll(view);
+
+      expect(event.defaultPrevented).toBe(true);
+      const selection = document.getSelection()!;
+      expect(selection.rangeCount).toBe(1);
+      expect(selection.isCollapsed).toBe(false);
+      expect(view.contains(selection.anchorNode)).toBe(true);
+      expect(view.contains(selection.focusNode)).toBe(true);
+    });
+
+    it('rebuilds every row from that selection, including unmounted ones', () => {
+      const view = openJsonView();
+      const mounted = view.querySelectorAll('[data-json-line]').length;
+      document.getSelection()?.removeAllRanges();
+
+      pressSelectAll(view);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const setData = vi.fn();
+      fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+      expect(setData).toHaveBeenCalledTimes(1);
+      const lines = setData.mock.calls[0][1].split('\n');
+      expect(lines.length).toBeGreaterThan(mounted);
+      expect(lines[0]).toBe('{');
+    });
+
+    it('leaves the key to a text field or an editor', () => {
+      // Cmd/Ctrl+A in a query editor means "select this query". A pane that
+      // took it would be answering for something it does not own.
+      openJsonView();
+      const input = document.body.appendChild(document.createElement('input'));
+      expect(pressSelectAll(input).defaultPrevented).toBe(false);
+
+      const editor = document.body.appendChild(document.createElement('div'));
+      editor.className = 'monaco-editor';
+      const inner = editor.appendChild(document.createElement('span'));
+      expect(pressSelectAll(inner).defaultPrevented).toBe(false);
+    });
+
+    it('leaves the key to the results find bar, which is a text field like any other', () => {
+      // The find shortcut deliberately treats its own input as NOT an editor, so
+      // Ctrl+F with the caret already in it means 'search here again'. That
+      // exception is find's alone: select-all in that input means select the
+      // search text, and taking it would leave the user unable to (#328 review).
+      //
+      // The bar is mounted INSIDE the pane, where it really lives. Outside it the
+      // pane declines on ownership instead, and the test would pass without ever
+      // reaching the predicate it is about.
+      const container = document.body.appendChild(document.createElement('div'));
+      render(<DataGrid documents={manyDocs} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      const bar = container.firstElementChild!.appendChild(document.createElement('div'));
+      bar.setAttribute('data-results-find-input', '');
+      const input = bar.appendChild(document.createElement('input'));
+
+      expect(pressSelectAll(input).defaultPrevented).toBe(false);
+    });
+
+    it('leaves the key to a non-editor element in another part of the app', () => {
+      // A focused control elsewhere — a sidebar row, a button — is not nothing in
+      // particular, so the pane must not answer for it just because it was the
+      // last one pointed at. Reading focus alone let a single pane claim
+      // Ctrl/Cmd+A for the whole window (#328 review).
+      const view = openJsonView();
+      selectPane(view.closest('div')!.parentElement ?? view);
+      const elsewhere = document.body.appendChild(document.createElement('div'));
+      elsewhere.tabIndex = 0;
+      document.getSelection()?.removeAllRanges();
+
+      const event = pressSelectAll(elsewhere);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(document.getSelection()?.rangeCount ?? 0).toBe(0);
+    });
+
+
+    it('lets go of the key once the user clicks away from the pane', () => {
+      // The case the app showed and the test above missed. Most of the app is
+      // not focusable: clicking a sidebar row moves focus nowhere, so the next
+      // keypress targets <body> and reads as "from nothing in particular" —
+      // which the last-pointed fallback then answered with a pane the user had
+      // already left, selecting results they were not looking at (#328 review).
+      //
+      // The earlier test dispatched on a focusable element, so it took the
+      // target-is-in-another-region branch and never reached this one.
+      const container = document.body.appendChild(document.createElement('div'));
+      render(<DataGrid documents={manyDocs} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      selectPane(container);
+
+      const elsewhere = document.body.appendChild(document.createElement('div'));
+      fireEvent.pointerDown(elsewhere);
+      document.getSelection()?.removeAllRanges();
+
+      // Focus went nowhere, so the key arrives at the body.
+      const event = pressSelectAll(document.body);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(document.getSelection()?.rangeCount ?? 0).toBe(0);
+    });
+
+
+    it('leaves the key to whichever pane the user is working in', () => {
+      const mount = (docs: unknown[]) => {
+        const container = document.body.appendChild(document.createElement('div'));
+        render(<DataGrid documents={docs as any} />, { container });
+        fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+        return { container, view: within(container).getByTestId('json-view') };
+      };
+      const left = mount(manyDocs);
+      const right = mount(manyDocs);
+      // The user selects the right-hand pane.
+      selectPane(right.container);
+      document.getSelection()?.removeAllRanges();
+
+      // The key arrives at the document, not at either view.
+      pressSelectAll(document.body);
+
+      const selection = document.getSelection()!;
+      expect(selection.rangeCount).toBe(1);
+      expect(right.view.contains(selection.anchorNode)).toBe(true);
+      expect(left.view.contains(selection.anchorNode)).toBe(false);
+    });
+  });
+
+
   it('rebuilds every line, not just the mounted ones', () => {
     const view = openJsonView();
     const mounted = view.querySelectorAll('[data-json-line]').length;
