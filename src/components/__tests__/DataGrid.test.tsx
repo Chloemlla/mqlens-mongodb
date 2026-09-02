@@ -1533,6 +1533,21 @@ describe('DataGrid — element selection boundaries (#322 review)', () => {
 // which holds only the mounted rows. Same silent truncation as #311, on the
 // more natural way to copy a whole result set.
 describe('DataGrid — select-all copies every row (#320)', () => {
+  beforeEach(() => resetResultsFindShortcutForTests());
+
+  /**
+   * Select a pane the way a user does: a pointer press inside it.
+   *
+   * Deliberately on a toolbar control rather than on the rows, because that is
+   * the case the old code got wrong. Ownership was recorded from a `mousedown`
+   * on the JSON body alone, so clicking a pane's toolbar — switching it to JSON
+   * is itself such a click — selected that pane for every other purpose while a
+   * copy still went to the pane before it (#330 review).
+   */
+  const selectPane = (container: HTMLElement) => {
+    fireEvent.pointerDown(within(container).getAllByRole('button')[0]);
+  };
+
   const manyDocs = Array.from({ length: 40 }, (_, i) => ({ _id: i, name: `n${i}` }));
 
   const openJsonView = () => {
@@ -1564,8 +1579,14 @@ describe('DataGrid — select-all copies every row (#320)', () => {
     getSelection.mockReturnValue(selectAll());
     document.dispatchEvent(new Event('selectionchange'));
 
+    // Dispatched on <body>, because that is where the browser dispatches it.
+    // A copy event targets the element holding the selection's focus, and this
+    // selection's focus is <body> — an ancestor of the React root, so a
+    // handler on the view is never reached and nothing was copied at all
+    // (#328). Aiming this at `view` instead is what let the bug ship: it
+    // proved the rebuild works while stepping over the delivery it depends on.
     const setData = vi.fn();
-    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
 
     expect(setData).toHaveBeenCalledTimes(1);
     const lines = setData.mock.calls[0][1].split('\n');
@@ -1576,10 +1597,149 @@ describe('DataGrid — select-all copies every row (#320)', () => {
     getSelection.mockRestore();
   });
 
+  /** Two DataGrids side by side, each in its own container, as a split shows them. */
+  const openTwoJsonPanes = () => {
+    const mount = (docs: unknown[]) => {
+      const container = document.body.appendChild(document.createElement('div'));
+      const result = render(<DataGrid documents={docs as any} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      return { result, container, view: within(container).getByTestId('json-view') };
+    };
+    // Both panes hold more than a screenful, so both need the rebuild — with a
+    // pane small enough to be fully mounted, the grid rightly stands aside and
+    // lets the browser copy, which would prove nothing about ownership.
+    const rightDocs = Array.from({ length: 40 }, (_, i) => ({ _id: i, name: `only-in-right-${i}` }));
+    return { left: mount(manyDocs), right: mount(rightDocs) };
+  };
+
+  it('has exactly one of two open JSON panes answer a select-all', () => {
+    // #330 review: a split workspace shows two JSON views, each listening on the
+    // document because that is where a select-all is dispatched. Both saw the
+    // enclosing selection, both wrote to the clipboard, and the second silently
+    // replaced the first — so Cmd+C copied whichever grid mounted last rather
+    // than the pane the user was working in.
+    const { right } = openTwoJsonPanes();
+
+    // The user is working in the right-hand pane.
+    selectPane(right.container);
+
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    // One writer, and it is the pane that was clicked — not the last to mount.
+    expect(setData).toHaveBeenCalledTimes(1);
+    expect(setData.mock.calls[0][1]).toContain('only-in-right-0');
+    getSelection.mockRestore();
+  });
+
+  it('rebuilds for the owning pane even when every row is mounted', () => {
+    // #330 review: with both panes small enough to be fully mounted, the owner
+    // took the "let the browser do it" path — and the browser serializes the
+    // whole enclosing selection, so the copy came back with both panes' text.
+    // Standing aside only makes sense when the selection lives inside the view;
+    // an enclosing one covers the page.
+    //
+    // The earlier split tests used 40 documents each, which forced the rebuild
+    // and stepped straight over this path.
+    const mount = (docs: unknown[]) => {
+      const container = document.body.appendChild(document.createElement('div'));
+      const result = render(<DataGrid documents={docs as any} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      return { result, container, view: within(container).getByTestId('json-view') };
+    };
+    const left = mount([{ _id: 'left-doc' }]);
+    const right = mount([{ _id: 'right-doc' }]);
+    // Precondition: both panes really are fully mounted, or this proves nothing.
+    expect(left.view.querySelectorAll('[data-json-line]').length).toBeGreaterThan(0);
+    expect(right.view.querySelectorAll('[data-json-line]').length).toBeGreaterThan(0);
+
+    selectPane(right.container);
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    const copied = setData.mock.calls[0][1];
+    expect(copied).toContain('right-doc');
+    expect(copied).not.toContain('left-doc');
+    getSelection.mockRestore();
+  });
+
+
+  it('leaves a copy alone when the user is in a pane showing explain', () => {
+    // #330 review: registration used to be scoped to the results tab, so a pane
+    // showing explain vanished from the registry. Clicking it selected no pane,
+    // the fallback handed ownership to the other, still-registered pane, and a
+    // select-all over the explain output came back as that pane's rows instead.
+    const mountJson = () => {
+      const container = document.body.appendChild(document.createElement('div'));
+      render(<DataGrid documents={manyDocs} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      return container;
+    };
+    const mountExplain = () => {
+      const container = document.body.appendChild(document.createElement('div'));
+      render(
+        <DataGrid documents={[{ _id: 1 }]} explainResult='{"queryPlanner": {}}' />,
+        { container }
+      );
+      fireEvent.click(within(container).getByRole('button', { name: /explain/i }));
+      return container;
+    };
+    mountJson();
+    const explainPane = mountExplain();
+
+    // The user is working in the explain pane.
+    selectPane(explainPane);
+
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    // Nobody rewrites the clipboard: the browser copies the explain text the
+    // user actually selected.
+    expect(setData).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+
+  it('lets the surviving pane answer once the other one closes', () => {
+    // The pane holding ownership can be closed. It will never answer again, and
+    // the one still on screen must not go on deferring to it (#330 review).
+    const { right } = openTwoJsonPanes();
+    selectPane(right.container);
+    right.result.unmount();
+
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    expect(setData.mock.calls[0][1]).not.toContain('only-in-right-0');
+    getSelection.mockRestore();
+  });
   it('ignores a selection that does not enclose the view', () => {
     // The trap in the obvious fix: treating any unresolvable endpoint as the
     // view's bounds would claim rows for selections living elsewhere in the UI.
-    const view = openJsonView();
+    // Listening on the document makes this the load-bearing case rather than a
+    // hypothetical one — every copy in the app now reaches this handler, so a
+    // copy from the query editor has to leave with the text it selected.
+    // Rendered, and deliberately not referenced again: the point is that the
+    // view is listening and still declines this copy.
+    openJsonView();
     const elsewhere = document.createElement('div');
     elsewhere.textContent = 'unrelated';
     document.body.appendChild(elsewhere);
@@ -1599,11 +1759,37 @@ describe('DataGrid — select-all copies every row (#320)', () => {
     document.dispatchEvent(new Event('selectionchange'));
 
     const setData = vi.fn();
-    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    fireEvent.copy(elsewhere, { clipboardData: { setData, getData: () => '' } });
     expect(setData).not.toHaveBeenCalled();
 
     elsewhere.remove();
     getSelection.mockRestore();
+  });
+});
+
+// #329: the row's copy/edit/delete buttons sit inside its selectable text so
+// they stay next to the document they act on. They hold no text, so a copy that
+// ran over them serialised each one as an empty block and every document
+// arrived with three blank lines under its opening brace. jsdom does not
+// serialise a selection, so what is pinned here is the arrangement that decides
+// it: the controls opt out of selection, and nothing forces them back in.
+describe('DataGrid — row actions stay out of copied text (#329)', () => {
+  it('marks the row actions unselectable and leaves the text selectable', () => {
+    render(<DataGrid documents={mockDocuments} onEditDocument={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+
+    const actions = screen.getAllByTestId('edit-doc-btn')[0].closest('span');
+    expect(actions).not.toBeNull();
+    expect(actions!.className).toContain('select-none');
+
+    // The text they live in still selects — the fix must not cost the view the
+    // selection it exists to allow, since `body` sets `user-select: none` for
+    // the whole app and this span is what opts back in.
+    const text = actions!.parentElement!;
+    expect(text.className).toContain('select-text');
+    // And it must not re-enable selection for its descendants wholesale: that
+    // blanket rule outranked the controls' `select-none` and was the bug.
+    expect(text.className).not.toContain('[&_*]:select-text');
   });
 });
 

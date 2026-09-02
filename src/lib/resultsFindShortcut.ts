@@ -29,6 +29,17 @@ interface Pane {
   element: () => HTMLElement | null;
   /** Called when this pane should open its find bar. */
   open: () => void;
+  /**
+   * Whether the find bar is reachable in this pane right now.
+   *
+   * Separate from being registered, because the two questions are different:
+   * "which pane is the user in" is true of every pane always, while "can this
+   * one open a find bar" is only true while its results tab is showing. A pane
+   * that unregistered itself on the explain tab was invisible here, so the
+   * user's click landed on no pane and the next question — which pane owns a
+   * copy — was answered with somebody else's (#330 review).
+   */
+  canOpenFind?: () => boolean;
 }
 
 const panes = new Map<number, Pane>();
@@ -107,7 +118,9 @@ function onKeyDown(event: KeyboardEvent): void {
   if (eventBelongsToAnEditor(event.target)) return;
 
   const pane = targetPane(event);
-  if (!pane) return;
+  // A pane with no find bar to open leaves the key alone rather than claiming
+  // it and doing nothing — the browser's own find is the better fallback.
+  if (!pane || pane.canOpenFind?.() === false) return;
   // Only now: leaving the key to the browser — and to Sidebar's own Cmd/Ctrl+F,
   // which stands down on defaultPrevented — when no pane claims it.
   event.preventDefault();
@@ -153,6 +166,30 @@ export function registerResultsFindTarget(pane: Pane): () => void {
       listening = false;
     }
   };
+}
+
+/**
+ * The results pane the user is working in, by the same reckoning the shortcut
+ * uses: the pane holding focus, else the one last pointed at, else the only one.
+ *
+ * Exposed because "which pane is this for" is not a question about find. A copy
+ * has to answer it too — several JSON views listen for the same select-all, and
+ * one of them has to be the one that responds (#330 review). Keeping a second
+ * notion of the active pane in the grid meant the two could disagree, and they
+ * did: this one counts a click anywhere in the pane, its toolbar included, while
+ * the grid's counted only clicks in the results body.
+ *
+ * `null` when nothing indicates a pane and there is more than one, which is the
+ * honest answer — the caller decides what to do without a preference.
+ */
+export function activeResultsPaneElement(): HTMLElement | null {
+  const fromFocus = paneContaining(document.activeElement);
+  if (fromFocus) return fromFocus.element();
+  if (lastPointedId !== null) {
+    const el = panes.get(lastPointedId)?.element();
+    if (el) return el;
+  }
+  return panes.size === 1 ? [...panes.values()][0].element() : null;
 }
 
 /** Reset module state between tests. */
