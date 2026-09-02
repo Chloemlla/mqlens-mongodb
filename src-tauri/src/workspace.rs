@@ -64,6 +64,14 @@ pub struct TabModel {
     pub last_aggregate: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builder_state: Option<serde_json::Value>,
+    /// An unsaved document edit, so moving this tab to another window carries
+    /// the text instead of discarding it (#326 review). The destination
+    /// materializes the tab from here, which is why the draft has to travel in
+    /// the model rather than in the move op. Opaque to this crate; see
+    /// `carriedDocumentEdit` in persistence.ts for what is deliberately left
+    /// behind — a save in flight belongs to the window that started it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_edit: Option<serde_json::Value>,
 }
 
 /// A node in the split-pane layout tree.
@@ -234,6 +242,8 @@ pub enum WorkspaceOp {
         last_aggregate: Option<Option<serde_json::Value>>,
         #[serde(default, deserialize_with = "deserialize_some")]
         builder_state: Option<Option<serde_json::Value>>,
+        #[serde(default, deserialize_with = "deserialize_some")]
+        document_edit: Option<Option<serde_json::Value>>,
     },
     /// Moves an already-open tab from wherever it currently lives (found by
     /// scanning ALL windows — the op itself doesn't name a source) into
@@ -859,7 +869,7 @@ fn apply_layout_op(ws: &mut Workspace, op: WorkspaceOp) {
                 }
             }
         }
-        WorkspaceOp::UpdateTabState { tab_id, last_query, last_aggregate, builder_state } => {
+        WorkspaceOp::UpdateTabState { tab_id, last_query, last_aggregate, builder_state, document_edit } => {
             if let Some(t) = ws.tabs.iter_mut().find(|t| &t.id == tab_id) {
                 // `patch` is `&Option<Value>` here: present-but-null (`Some(None)`
                 // on the op) clears the field; present-with-value sets it.
@@ -879,6 +889,15 @@ fn apply_layout_op(ws: &mut Workspace, op: WorkspaceOp) {
                 if let Some(patch) = builder_state {
                     if &t.builder_state != patch {
                         t.builder_state = patch.clone();
+                        changed = true;
+                    }
+                }
+                // Present-and-null is how closing an edit clears the draft, so
+                // a tab moved afterwards does not arrive carrying text the user
+                // already finished with.
+                if let Some(patch) = document_edit {
+                    if &t.document_edit != patch {
+                        t.document_edit = patch.clone();
                         changed = true;
                     }
                 }
@@ -1166,8 +1185,28 @@ pub fn load_from_file(path: &Path) -> Option<Workspace> {
 /// mid-`fs::write` left a corrupt file that `load_from_file` would then fail
 /// to parse (or fail `validate`) on every future boot, until the user
 /// deleted it by hand.
+/// The workspace as it goes to disk: every in-progress document edit dropped.
+///
+/// A draft has to be in the store for a tab to change window — the destination
+/// builds the tab from there — but it does not have to outlive the session, and
+/// `workspace.json` is plaintext. Keeping an unsaved document body (its
+/// `targetDoc` is a whole document) in a file that sits on disk indefinitely is
+/// a bigger promise than the feature needs: the draft exists to survive a move,
+/// not a reinstall.
+///
+/// So it lives in memory, where every window reads it, and stops there. A
+/// restart opens with no editors, exactly as before drafts travelled at all
+/// (#326 review).
+fn without_document_edits(ws: &Workspace) -> Workspace {
+    let mut copy = ws.clone();
+    for tab in &mut copy.tabs {
+        tab.document_edit = None;
+    }
+    copy
+}
+
 pub fn save_to_file(path: &Path, ws: &Workspace) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(ws)
+    let content = serde_json::to_string_pretty(&without_document_edits(ws))
         .map_err(|e| format!("Failed to serialize workspace: {}", e))?;
     let mut tmp_os = path.as_os_str().to_os_string();
     tmp_os.push(".tmp");
@@ -1705,6 +1744,7 @@ mod tests {
             last_query: None,
             last_aggregate: None,
             builder_state: None,
+            document_edit: None,
         }
     }
 
@@ -1729,6 +1769,76 @@ mod tests {
         assert_eq!(ws.revision, rev_before + 1);
     }
 
+
+    /// #326 review: a tab moved to another window is rebuilt there from this
+    /// model, so an unsaved document edit has to live on the model or the move
+    /// discards it. Closing the edit sends an explicit null — absent would mean
+    /// "untouched" and leave a finished draft behind for the next move to carry.
+    #[test]
+    fn update_tab_state_carries_and_clears_a_document_edit() {
+        let mut ws = ws_with(&["t1"]);
+        ws.tabs.push(sample_tab("t1"));
+        let draft = serde_json::json!({
+            "mode": "edit",
+            "initialJson": "{\"_id\":\"1\"}",
+            "targetDoc": {"_id": "1"},
+            "draft": "{\"_id\":\"1\",\"name\":\"half typed\"}"
+        });
+
+        apply(
+            &mut ws,
+            WorkspaceOp::UpdateTabState {
+                tab_id: "t1".into(),
+                last_query: None,
+                last_aggregate: None,
+                builder_state: None,
+                document_edit: Some(Some(draft.clone())),
+            },
+        );
+        assert_eq!(ws.tabs[0].document_edit, Some(draft.clone()));
+        assert_eq!(ws.revision, 1);
+
+        // Re-sending the same draft changes nothing — a keystroke that lands on
+        // the same text must not bump the revision and wake every window.
+        apply(
+            &mut ws,
+            WorkspaceOp::UpdateTabState {
+                tab_id: "t1".into(),
+                last_query: None,
+                last_aggregate: None,
+                builder_state: None,
+                document_edit: Some(Some(draft)),
+            },
+        );
+        assert_eq!(ws.revision, 1);
+
+        // A patch that does not mention it leaves the draft alone.
+        apply(
+            &mut ws,
+            WorkspaceOp::UpdateTabState {
+                tab_id: "t1".into(),
+                last_query: Some(Some(serde_json::json!({"filter": "{}"}))),
+                last_aggregate: None,
+                builder_state: None,
+                document_edit: None,
+            },
+        );
+        assert!(ws.tabs[0].document_edit.is_some());
+
+        // Closing the edit clears it.
+        apply(
+            &mut ws,
+            WorkspaceOp::UpdateTabState {
+                tab_id: "t1".into(),
+                last_query: None,
+                last_aggregate: None,
+                builder_state: None,
+                document_edit: Some(None),
+            },
+        );
+        assert_eq!(ws.tabs[0].document_edit, None);
+    }
+
     #[test]
     fn update_tab_state_patches_selected_fields_only() {
         let mut ws = ws_with(&["t1"]);
@@ -1744,6 +1854,7 @@ mod tests {
                 last_query: None, // absent from the patch: untouched
                 last_aggregate: Some(Some(serde_json::json!([{"$match": {}}]))), // present: set
                 builder_state: None,
+                document_edit: None,
             },
         );
         let t = &ws.tabs[0];
@@ -1762,6 +1873,7 @@ mod tests {
                 last_query: None,
                 last_aggregate: Some(Some(serde_json::json!([{"$match": {}}]))),
                 builder_state: None,
+                document_edit: None,
             },
         );
         assert_eq!(ws.revision, rev_before);
@@ -1784,6 +1896,7 @@ mod tests {
                 last_query: None,
                 last_aggregate: Some(None), // explicit null: clear
                 builder_state: None,
+                document_edit: None,
             },
         );
         assert_eq!(ws.tabs[0].last_aggregate, None);
@@ -1804,6 +1917,7 @@ mod tests {
                 last_query: None, // absent: untouched, NOT cleared
                 last_aggregate: None,
                 builder_state: None,
+                document_edit: None,
             },
         );
         assert_eq!(ws.tabs[0].last_query, Some(serde_json::json!({"filter": "{}"})));
@@ -1822,6 +1936,7 @@ mod tests {
                 last_query: None,
                 last_aggregate: Some(None), // explicit null on an already-None field: no-op
                 builder_state: None,
+                document_edit: None,
             },
         );
         assert_eq!(ws.tabs[0].last_aggregate, None);
@@ -2094,6 +2209,7 @@ mod tests {
                 last_query: Some(serde_json::json!({ "filter": {} })),
                 last_aggregate: None,
                 builder_state: None,
+                document_edit: None,
             }
         }
 
@@ -2170,6 +2286,7 @@ mod tests {
                 last_query: Some(Some(patched_query.clone())),
                 last_aggregate: None,
                 builder_state: None,
+                document_edit: None,
             },
         );
 
@@ -2821,6 +2938,50 @@ mod store {
         );
     }
 
+    /// #326 review: a draft has to reach the store so a tab can carry it to
+    /// another window, but `workspace.json` is plaintext and long-lived. The
+    /// document stays in memory, where every window reads it, and never lands
+    /// in the file.
+    #[test]
+    fn save_to_file_keeps_document_edits_out_of_the_file() {
+        let path = tmp_path("no-drafts-on-disk.json");
+        let mut ws = sample_ws();
+        ws.tabs.push(TabModel {
+            id: "a".into(),
+            tab_type: "collection".into(),
+            profile_id: "p1".into(),
+            profile_name: "Profile 1".into(),
+            db: "mydb".into(),
+            collection: "mycoll".into(),
+            index_name: None,
+            last_query: Some(serde_json::json!({"filter": "{}"})),
+            last_aggregate: None,
+            builder_state: None,
+            document_edit: Some(serde_json::json!({
+                "id": "edit-1",
+                "mode": "edit",
+                "draft": "{\"ssn\":\"not for the disk\"}"
+            })),
+        });
+
+        save_to_file(&path, &ws).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("not for the disk"),
+            "an unsaved document body must not be written to workspace.json:\n{raw}"
+        );
+        assert!(!raw.contains("documentEdit"), "the key itself should be absent too");
+
+        // Everything else still persists, and the in-memory copy is untouched:
+        // this is a serialization choice, not a mutation of the store.
+        let loaded = load_from_file(&path).unwrap();
+        assert_eq!(loaded.tabs[0].last_query, Some(serde_json::json!({"filter": "{}"})));
+        assert_eq!(loaded.tabs[0].document_edit, None);
+        assert!(ws.tabs[0].document_edit.is_some());
+
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn save_to_file_writes_atomically_via_tmp_rename() {
         // Fix 5 (#97 phase 2 final review): `save_to_file` must land the
@@ -3060,6 +3221,7 @@ mod broadcast {
                     last_query: Some(Some(serde_json::json!({"x": 1}))),
                     last_aggregate: None,
                     builder_state: None,
+                    document_edit: None,
                 },
             ),
         ];
@@ -3076,6 +3238,7 @@ mod broadcast {
                 last_query: None,
                 last_aggregate: None,
                 builder_state: None,
+                document_edit: None,
             });
             let payload = apply_and_describe(&mut ws, op, "main".into());
             let payload = payload.unwrap_or_else(|| panic!("`{name}` was expected to change state"));
