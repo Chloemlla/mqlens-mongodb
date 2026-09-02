@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const invokeMock = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 
-import { updateTabState, resetUpdateTabStateDebounce, workspaceApply, workspaceGet, actionToOp } from '../workspaceStore';
+import { updateTabState, flushTabState, cancelTabState, hasPendingDocumentEdit, applyTabOp, renameTabState, resetUpdateTabStateDebounce, workspaceApply, workspaceGet, actionToOp } from '../workspaceStore';
 import { toPersistedTab, toProfileSpaceId, type PersistableConnection } from '../persistence';
 import type { WorkspaceAction } from '../model';
 
@@ -53,6 +53,246 @@ describe('workspaceStore', () => {
       origin: 'main',
     });
   });
+
+  it('flushTabState sends a pending patch immediately, and only once', () => {
+    // #326 review: a cross-window move is issued immediately and is
+    // backend-authoritative, so the destination reads the tab as the backend
+    // has it right then. A draft still sitting in the debounce would not be
+    // there — and the flush that followed is not a cross-window op, so the
+    // destination would never reconcile it.
+    updateTabState('t1', { documentEdit: { draft: '{"name":"half typed"}' } });
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    flushTabState('t1');
+    expect(invokeMock).toHaveBeenCalledWith('workspace_apply', {
+      op: { type: 'update_tab_state', tab_id: 't1', document_edit: { draft: '{"name":"half typed"}' } },
+      origin: 'main',
+    });
+
+    // The timer it pre-empted must not fire a second write.
+    vi.advanceTimersByTime(500);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushTabState is a no-op for a tab with nothing pending', () => {
+    flushTabState('t-nothing');
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it('flushTabState resolves only once the backend write settles', async () => {
+    // #326 review: a move is a separate backend command, so starting the flush
+    // first buys no ordering — the move could take the store first and snapshot
+    // the older draft. Callers await this, so it has to mean something.
+    let settle!: () => void;
+    invokeMock.mockImplementationOnce(() => new Promise<void>((r) => { settle = r; }));
+    updateTabState('t1', { documentEdit: { draft: '{"name":"Ada"}' } });
+
+    let done = false;
+    const flushed = flushTabState('t1').then(() => { done = true; });
+    await Promise.resolve();
+    expect(done).toBe(false);
+
+    settle();
+    await flushed;
+    expect(done).toBe(true);
+  });
+
+  it('keeps counting a draft when a second write for the tab overlaps it', async () => {
+    // #326 review: tracking one write per tab meant the second erased the
+    // first's record. A query-state update starting while a draft was still in
+    // flight made `hasPendingDocumentEdit` report false, and a move could go.
+    let settleDraft!: (v: unknown) => void;
+    invokeMock.mockImplementationOnce(() => new Promise((r) => { settleDraft = r; }));
+    updateTabState('t1', { documentEdit: { draft: '{"name":"Ada"}' } });
+    vi.advanceTimersByTime(500);
+    expect(hasPendingDocumentEdit('t1')).toBe(true);
+
+    // A second, unrelated write for the same tab while the first is away.
+    updateTabState('t1', { lastQuery: { filter: '{}' } });
+    vi.advanceTimersByTime(500);
+    expect(hasPendingDocumentEdit('t1')).toBe(true);
+
+    settleDraft(undefined);
+    await vi.waitFor(() => expect(hasPendingDocumentEdit('t1')).toBe(false));
+  });
+
+  it('runs a tab\'s writes one at a time, in the order they were issued', async () => {
+    // The close of a tab must not overtake a draft still on its way, and the
+    // reopen that reuses the id must not overtake the close (#326 review).
+    const order: string[] = [];
+    let settleFirst!: (v: unknown) => void;
+    invokeMock.mockImplementationOnce((_cmd: string, args: any) => {
+      order.push(`start:${args.op.type}`);
+      return new Promise((r) => { settleFirst = r; });
+    });
+    invokeMock.mockImplementation((_cmd: string, args: any) => {
+      order.push(`start:${args.op.type}`);
+      return Promise.resolve();
+    });
+
+    updateTabState('t1', { documentEdit: { draft: 'half typed' } });
+    vi.advanceTimersByTime(500);
+    expect(order).toEqual(['start:update_tab_state']);
+
+    // Issued while the draft write is still out; must not start yet.
+    const closed = applyTabOp(['t1'], { type: 'close_tab', tab_id: 't1' });
+    await Promise.resolve();
+    expect(order).toEqual(['start:update_tab_state']);
+
+    settleFirst(undefined);
+    await closed;
+    expect(order).toEqual(['start:update_tab_state', 'start:close_tab']);
+  });
+
+
+  it('renameTabState moves a queued patch onto the tab\'s new id', async () => {
+    // #326 review: a patch restored after a failed write is keyed by the id it
+    // was sent with. Rename the collection and that id is free again — reopen it
+    // later and the deterministic id returns with a renamed tab's draft still
+    // queued against it.
+    invokeMock.mockRejectedValueOnce(new Error('backend down'));
+    updateTabState('old-id', { documentEdit: { draft: 'half typed' } });
+    expect(await flushTabState('old-id')).toBe(false);
+    expect(hasPendingDocumentEdit('old-id')).toBe(true);
+
+    renameTabState('old-id', 'new-id');
+    expect(hasPendingDocumentEdit('old-id')).toBe(false);
+    expect(hasPendingDocumentEdit('new-id')).toBe(true);
+
+    invokeMock.mockClear();
+    vi.advanceTimersByTime(500);
+    expect(invokeMock).toHaveBeenCalledWith('workspace_apply', {
+      op: { type: 'update_tab_state', tab_id: 'new-id', document_edit: { draft: 'half typed' } },
+      origin: 'main',
+    });
+  });
+
+  it('renameTabState lets a value already queued under the new id win', () => {
+    updateTabState('old-id', { documentEdit: { draft: 'older' } });
+    updateTabState('new-id', { documentEdit: { draft: 'newer' } });
+    renameTabState('old-id', 'new-id');
+
+    invokeMock.mockClear();
+    vi.advanceTimersByTime(500);
+    const forNewId = invokeMock.mock.calls.filter(([, a]: any) => (a.op as any).tab_id === 'new-id');
+    expect(forNewId).toHaveLength(1);
+    expect((forNewId[0][1].op as any).document_edit).toEqual({ draft: 'newer' });
+  });
+
+  it('renameTabState disowns a write still out under the old id', async () => {
+    // It cannot be recalled, but its failure must not restore a patch under an
+    // id that is nobody's tab now.
+    let rejectWrite!: (e: Error) => void;
+    invokeMock.mockImplementationOnce(() => new Promise((_, r) => { rejectWrite = r; }));
+    updateTabState('old-id', { documentEdit: { draft: 'half typed' } });
+    vi.advanceTimersByTime(500);
+
+    renameTabState('old-id', 'new-id');
+    rejectWrite(new Error('backend down'));
+    await vi.waitFor(() => expect(hasPendingDocumentEdit('old-id')).toBe(false));
+  });
+
+
+  it('cancelTabState drops a pending patch instead of sending it late', () => {
+    // Tab ids are deterministic: close a tab mid-debounce and reopen the same
+    // collection, and the queued draft would land on the new model — an editor
+    // the user closed, attached to a tab that never had one.
+    updateTabState('t1', { documentEdit: { draft: '{"name":"Ada"}' } });
+    cancelTabState('t1');
+    vi.advanceTimersByTime(500);
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    // And the batch form, for close_many.
+    updateTabState('t2', { documentEdit: { draft: 'x' } });
+    updateTabState('t3', { documentEdit: { draft: 'y' } });
+    cancelTabState(['t2', 't3']);
+    vi.advanceTimersByTime(500);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it('hasPendingDocumentEdit reports a queued clear, not just a queued draft', async () => {
+    // #326 review: cancelling an edit removes it from the tab at once while its
+    // `document_edit: null` is still in the debounce. At that moment the tab has
+    // no edit and the backend still holds the draft — so "does this tab have an
+    // edit" is the wrong question to gate a move on.
+    expect(hasPendingDocumentEdit('t1')).toBe(false);
+
+    updateTabState('t1', { documentEdit: null });
+    expect(hasPendingDocumentEdit('t1')).toBe(true);
+
+    // Still pending once the timer fires: it has left the queue but the backend
+    // has not answered yet, and that interval is the one a move must not slip
+    // through. Only settling clears it.
+    vi.advanceTimersByTime(500);
+    expect(hasPendingDocumentEdit('t1')).toBe(true);
+    await vi.waitFor(() => expect(hasPendingDocumentEdit('t1')).toBe(false));
+
+    // A patch about something else is not a reason to hold up a move.
+    updateTabState('t2', { lastQuery: { filter: '{}' } });
+    expect(hasPendingDocumentEdit('t2')).toBe(false);
+  });
+
+  it('counts a write that has left the queue but not landed', async () => {
+    // #326 review: between the debounce firing and the backend answering, the
+    // tab looked synchronized — nothing queued — so a move could start and
+    // overtake the write it was supposed to follow.
+    let settle!: (v: unknown) => void;
+    invokeMock.mockImplementationOnce(() => new Promise((r) => { settle = r; }));
+    updateTabState('t1', { documentEdit: { draft: '{"name":"Ada"}' } });
+    vi.advanceTimersByTime(500);
+
+    // Queue is empty, but the backend does not have it yet.
+    expect(hasPendingDocumentEdit('t1')).toBe(true);
+
+    let moved = false;
+    const ready = flushTabState('t1').then((ok) => { moved = ok; });
+    await Promise.resolve();
+    expect(moved).toBe(false);
+
+    settle(undefined);
+    await ready;
+    expect(moved).toBe(true);
+    expect(hasPendingDocumentEdit('t1')).toBe(false);
+  });
+
+
+  it('keeps a patch pending when its write fails, so a retry still has it', async () => {
+    // #326 review: a move aborts on a failed flush — but if the patch were
+    // spent, the next attempt would find nothing queued, report success without
+    // writing, and move against the same stale model the first attempt refused.
+    invokeMock.mockRejectedValueOnce(new Error('backend down'));
+    updateTabState('t1', { documentEdit: { draft: '{"name":"Ada"}' } });
+
+    expect(await flushTabState('t1')).toBe(false);
+    expect(hasPendingDocumentEdit('t1')).toBe(true);
+
+    // The retry writes it, and this time it lands.
+    invokeMock.mockClear();
+    expect(await flushTabState('t1')).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith('workspace_apply', {
+      op: { type: 'update_tab_state', tab_id: 't1', document_edit: { draft: '{"name":"Ada"}' } },
+      origin: 'main',
+    });
+    expect(hasPendingDocumentEdit('t1')).toBe(false);
+  });
+
+  it('lets a newer value win over one whose write failed', async () => {
+    invokeMock.mockRejectedValueOnce(new Error('backend down'));
+    updateTabState('t1', { documentEdit: { draft: 'first' } });
+    const failing = flushTabState('t1');
+    // Typed while that request was in flight.
+    updateTabState('t1', { documentEdit: { draft: 'second' } });
+    expect(await failing).toBe(false);
+
+    invokeMock.mockClear();
+    await flushTabState('t1');
+    const [, { op }] = invokeMock.mock.calls[0];
+    expect((op as any).document_edit).toEqual({ draft: 'second' });
+  });
+
+
+
+
 
   it('omits fields never passed to updateTabState (no key at all, not undefined)', () => {
     updateTabState('t1', { lastQuery: { filter: '{}' } });

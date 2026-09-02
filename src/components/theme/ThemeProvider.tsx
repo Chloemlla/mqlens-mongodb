@@ -2,10 +2,12 @@ import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "r
 import { invoke } from "@tauri-apps/api/core";
 import {
   applyTheme,
+  getEffectiveTokens,
   applyResponsiveScale,
   exportThemeJson,
   importThemeJson,
 } from "@/lib/themes/apply-theme";
+import { setMonacoAppTheme, tokenResolverFor } from "@/lib/monacoAppTheme";
 import {
   appearanceToThemeConfig,
   readInitialThemeConfig,
@@ -93,10 +95,29 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener(VAULT_UNLOCKED_EVENT, onVaultUnlocked);
   }, [reloadFromEncryptedSettings]);
 
-  useEffect(() => {
-    const mode = applyTheme(config);
+  // Applying a theme means three things that must not drift apart: the CSS
+  // variables, Monaco's global themes, and the resolved mode React reads.
+  // They were spelled out in two places — this effect and the system-mode
+  // listener below — and the listener was already missing the Monaco half, so
+  // an OS theme flip left the owner on the previous mode and the next editor
+  // to mount restored it for everyone (#324 review).
+  const applyThemeEverywhere = useCallback((next: ThemeConfig) => {
+    const mode = applyTheme(next);
+    // Doing this here rather than in each editor is what makes the ordering
+    // right: a parent's effect runs after its children's, so the CSS variables
+    // are written by now and no editor is still looking at the previous theme
+    // (#282). A single writer to a global is what keeps a later editor from
+    // overwriting it from stale values.
+    setMonacoAppTheme(
+      tokenResolverFor(getEffectiveTokens(next)),
+      mode === "light" ? "mqlens-light" : "mqlens-dark"
+    );
     setResolvedMode(mode);
-  }, [config]);
+  }, []);
+
+  useEffect(() => {
+    applyThemeEverywhere(config);
+  }, [applyThemeEverywhere, config]);
 
   const updateConfig = useCallback((partial: Partial<ThemeConfig>) => {
     setConfig((prev) => ({ ...prev, ...partial }));
@@ -168,10 +189,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (config.mode !== "system") return;
     const mq = window.matchMedia("(prefers-color-scheme: light)");
-    const handler = () => {
-      const mode = applyTheme(config);
-      setResolvedMode(mode);
-    };
+    const handler = () => applyThemeEverywhere(config);
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
   }, [config]);

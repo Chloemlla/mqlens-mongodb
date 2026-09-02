@@ -31,7 +31,7 @@ import {
   renameShellSession,
   retargetShellSessionDatabase,
 } from './lib/mongoshSession';
-import { DataGrid, type ViewMode } from './components/DataGrid';
+import { DataGrid, type ViewMode, type ResultsTab } from './components/DataGrid';
 import { ConnectionManager } from './components/ConnectionManager';
 import { WatchPanel } from './components/WatchPanel';
 import { SettingsView, type SettingsTabId, MONGO_TOOLS_DIR_KEY } from './components/SettingsModal';
@@ -78,6 +78,11 @@ import {
   detachTabToNewWindow,
   closeWorkspaceWindow,
   moveTabToWindow,
+  flushTabState,
+  cancelTabState,
+  applyTabOp,
+  renameTabState,
+  hasPendingDocumentEdit,
   type WorkspaceChangedPayload,
   type ConnectionsChangedPayload,
   type ConnectionEntry,
@@ -89,6 +94,7 @@ import {
   toProfileSpaceId,
   toLiveSpaceId,
   materializeArrivingTab,
+  carriedDocumentEdit,
   type PersistedWorkspace,
   type PersistedWindow,
   type PersistedTab,
@@ -127,6 +133,44 @@ import { FolderCode, KeyRound, Radio, X, ChevronsRight, XSquare, Play, Settings,
 import logoMark from './assets/logo-mark.svg';
 import { loadTabColors, saveTabColor, TAB_COLORS, tabColorCss, type TabColorId } from './lib/tabColors';
 
+/** An edit or insert in progress, with everything true of it while it lasts.
+ *
+ *  All of it lives here rather than in the dialog because the dialog is a view
+ *  of whichever tab is active: it unmounts when the user looks elsewhere and
+ *  remounts on the way back. The draft came here first (#277), and the error
+ *  and the pending save followed once it was clear they have the same lifetime
+ *  — each was patched into the dialog separately and each went wrong in the
+ *  same way, showing one tab's state on another or losing it in between (#326
+ *  review). An edit ends when this object is replaced or removed, which is what
+ *  makes "starting a new edit" and "clearing the last one's state" a single
+ *  act. */
+interface DocumentEdit {
+  /** Identifies THIS edit, so a result can tell whether it is still the one.
+   *
+   *  The tab id is not enough. The dialog is non-modal and draggable, so the
+   *  user can push it aside and start another insert on the same tab while the
+   *  first save is still running — and a completion matched on tab alone would
+   *  then clear the replacement's `saving`, write the old failure onto it, or
+   *  close it and take its draft with it (#326 review). */
+  id: string;
+  mode: 'insert' | 'edit';
+  initialJson: string;
+  targetDoc: Record<string, any> | null;
+  /** Live text. Kept here so it outlives the dialog unmounting on a tab switch. */
+  draft: string;
+  /** A save of THIS edit that failed, waiting to be seen by the tab that owns it. */
+  error: string | null;
+  /** True while this edit's save is in flight, so Save cannot fire twice. */
+  saving: boolean;
+}
+
+/** A fresh identity for each edit, so a completion can name the one it belongs
+ *  to. Same fallback as `queryStore`'s, for environments without `randomUUID`. */
+const newEditId = (): string =>
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `edit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
 export interface QueryTab {
   id: string;
   type: 'collection' | 'index' | 'shell' | 'settings' | 'quickstart' | 'export' | 'import' | 'tasks' | 'activity' | 'schema' | 'create-view' | 'gridfs' | 'monitoring' | 'users' | 'dump' | 'restore' | 'validation' | 'generate' | 'watch';
@@ -147,6 +191,12 @@ export interface QueryTab {
   // Results view mode, kept on the tab so it survives the grid remounting on
   // every run and the tab being switched away (#218).
   viewMode?: ViewMode;
+  // Which results tab is showing, kept on the tab for the same reason as
+  // viewMode: the grid remounts on every run (#281).
+  resultsTab?: ResultsTab;
+  // An in-progress document edit belongs to the tab it was opened from, so it
+  // survives a look at another tab and dies with this one (#277).
+  documentEdit?: DocumentEdit;
   // What the results pager last asked for. The values travel with the revision
   // so the builder can never observe a new revision beside a stale page size —
   // see DocumentViewer's pagerRequest prop.
@@ -164,6 +214,13 @@ export interface QueryTab {
 /// `$addFields` — reshapes the row or replaces its identity, so its `_id` may be
 /// a group key rather than a document id and saving could hit an unrelated
 /// document.
+/** How long an edit stays frozen waiting for its tab's move to be reconciled.
+ *
+ *  A backstop, not a schedule: the freeze normally ends when the tab leaves
+ *  this window, which is immediate. This is only so a move that never lands
+ *  cannot leave an editor unusable for the rest of the session. */
+const WINDOW_CHANGE_LOCK_MS = 10_000;
+
 const DOCUMENT_PRESERVING_STAGES = new Set(['$match', '$sort', '$limit', '$skip']);
 
 /** True when every stage of `pipeline` leaves documents intact. */
@@ -700,6 +757,9 @@ function Workspace() {
   const handleViewModeChange = useCallback((tabId: string, mode: ViewMode) => {
     setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, viewMode: mode } : t)));
   }, []);
+  const handleResultsTabChange = useCallback((tabId: string, resultsTab: ResultsTab) => {
+    setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, resultsTab } : t)));
+  }, []);
   const handleChatMessagesChange = useCallback((tabId: string, messages: ChatMessage[]) => {
     const prev = tabChatCache.current.get(tabId);
     tabChatCache.current.set(tabId, { ...prev, messages, isOpen: prev?.isOpen ?? false });
@@ -1097,6 +1157,21 @@ function Workspace() {
       keys: Record<string, number>;
     } | null;
   } | null>(null);
+  // Document writes sent and not yet answered, one entry per request.
+  //
+  // Kept beside the tabs rather than on them because a request outlives the
+  // edit that started it: replace the edit, close the dialog, switch tabs, and
+  // the write is still out. Whatever wants to know whether a namespace is busy
+  // has to ask about requests (#326 review).
+  const [pendingSaves, setPendingSaves] = useState<
+    Array<{ editId: string; tabId: string; connectionId: string; db: string; collection: string }>
+  >([]);
+  // Tabs whose move has been dispatched and not yet reconciled away. Their
+  // edits are frozen for that window — see lockTabForWindowChange.
+  const [movingTabIds, setMovingTabIds] = useState<ReadonlySet<string>>(() => new Set());
+  // Read after an await, where the render closure is already stale.
+  const pendingSavesRef = useRef(pendingSaves);
+  pendingSavesRef.current = pendingSaves;
   const [indexMutationTrigger, setIndexMutationTrigger] = useState(0);
   const [collectionMutationTrigger, setCollectionMutationTrigger] = useState(0);
   const [sidebarFilterQuery, setSidebarFilterQuery] = useState('');
@@ -1477,7 +1552,7 @@ function Workspace() {
         };
         setTabs(prev => [...prev, newTab as QueryTab]);
       } else {
-        setTabs(prev => prev.map(t => t.id === tabId ? { ...t, loading: true, error: null } : t));
+        setTabs(prev => prev.map(t => t.id === tabId ? { ...t, loading: true, error: null, resultsTab: 'results' } : t));
       }
       dispatchWorkspace({ type: 'open_tab', tabId }, newTab ? { tab: newTab } : undefined);
 
@@ -2619,38 +2694,76 @@ function Workspace() {
             return;
           }
           unmirroredTabIdsRef.current.delete(action.tabId);
-          workspaceApply(actionToOp(action, persisted, activeConnections));
+          // Ordered on the tab, like the close below: reopening a collection
+          // reuses its id, and this must not overtake the close of the tab that
+          // had it (#326 review).
+          applyTabOp(
+            [toProfileSpaceId(action.tabId, activeConnections)],
+            actionToOp(action, persisted, activeConnections)
+          );
           return;
         }
         if (unmirroredTabIdsRef.current.has(action.tabId)) return;
-        workspaceApply(actionToOp(action, undefined, activeConnections));
+        applyTabOp(
+          [toProfileSpaceId(action.tabId, activeConnections)],
+          actionToOp(action, undefined, activeConnections)
+        );
         return;
       }
+      // Two things a close has to get right, both because tab ids are
+      // deterministic: close and reopen the same collection and the id comes
+      // back. A queued patch would attach to the new model, restoring an editor
+      // the user closed — so it is dropped. And a write already on its way
+      // would do the same, so the close is ordered behind it rather than racing
+      // it, and the reopen behind the close (#326 review).
       case 'close_tab':
+        cancelTabState(toProfileSpaceId(action.tabId, activeConnections));
         if (unmirroredTabIdsRef.current.has(action.tabId)) {
           unmirroredTabIdsRef.current.delete(action.tabId);
           return;
         }
-        workspaceApply(actionToOp(action, undefined, activeConnections));
+        applyTabOp(
+          [toProfileSpaceId(action.tabId, activeConnections)],
+          actionToOp(action, undefined, activeConnections)
+        );
         return;
       case 'close_many': {
+        const closing = action.tabIds.map(id => toProfileSpaceId(id, activeConnections));
+        cancelTabState(closing);
         const tabIds = action.tabIds.filter(id => !unmirroredTabIdsRef.current.has(id));
         action.tabIds.forEach(id => unmirroredTabIdsRef.current.delete(id));
         if (tabIds.length === 0) return;
-        workspaceApply(actionToOp({ ...action, tabIds }, undefined, activeConnections));
+        applyTabOp(closing, actionToOp({ ...action, tabIds }, undefined, activeConnections));
         return;
       }
       case 'move_tab':
         if (unmirroredTabIdsRef.current.has(action.tabId)) return;
         workspaceApply(actionToOp(action, undefined, activeConnections));
         return;
+      // Ordered against both ids. A rename gives the tab a new id at once, so
+      // its draft is mirrored under the new one while `rename_tab` is still on
+      // its way: arriving first, that update finds no such tab and succeeds as
+      // a no-op, and the rename then carries only the older draft — text lost
+      // with nothing left pending to say so (#326 review).
       case 'rename_tab':
+        // The queued patch follows the tab, whether or not the rename itself is
+        // mirrored — an unmirrored tab can still have left one behind.
+        renameTabState(
+          toProfileSpaceId(action.oldId, activeConnections),
+          toProfileSpaceId(action.newId, activeConnections)
+        );
         if (unmirroredTabIdsRef.current.has(action.oldId)) {
           unmirroredTabIdsRef.current.delete(action.oldId);
           unmirroredTabIdsRef.current.add(action.newId);
           return;
         }
-        workspaceApply(actionToOp(action, undefined, activeConnections));
+        applyTabOp(
+          [
+            toProfileSpaceId(action.oldId, activeConnections),
+            toProfileSpaceId(action.newId, activeConnections),
+          ],
+          actionToOp(action, undefined, activeConnections)
+        );
         return;
       default:
         workspaceApply(actionToOp(action, undefined, activeConnections));
@@ -2673,11 +2786,102 @@ function Workspace() {
     setTabContextMenu({ tabId, x: e.clientX, y: e.clientY });
   };
 
-  const handleDetachTab = (tabId: string) => {
+  /** Whether this tab can change window right now, and readies it if so.
+   *
+   *  A save in flight blocks the move. The request belongs to this window and
+   *  settles here, so it cannot travel — and `carriedDocumentEdit` drops
+   *  `saving` precisely because an arriving tab must not claim a request the
+   *  destination cannot finish. But that leaves the destination's Save enabled
+   *  over a document that is already being written, and the clear this window
+   *  sends on success is not a cross-window op, so the destination never learns
+   *  the insert happened: one more click and the document is written twice
+   *  (#326 review). Waiting for the save is the honest answer — it is brief,
+   *  and the alternative is a duplicate.
+   *
+   *  Otherwise a tab that holds an edit has its pending mirror flushed, so
+   *  what the destination reads is the draft as it stands rather than one
+   *  debounce behind. Only then: a tab with no edit has nothing at stake here,
+   *  and flushing it would put a write in front of every move that never used
+   *  to be there. */
+  const readyForWindowChange = async (tabId: string): Promise<boolean> => {
+    const profileId = toProfileSpaceId(tabId, activeConnections);
+    // Re-read on every pass, from the ref rather than the render closure: the
+    // await below is a gap the user can type, cancel or start a save in, and a
+    // check made before it describes a state the move no longer happens in
+    // (#326 review). Each pass either finds nothing left to send, or sends it
+    // and looks again.
+    for (let pass = 0; pass < 4; pass++) {
+      const edit = tabsRef.current.find(x => x.id === tabId)?.documentEdit;
+      // Asked of the requests, not of the edit on screen. A save whose edit has
+      // since been replaced is still a save this window cannot hand to another
+      // one, and the edit that replaced it says nothing about it (#326 review).
+      if (pendingSavesRef.current.some(s => s.tabId === tabId)) {
+        toast(t('toast.documentSaveInProgress'), 'error');
+        return false;
+      }
+      // Not `if (edit)`: cancelling one removes it from the tab immediately
+      // while its `document_edit: null` is still queued, so at that moment the
+      // tab has no edit and the backend still holds the draft the move would
+      // carry — an already-inserted document among them, offered to the
+      // destination to submit again.
+      if (!edit && !hasPendingDocumentEdit(profileId)) return true;
+      // Awaited, not merely called first. Both are separate backend commands,
+      // so starting the flush buys no ordering: the move could take the store
+      // first and snapshot the older draft, and the update landing afterwards
+      // is not a cross-window op for the destination to reconcile.
+      if (!(await flushTabState(profileId))) {
+        // The write did not land, so the backend still holds the older model.
+        // Moving now would carry that instead — dropping the newest draft, or
+        // reviving an editor whose insert already succeeded for the destination
+        // to submit a second time (#326 review).
+        toast(t('toast.documentEditNotSynced'), 'error');
+        return false;
+      }
+      if (!hasPendingDocumentEdit(profileId)) {
+        // Settled: nothing new arrived while that was in flight.
+        const still = tabsRef.current.find(x => x.id === tabId)?.documentEdit;
+        if (!still?.saving) return true;
+      }
+    }
+    // Four passes and the edit is still moving. Rather than carry a draft that
+    // may already be stale again, leave the tab where it is and say so.
+    toast(t('toast.documentSaveInProgress'), 'error');
+    return false;
+  };
+
+  /** Freezes a tab's edit from the moment its move is dispatched.
+   *
+   *  The move is fire-and-forget: the backend may already have taken the tab's
+   *  snapshot while this window still shows it, and it stays interactive until
+   *  the reconciliation broadcast removes it. Anything typed in that window is
+   *  mirrored under an id the destination no longer reconciles — text lost in
+   *  front of the user — and a save started there does not travel, since
+   *  `carriedDocumentEdit` drops `saving`, leaving the destination free to
+   *  submit the same insert again (#326 review).
+   *
+   *  Released when the tab leaves, and on a timer besides: a move that never
+   *  happens must not stand the editor down for the rest of the session. */
+  const lockTabForWindowChange = (tabId: string) => {
+    setMovingTabIds(prev => new Set(prev).add(tabId));
+    window.setTimeout(() => {
+      setMovingTabIds(prev => {
+        if (!prev.has(tabId)) return prev;
+        const next = new Set(prev);
+        next.delete(tabId);
+        return next;
+      });
+    }, WINDOW_CHANGE_LOCK_MS);
+  };
+
+  const handleDetachTab = async (tabId: string) => {
+    if (!(await readyForWindowChange(tabId))) return;
+    lockTabForWindowChange(tabId);
     detachTabToNewWindow(toProfileSpaceId(tabId, activeConnections));
   };
 
-  const handleMoveTab = (tabId: string, targetWindowId: string) => {
+  const handleMoveTab = async (tabId: string, targetWindowId: string) => {
+    if (!(await readyForWindowChange(tabId))) return;
+    lockTabForWindowChange(tabId);
     moveTabToWindow(toProfileSpaceId(tabId, activeConnections), targetWindowId);
     // Final whole-branch review, Fix 4(b): the "Move to <window>" list is
     // built from `lastWorkspaceRef` (the last-known cross-window document),
@@ -2979,7 +3183,11 @@ function Workspace() {
 
   const handleExecuteQuery = async (tab: QueryTab, query: { filter: string; sort: string; projection: string; limit: number; skip: number }) => {
     // Update the tab's loading state
-    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null } : t));
+    // Back to Results for a run: the user asked for rows, so show them. The
+    // grid remounts while loading, and the tab now outlives that remount, so
+    // without this a run started from Explain would hide its own results
+    // behind the plan (#325 review).
+    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null, resultsTab: 'results' } : t));
 
     try {
       const resultStrs = await invoke<string[]>('execute_mql_query', {
@@ -3087,7 +3295,11 @@ function Workspace() {
       }
     }
 
-    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null } : t));
+    // Back to Results for a run: the user asked for rows, so show them. The
+    // grid remounts while loading, and the tab now outlives that remount, so
+    // without this a run started from Explain would hide its own results
+    // behind the plan (#325 review).
+    setTabs(prev => prev.map(t => t.id === tab.id ? { ...t, loading: true, error: null, resultsTab: 'results' } : t));
 
     try {
       const resultStrs = await invoke<string[]>('execute_aggregate', {
@@ -3616,12 +3828,135 @@ function Workspace() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [exportTasks]);
 
-  const [documentModal, setDocumentModal] = useState<
-    { mode: 'insert' | 'edit'; initialJson: string; targetDoc: Record<string, any> | null; tabId: string } | null
-  >(null);
+  // Only the active tab's edit is rendered, so opening one no longer replaces
+  // another tab's work — each tab keeps its own until it is saved or closed.
+  // Replacing the whole object is what starts a new edit, so nothing has to
+  // remember to clear the last one's error or pending save.
+  // Mirrored to the backend as it changes, because a tab moved to another
+  // window is rebuilt there from the backend's copy — an edit that never
+  // reached it is an edit the move discards (#326 review). `updateTabState`
+  // debounces, so a keystroke is not a round trip. `carriedDocumentEdit`
+  // decides what travels; `null` on close, since an absent key means
+  // "untouched" and would leave a finished draft on the model.
+  const openDocumentEdit = (
+    tab: QueryTab,
+    edit: Omit<DocumentEdit, 'id' | 'draft' | 'error' | 'saving'>
+  ) => {
+    // Frozen tabs take no new edit either. The dialog being non-modal is what
+    // makes this reachable — drag it aside and Insert again — and a replacement
+    // started now is mirrored after the move may already have taken its
+    // snapshot, so it goes nowhere and dies with the source tab (#326 review).
+    if (movingTabIds.has(tab.id)) return;
+    const opened: DocumentEdit = {
+      ...edit,
+      id: newEditId(),
+      draft: edit.initialJson,
+      error: null,
+      saving: false,
+    };
+    setTabs(prev => prev.map(t => (t.id === tab.id ? { ...t, documentEdit: opened } : t)));
+  };
+  /** Ends whatever edit this tab has open — the user's own Cancel, where what
+   *  is on screen is exactly what they meant to close. A save that finished
+   *  uses `closeEditById` instead, since by then the edit may have moved on. */
+  const closeDocumentEdit = (tabId: string) =>
+    setTabs(prev => prev.map(t => (t.id === tabId ? { ...t, documentEdit: undefined } : t)));
+  /** Updates one edit, found by its own id — wherever its tab has got to.
+   *
+   *  Matching on the tab was not enough twice over. The dialog is non-modal, so
+   *  the user can drag it aside and start another edit on the same tab while
+   *  the first save is in flight — and those controls include renaming the
+   *  collection, which preserves the edit but replaces the tab id. A completion
+   *  that named a tab therefore either landed on the wrong edit or on nothing
+   *  at all, leaving the renamed tab's dialog disabled for good with its
+   *  failure never shown (#326 review).
+   *
+   *  The edit's id survives both, so completions use it alone: they find the
+   *  edit that asked, or nothing, and never something else. */
+  const patchDocumentEdit = (editId: string, patch: Partial<DocumentEdit>) =>
+    setTabs(prev =>
+      prev.map(t =>
+        t.documentEdit?.id === editId ? { ...t, documentEdit: { ...t.documentEdit, ...patch } } : t
+      )
+    );
+  /** The tab currently holding this edit, read live so a rename during a
+   *  request is followed rather than missed. */
+  const tabHoldingEdit = (editId: string): QueryTab | undefined =>
+    tabsRef.current.find(t => t.documentEdit?.id === editId);
+  /** Ends the edit with this id, wherever it is. Used by a save that finished;
+   *  the user's own Cancel closes what is on screen instead. */
+  const closeEditById = (editId: string) =>
+    setTabs(prev =>
+      prev.map(t => (t.documentEdit?.id === editId ? { ...t, documentEdit: undefined } : t))
+    );
+  const setDocumentDraft = (tabId: string, draft: string) => {
+    // Frozen: this tab is on its way to another window, and anything accepted
+    // here would be mirrored under an id the destination no longer reconciles.
+    // The dialog is read-only meanwhile; this is the same answer for anything
+    // that reaches the handler another way.
+    if (movingTabIds.has(tabId)) return;
+    const edit = tabs.find(t => t.id === tabId)?.documentEdit;
+    if (!edit) return;
+    patchDocumentEdit(edit.id, { draft });
+  };
+
+  // The freeze ends when reconciliation takes the tab, which is the event it
+  // was waiting for. The timer in  only matters if that
+  // never comes.
+  useEffect(() => {
+    setMovingTabIds(prev => {
+      if (prev.size === 0) return prev;
+      const stillHere = [...prev].filter(id => tabs.some(t => t.id === id));
+      return stillHere.length === prev.size ? prev : new Set(stillHere);
+    });
+  }, [tabs]);
+
+  // The backend's copy of each tab's edit, kept level with state from one place
+  // rather than announced by whoever changed it.
+  //
+  // Every handler above tried to predict its own mirror, and predicting is what
+  // went wrong: a `setTabs` updater runs when React chooses, so `closeDocumentEdit`
+  // decided whether to send the clear before knowing whether it had closed
+  // anything — and a close that sent nothing left an earlier debounced draft
+  // standing on the backend, ready for the next move to revive an edit the user
+  // had already finished with (#326 review). Reading committed state instead
+  // cannot be wrong about what happened, because it runs after it happened.
+  //
+  // The comparison is against what was last sent, so a re-render that leaves an
+  // edit untouched sends nothing, and a keystroke sends once. `updateTabState`
+  // debounces the rest.
+  const mirroredEditsRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    const open = new Set<string>();
+    for (const tab of tabs) {
+      if (!tab.documentEdit) continue;
+      open.add(tab.id);
+      const carried = JSON.stringify(carriedDocumentEdit(tab.documentEdit));
+      if (mirroredEditsRef.current.get(tab.id) === carried) continue;
+      mirroredEditsRef.current.set(tab.id, carried);
+      mirrorUpdateTabState(tab.id, activeConnectionsRef.current, {
+        documentEdit: JSON.parse(carried),
+      });
+    }
+    for (const tabId of [...mirroredEditsRef.current.keys()]) {
+      if (open.has(tabId)) continue;
+      mirroredEditsRef.current.delete(tabId);
+      // Only a tab still open HERE gets the clear. A tab that has left this
+      // window's `tabs` needs none either way, and sending one is wrong: if it
+      // was closed, the backend dropped the whole model with it, and if it
+      // merely moved, the model is alive in another window and this would race
+      // the destination's own write to erase a draft that is still open
+      // (#326 review). Absence says the tab left, never that the edit ended.
+      if (!tabs.some(t => t.id === tabId)) continue;
+      // Explicitly null, not absent: absent means "untouched" and would leave a
+      // finished draft on the model for the next move to carry.
+      mirrorUpdateTabState(tabId, activeConnectionsRef.current, { documentEdit: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs]);
 
   const handleInsertDocument = (tab: QueryTab) => {
-    setDocumentModal({ mode: 'insert', initialJson: '{\n  \n}', targetDoc: null, tabId: tab.id });
+    openDocumentEdit(tab, { mode: 'insert', initialJson: "{\n  \n}", targetDoc: null });
   };
 
   const handleExportForTab = async (
@@ -3789,13 +4124,13 @@ function Workspace() {
   };
 
   const handleEditDocument = (tab: QueryTab, doc: Record<string, any>) => {
-    setDocumentModal({ mode: 'edit', initialJson: docToShell(doc), targetDoc: doc, tabId: tab.id });
+    openDocumentEdit(tab, { mode: 'edit', initialJson: docToShell(doc), targetDoc: doc });
   };
 
   // Duplicate: open the insert modal pre-filled with the document minus its _id.
   const handleDuplicateDocument = (tab: QueryTab, doc: Record<string, any>) => {
     const { _id, ...rest } = doc;
-    setDocumentModal({ mode: 'insert', initialJson: docToShell(rest), targetDoc: null, tabId: tab.id });
+    openDocumentEdit(tab, { mode: 'insert', initialJson: docToShell(rest), targetDoc: null });
   };
 
   const handleDeleteDocument = async (tab: QueryTab, doc: Record<string, any>) => {
@@ -3973,28 +4308,68 @@ function Workspace() {
     }
   };
 
+  /** Runs a save and files its outcome against the edit that asked for it.
+   *
+   *  `tab.id` is captured before the request, not read from `activeTab` after
+   *  it, so a rejection that settles once the user has moved on is still
+   *  recorded on its own edit rather than on whichever one is now showing —
+   *  and is waiting there when they come back (#326 review). */
   const handleSaveDocument = async (json: string) => {
-    if (!documentModal) return;
-    const tab = tabs.find(t => t.id === documentModal.tabId);
-    if (!tab) return;
+    const tab = activeTab;
+    const edit = tab?.documentEdit;
+    if (!tab || !edit) return;
+    // A save started after the move was dispatched does not travel — the
+    // destination is handed an edit with no save on it and would let the same
+    // insert be submitted again (#326 review).
+    if (movingTabIds.has(tab.id)) return;
+    // Captured before the request: every line below names the edit that asked,
+    // so a result arriving after the user has moved on — to another tab, or to
+    // a different edit on this one — reaches that edit or nothing at all.
+    const editId = edit.id;
+    patchDocumentEdit(editId, { saving: true, error: null });
+    // Recorded against the request, not the edit. The edit can be replaced
+    // while this runs — starting another one on the same tab is what the
+    // non-modal dialog is for — and everything that asks "is a save running
+    // here" would then be told no while the write was still out (#326 review).
+    setPendingSaves(prev => [
+      ...prev,
+      { editId, tabId: tab.id, connectionId: tab.connectionId, db: tab.db, collection: tab.collection },
+    ]);
+    try {
+      await saveDocument(tab, edit, json);
+    } catch (err: any) {
+      patchDocumentEdit(editId, { error: String(err?.message || err) });
+    } finally {
+      patchDocumentEdit(editId, { saving: false });
+      setPendingSaves(prev => prev.filter(s => s.editId !== editId));
+    }
+  };
+
+  const saveDocument = async (tab: QueryTab, edit: DocumentEdit, json: string) => {
     const collection = tab.collection;
-    if (documentModal.mode === 'insert') {
+    if (edit.mode === 'insert') {
       await invoke('insert_document', {
         id: tab.connectionId,
         database: tab.db,
         collection,
         document: json,
       });
-      setDocumentModal(null);
-      await refreshTabResults(tab);
+      // Resolved BEFORE the close, and from the ref: a rename during the
+      // request moved this edit to a tab with a new id and namespace, and the
+      // captured one would refresh the collection this tab no longer is (#326
+      // review).
+      const insertedInto = tabHoldingEdit(edit.id) ?? tab;
+      closeEditById(edit.id);
+      await refreshTabResults(insertedInto);
       toast(t('toast.documentInsertedInto', { collection }), 'success', { title: t('toast.insertedTitle') });
       return;
     }
 
-    const target = documentModal.targetDoc;
+    const target = edit.targetDoc;
     if (!target || target._id === undefined) {
-      // DocumentEditModal catches this and renders `err.message` straight into
-      // its error banner, so the text is user-facing copy, not a dev invariant.
+      // Caught by handleSaveDocument and filed on the edit, which the dialog
+      // renders straight into its error banner — so the text is user-facing
+      // copy, not a dev invariant.
       throw new Error(t('documents:editModal.errors.noId'));
     }
     // Send the document as loaded *and* as edited so the backend can apply only
@@ -4028,8 +4403,9 @@ function Workspace() {
         ? (pipelineYieldsWholeDocuments(tab.lastAggregate) ? '{}' : null)
         : (tab.lastQuery?.projection ?? '{}'),
     });
-    setDocumentModal(null);
-    await refreshTabResults(tab);
+    const savedIn = tabHoldingEdit(edit.id) ?? tab;
+    closeEditById(edit.id);
+    await refreshTabResults(savedIn);
     toast(t('toast.documentSavedIn', { collection }), 'success', { title: t('toast.savedTitle') });
   };
 
@@ -4199,6 +4575,8 @@ function Workspace() {
                     limit={tab.lastQuery?.limit ?? 50}
                     viewMode={tab.viewMode ?? 'json'}
                     onViewModeChange={(mode) => handleViewModeChange(tab.id, mode)}
+                    activeTab={tab.resultsTab ?? 'results'}
+                    onActiveTabChange={(t) => handleResultsTabChange(tab.id, t)}
                     onCreateSuggestedIndex={s => handleCreateSuggestedIndex(tab, s)}
                     {...(!tab.lastAggregate ? {
                       onPageChange: (newSkip: number) => handlePageChange(tab, newSkip),
@@ -4540,6 +4918,7 @@ function Workspace() {
       sidebar={
         <Sidebar
           onSelectCollection={handleSelectCollection}
+          pendingSaves={pendingSaves}
           isCollectionOpen={(connectionId, db, collection) =>
             collectionTabsMatching(tabs, { connectionId, db, collection }).length > 0
           }
@@ -4650,11 +5029,19 @@ function Workspace() {
             prefill={indexModalTarget?.prefill}
           />
 
+          {/* Driven by the ACTIVE tab: switching away hides the edit and
+              switching back restores it, because the text lives on the tab
+              rather than in the dialog (#277). */}
           <DocumentEditModal
-            isOpen={documentModal !== null}
-            mode={documentModal?.mode || 'insert'}
-            initialJson={documentModal?.initialJson || '{}'}
-            onClose={() => setDocumentModal(null)}
+            isOpen={activeTab?.documentEdit !== undefined}
+            mode={activeTab?.documentEdit?.mode || 'insert'}
+            initialJson={activeTab?.documentEdit?.initialJson || '{}'}
+            json={activeTab?.documentEdit?.draft ?? ''}
+            error={activeTab?.documentEdit?.error ?? null}
+            saving={activeTab?.documentEdit?.saving ?? false}
+            frozen={activeTab ? movingTabIds.has(activeTab.id) : false}
+            onJsonChange={(draft) => activeTab && setDocumentDraft(activeTab.id, draft)}
+            onClose={() => activeTab && closeDocumentEdit(activeTab.id)}
             onSave={handleSaveDocument}
           />
 

@@ -44,8 +44,8 @@ describe('ClusterHealthCard', () => {
     expect(screen.getByTestId('cluster-card-member-db1:27017')).toHaveTextContent('PRIMARY');
     expect(screen.getByTestId('cluster-card-member-db2:27017')).toHaveTextContent('Online [SECONDARY]');
     expect(screen.getByTestId('cluster-card-member-db2:27017')).toHaveTextContent('lag 0.8s');
-    // 42s >= 10s threshold: amber class somewhere inside the row.
-    expect(screen.getByTestId('cluster-card-member-db3:27017').innerHTML).toMatch(/amber/);
+    // 42s >= 10s threshold: the warning token appears somewhere inside the row.
+    expect(screen.getByTestId('cluster-card-member-db3:27017').innerHTML).toMatch(/text-warning/);
     // Unhealthy member: destructive styling + Offline instead of lag.
     const down = screen.getByTestId('cluster-card-member-db4:27017');
     expect(down.className).toMatch(/destructive/);

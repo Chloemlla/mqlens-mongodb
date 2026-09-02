@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useDialogs } from './dialogs/DialogProvider';
+import { isNamespaceBusy, type PendingSave } from '../lib/namespaceBusy';
 import { confirmByTypedName } from '../lib/typedNameConfirm';
 import { fuzzyMatch } from '../lib/fuzzyMatch';
 import { type CollectionSelection, emptySelection, toggleCollection, selectionScope } from '@/lib/collectionSelection';
@@ -201,6 +202,10 @@ interface SidebarProps {
   onDatabaseDropped?: (connectionId: string, dbName: string) => void;
   onDatabaseRenamed?: (connectionId: string, oldName: string, newName: string) => void;
   onNamespaceMutated?: (connectionId?: string) => void;
+  /** Document writes this window has sent and not yet seen answered, so a
+   *  rename or a drop can refuse before it starts. Advisory: the backend makes
+   *  the same check across every window and is the one that decides. */
+  pendingSaves?: readonly PendingSave[];
   onFilterQueryChange?: (query: string) => void;
   indexMutationTrigger?: number;
   collectionMutationTrigger?: number;
@@ -328,6 +333,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onDatabaseDropped,
   onDatabaseRenamed,
   onNamespaceMutated,
+  pendingSaves,
   onFilterQueryChange,
   indexMutationTrigger,
   collectionMutationTrigger,
@@ -978,6 +984,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleDropCollection = async (connectionId: string, dbName: string, collName: string) => {
+    // The same race as a rename, and worse: a drop that lands before a pending
+    // insert has the server recreate the collection for it, so the drop comes
+    // undone with one document sitting in it (#326 review). The backend refuses
+    // this too and its answer is the true one — it sees every window; this is
+    // here to refuse before the confirm dialog rather than after it.
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName, collName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const conn = activeConnections.find((c) => c.id === connectionId);
     // #188 security review Fix 5: block read-only BEFORE the confirm dialog
     // and, critically, before the `isMock` branch below — which mutates the
@@ -1049,6 +1064,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleRenameCollection = async (connectionId: string, dbName: string, collName: string) => {
+    // A document save already sent names this namespace. Renaming it now is a
+    // race MongoDB settles: if the rename lands first, the insert can recreate
+    // the old name and write into it, while the tab reports success against the
+    // new one (#326 review). The wait is brief; splitting a write across two
+    // collections is not recoverable.
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName, collName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const conn = activeConnections.find((c) => c.id === connectionId);
     // #188 Task 3: on a confirm_destructive connection, typing the current
     // collection name (the "already a prompt" precedent kept as-is below for
@@ -1134,6 +1158,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleDropDatabase = async (connectionId: string, dbName: string) => {
+    // Every collection under it goes, so any write below the database blocks.
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const conn = activeConnections.find((c) => c.id === connectionId);
     // #188 security review Fix 5: see handleDropCollection's comment on this
     // same pattern — blocks the `isMock` branch below from dropping a
@@ -1228,6 +1257,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleRenameDatabase = async (connectionId: string, dbName: string) => {
+    // Same race, one level up: every collection under this database moves, so
+    // a save running against any of them is enough to refuse (#326 review).
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const newName = await prompt({
       title: t('dialogs.renameDatabase.promptTitle'),
       message: t('dialogs.enterNewDatabaseName'),
@@ -1765,7 +1800,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         </Badge>
                       )}
                       <span
-                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-success"
                         aria-label={t('connection.connectedAriaLabel')}
                       />
                     </div>
@@ -2592,13 +2627,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                     size={11}
                                     className={cn(
                                       'shrink-0',
-                                      isConnected ? 'text-emerald-500' : 'text-muted-foreground',
+                                      isConnected ? 'text-success' : 'text-muted-foreground',
                                     )}
                                   />
                                   <span className="min-w-0 truncate">{profile.name}</span>
                                   {isConnected && (
                                     <span
-                                      className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                                      className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-success"
                                       aria-label={t('connection.connectedAriaLabel')}
                                     />
                                   )}
@@ -2624,7 +2659,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                             size={11}
                             className={cn(
                               'shrink-0',
-                              isConnected ? 'text-emerald-500' : 'text-muted-foreground',
+                              isConnected ? 'text-success' : 'text-muted-foreground',
                             )}
                           />
                           <span className="min-w-0 truncate">{profile.name}</span>

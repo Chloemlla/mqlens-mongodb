@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import React from 'react';
 import { render, screen, fireEvent, within } from '@testing-library/react';
 
 // Monaco renders the Query Code panel; mock it as a plain textarea (same shape
@@ -1603,5 +1604,155 @@ describe('DataGrid — select-all copies every row (#320)', () => {
 
     elsewhere.remove();
     getSelection.mockRestore();
+  });
+});
+
+// #281: after one visit to Explain, every subsequent run reopened it — the
+// Results tab had to be clicked again each time. The grid remounts on every run
+// (the pane renders `{loading ? <spinner/> : <DataGrid/>}`), a plan is not
+// cleared when a query re-runs, and the explain auto-switch had no mount guard,
+// so it fired on each remount while the results effect was already guarded.
+describe('DataGrid — the explain tab does not hijack later runs (#281)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  it('stays on results when the grid remounts with an existing plan', () => {
+    const { unmount } = render(
+      <DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />
+    );
+    unmount();
+    // The remount a re-run causes, with the plan still hanging around.
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />);
+    expect(screen.getByTestId('json-view')).toBeInTheDocument();
+  });
+
+  it('still opens explain when a plan actually arrives', () => {
+    // The guard must not cost the behaviour it guards: a plan showing up after
+    // mount is a real event and should switch.
+    const onActiveTabChange = vi.fn();
+    const { rerender } = render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={null}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    rerender(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+
+  it('reports the tab the user picks so it can outlive the grid', () => {
+    const onActiveTabChange = vi.fn();
+    render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /explain/i }));
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+});
+
+// #325 review: the tab now outlives the loading remount, so a run started from
+// Explain would have kept showing the plan and hidden its own results — the
+// documents effect deliberately skips mount, so nothing would correct it.
+describe('DataGrid — a run started from Explain shows its results (#325 review)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  it('shows rows when the caller resets the tab for a run', () => {
+    // Sitting on Explain.
+    const { unmount } = render(
+      <DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />
+    );
+    expect(screen.getByTestId('explain-panel')).toBeInTheDocument();
+    // A run: the grid unmounts while loading, and App resets the tab because
+    // the user asked for rows.
+    unmount();
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />);
+    expect(screen.getByTestId('json-view')).toBeInTheDocument();
+  });
+
+  it('would hide them if the caller kept the tab on explain', () => {
+    // Pins why the App-side reset is required rather than optional: the grid
+    // honours the tab it is given, and nothing here switches back.
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />);
+    expect(screen.queryByTestId('json-view')).not.toBeInTheDocument();
+  });
+});
+
+// #325 review: StrictMode runs every effect twice on mount, and a one-shot
+// guard is spent by the first setup — so the replayed setup saw an already-gone
+// guard and fired anyway. The app mounts under StrictMode in development, so
+// the bug was fully back there.
+//
+// These assert on `onActiveTabChange` rather than on what is rendered. With a
+// controlled tab the rendered panel is unaffected by a stray switch — the
+// controlled prop still wins that render — so the damage travels out through
+// the callback, which is what the caller persists and hands back next time.
+describe('DataGrid — tab guards survive StrictMode replay (#325 review)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  const renderStrict = (ui: React.ReactElement) =>
+    render(<React.StrictMode>{ui}</React.StrictMode>);
+
+  it('does not announce an explain switch when it merely remounts', () => {
+    const onActiveTabChange = vi.fn();
+    renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).not.toHaveBeenCalledWith('explain');
+  });
+
+  it('does not announce a results switch either', () => {
+    // The documents guard had the same shape, so its replay could have pushed
+    // the tab the other way and lost a deliberate Explain selection.
+    const onActiveTabChange = vi.fn();
+    renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="explain"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).not.toHaveBeenCalledWith('results');
+  });
+
+  it('still opens explain when a plan genuinely arrives', () => {
+    const onActiveTabChange = vi.fn();
+    const { rerender } = renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={null}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    rerender(
+      <React.StrictMode>
+        <DataGrid
+          documents={mockDocuments}
+          explainResult={plan}
+          activeTab="results"
+          onActiveTabChange={onActiveTabChange}
+        />
+      </React.StrictMode>
+    );
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
   });
 });

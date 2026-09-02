@@ -20,7 +20,7 @@ import { buildRunnableCommand, guardScriptRun, type GeneratedQuery } from '../li
 import { DataGrid } from './DataGrid';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
 import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
-import { registerMqlensMonacoThemes } from '../lib/monacoAppTheme';
+import { attachMonaco } from '../lib/monacoAppTheme';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 import { windowLabel } from '../workspace/workspaceStore';
 
@@ -1143,7 +1143,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               acceptSuggestionOnEnter: 'on',
             }}
             onMount={(editor, monaco) => {
-              registerMqlensMonacoThemes(monaco);
+              attachMonaco(monaco);
               monaco.editor.setTheme(monacoTheme);
               // Enter accepts an open suggestion, else newline. Ctrl/Cmd+Enter
               // runs — scoped via onKeyDown (not addCommand, which leaks globally).
