@@ -39,7 +39,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 russh = "0.63.1"
 sysinfo = "0.38.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-argon2 = "0.5"
+argon2 = "0.6"
 aes-gcm = "0.11"
 rand = "0.8"
 # Pinned to the last release on the rand-0.8 line (fake 3.2.0+ moved to rand 0.9,
