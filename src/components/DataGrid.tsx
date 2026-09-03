@@ -69,6 +69,12 @@ interface DataGridProps {
    *  choice the user loses (#281). Omit both to self-manage. */
   activeTab?: ResultsTab;
   onActiveTabChange?: (tab: ResultsTab) => void;
+  /** Table column widths, owned by the caller for the same reason as the two
+   *  above: the grid remounts on every run, so widths kept here are widths the
+   *  user re-drags after every query (#268). Keyed by column name. Omit both to
+   *  self-manage. */
+  columnWidths?: Record<string, number>;
+  onColumnWidthsChange?: (widths: Record<string, number>) => void;
   /**
    * Drop the control bar — the Results/Explain tabs, the view-mode switcher and
    * the row actions — and render the documents alone.
@@ -574,6 +580,8 @@ export const DataGrid: React.FC<DataGridProps> = ({
   viewMode: controlledViewMode,
   activeTab: controlledActiveTab,
   onActiveTabChange,
+  columnWidths: controlledColWidths,
+  onColumnWidthsChange,
   onViewModeChange,
   onCreateSuggestedIndex,
   connectionMode,
@@ -692,9 +700,19 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Chromeless callers have no tabs to switch and no explain plan to show.
   const effectiveTab = chromeless ? 'results' : activeTab;
 
-  // Column resize: table view keeps per-column widths (session-scoped — the
-  // column set changes per collection); the tree view's key column persists.
-  const [colWidths, setColWidths] = useState<Record<string, number>>({});
+  // Column resize: table view keeps per-column widths, owned by the caller for
+  // the same reason `viewMode` and `activeTab` are. Held here they died with
+  // every run — the grid remounts, the widths came back as {}, and a column
+  // widened to read a field snapped back to 180px (#268).
+  const [uncontrolledColWidths, setUncontrolledColWidths] = useState<Record<string, number>>({});
+  const colWidths = controlledColWidths ?? uncontrolledColWidths;
+  const setColWidths = (update: (prev: Record<string, number>) => Record<string, number>) => {
+    setUncontrolledColWidths(update);
+    // Computed from the widths on screen rather than from the uncontrolled copy,
+    // which a controlled caller never updates and which would otherwise send
+    // every drag as though it were the first.
+    onColumnWidthsChange?.(update(colWidths));
+  };
   const colWidth = (col: string) => colWidths[col] ?? 180;
   // The table header and the virtualized body are separate boxes: only the body
   // scrolls. Once resized columns overflow the viewport the header would stay

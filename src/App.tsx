@@ -194,6 +194,12 @@ export interface QueryTab {
   // Which results tab is showing, kept on the tab for the same reason as
   // viewMode: the grid remounts on every run (#281).
   resultsTab?: ResultsTab;
+  // Table column widths the user dragged, kept on the tab for the same reason
+  // again: re-running a query threw them away and every column snapped back to
+  // its default, so widening a column to read a field had to be redone after
+  // every run (#268). Keyed by column name, which is why this belongs to a tab
+  // — a tab is one collection, and its columns are that collection's.
+  columnWidths?: Record<string, number>;
   // An in-progress document edit belongs to the tab it was opened from, so it
   // survives a look at another tab and dies with this one (#277).
   documentEdit?: DocumentEdit;
@@ -265,6 +271,8 @@ function rowsAreStoredDocuments(tab: {
   if (tab.lastAggregate) return pipelineYieldsWholeDocuments(tab.lastAggregate);
   return !projectionComputesId(tab.lastQuery?.projection);
 }
+
+const EMPTY_COLUMN_WIDTHS: Record<string, number> = {};
 
 const DEFAULT_QUERY = { filter: '{}', sort: '{}', projection: '{}', limit: 50, skip: 0 };
 
@@ -760,6 +768,12 @@ function Workspace() {
   const handleResultsTabChange = useCallback((tabId: string, resultsTab: ResultsTab) => {
     setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, resultsTab } : t)));
   }, []);
+  const handleColumnWidthsChange = useCallback(
+    (tabId: string, columnWidths: Record<string, number>) => {
+      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, columnWidths } : t)));
+    },
+    []
+  );
   const handleChatMessagesChange = useCallback((tabId: string, messages: ChatMessage[]) => {
     const prev = tabChatCache.current.get(tabId);
     tabChatCache.current.set(tabId, { ...prev, messages, isOpen: prev?.isOpen ?? false });
@@ -4577,6 +4591,8 @@ function Workspace() {
                     onViewModeChange={(mode) => handleViewModeChange(tab.id, mode)}
                     activeTab={tab.resultsTab ?? 'results'}
                     onActiveTabChange={(t) => handleResultsTabChange(tab.id, t)}
+                    columnWidths={tab.columnWidths ?? EMPTY_COLUMN_WIDTHS}
+                    onColumnWidthsChange={(w) => handleColumnWidthsChange(tab.id, w)}
                     onCreateSuggestedIndex={s => handleCreateSuggestedIndex(tab, s)}
                     {...(!tab.lastAggregate ? {
                       onPageChange: (newSkip: number) => handlePageChange(tab, newSkip),
