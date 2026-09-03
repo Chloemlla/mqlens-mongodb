@@ -29,6 +29,17 @@ interface Pane {
   element: () => HTMLElement | null;
   /** Called when this pane should open its find bar. */
   open: () => void;
+  /**
+   * Whether the find bar is reachable in this pane right now.
+   *
+   * Separate from being registered, because the two questions are different:
+   * "which pane is the user in" is true of every pane always, while "can this
+   * one open a find bar" is only true while its results tab is showing. A pane
+   * that unregistered itself on the explain tab was invisible here, so the
+   * user's click landed on no pane and the next question — which pane owns a
+   * copy — was answered with somebody else's (#330 review).
+   */
+  canOpenFind?: () => boolean;
 }
 
 const panes = new Map<number, Pane>();
@@ -36,16 +47,35 @@ let nextId = 1;
 let lastPointedId: number | null = null;
 let listening = false;
 
-/** Editors and text fields keep their own find/typing behaviour. */
-function eventBelongsToAnEditor(target: EventTarget | null): boolean {
+/**
+ * Anywhere the user types: an editor, a text field, a contenteditable.
+ *
+ * No exceptions — including the find bar's own input, which is a text field
+ * like any other. Every results-pane shortcut owes these the same deference,
+ * because inside one the key means something about its content: Cmd/Ctrl+A in
+ * a query editor means "select this query", and a pane that took it would be
+ * answering for something it does not own.
+ */
+export function isTextEntryContext(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
-  // The find bar's own input is a text field but is not somebody else's: the
-  // shortcut pressed inside it means "search here again", not "leave me alone".
-  if (target.closest(`[${RESULTS_FIND_INPUT_ATTR}]`)) return false;
   if (target.closest(".monaco-editor")) return true;
   const tag = target.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
   return target.closest('[contenteditable="true"]') !== null;
+}
+
+/**
+ * Text entry, as the FIND shortcut sees it — one exception to the above.
+ *
+ * The find bar's own input is a text field but is not somebody else's: Ctrl+F
+ * pressed with the caret already in it means "search here again", not "leave me
+ * alone". That exception belongs to find alone. Select-all in that input means
+ * "select the search text" like in any other field, so it uses the plain
+ * predicate instead (#328 review).
+ */
+function eventBelongsToAnEditor(target: EventTarget | null): boolean {
+  if (target instanceof Element && target.closest(`[${RESULTS_FIND_INPUT_ATTR}]`)) return false;
+  return isTextEntryContext(target);
 }
 
 /** The registered pane containing `node`, if any. */
@@ -77,8 +107,8 @@ function paneContaining(node: EventTarget | null): Pane | undefined {
  *
  * With several panes and no signal at all, nothing opens rather than all of them.
  */
-function targetPane(event: KeyboardEvent): Pane | undefined {
-  const fromTarget = paneContaining(event.target);
+function paneForEventTarget(target: EventTarget | null): Pane | undefined {
+  const fromTarget = paneContaining(target);
   if (fromTarget) return fromTarget;
 
   const fromFocus = paneContaining(document.activeElement);
@@ -86,17 +116,38 @@ function targetPane(event: KeyboardEvent): Pane | undefined {
 
   // Anything else focused belongs to another region, and the key is its business.
   const unfocused =
-    event.target === null ||
-    event.target === document.body ||
-    event.target === document ||
-    event.target === window;
+    target === null ||
+    target === document.body ||
+    target === document ||
+    target === window;
   if (!unfocused) return undefined;
 
   if (lastPointedId !== null) {
     const pane = panes.get(lastPointedId);
     if (pane?.element()) return pane;
   }
-  return panes.size === 1 ? [...panes.values()][0] : undefined;
+  return undefined;
+}
+
+/**
+ * Find is more generous than that: with a single pane on screen and nothing
+ * else indicating one, Cmd/Ctrl+F opens it.
+ *
+ * That generosity suits opening a find bar, which is harmless and obviously
+ * what the user meant. It does not suit a key that replaces the selection:
+ * pressing Cmd/Ctrl+A while working in the sidebar would select results the
+ * user was not looking at. So it stays here, with find, rather than in the
+ * shared resolver (#328 review).
+ */
+function targetPane(event: KeyboardEvent): Pane | undefined {
+  const pane = paneForEventTarget(event.target);
+  if (pane) return pane;
+  const unfocused =
+    event.target === null ||
+    event.target === document.body ||
+    event.target === document ||
+    event.target === window;
+  return unfocused && panes.size === 1 ? [...panes.values()][0] : undefined;
 }
 
 function onKeyDown(event: KeyboardEvent): void {
@@ -107,7 +158,9 @@ function onKeyDown(event: KeyboardEvent): void {
   if (eventBelongsToAnEditor(event.target)) return;
 
   const pane = targetPane(event);
-  if (!pane) return;
+  // A pane with no find bar to open leaves the key alone rather than claiming
+  // it and doing nothing — the browser's own find is the better fallback.
+  if (!pane || pane.canOpenFind?.() === false) return;
   // Only now: leaving the key to the browser — and to Sidebar's own Cmd/Ctrl+F,
   // which stands down on defaultPrevented — when no pane claims it.
   event.preventDefault();
@@ -124,6 +177,14 @@ function onPointerDown(event: Event): void {
       return;
     }
   }
+  // Pointing somewhere else means the user has left: a pane the user pointed at
+  // ten minutes ago is not where they are now.
+  //
+  // This matters because most of the app is not focusable. Clicking a sidebar
+  // row moves focus nowhere, so the next keypress targets <body> and reads as
+  // "from nothing in particular" — and a remembered pane would answer for it,
+  // selecting results the user had already navigated away from (#328 review).
+  lastPointedId = null;
 }
 
 /**
@@ -153,6 +214,28 @@ export function registerResultsFindTarget(pane: Pane): () => void {
       listening = false;
     }
   };
+}
+
+/**
+ * The results pane an event is for, by exactly the reckoning the find shortcut
+ * uses — including its most important part, the event's own target.
+ *
+ * Exposed because "which pane is this for" is not a question about find. A copy
+ * has to answer it too, and so does select-all: several JSON views hear the same
+ * document-level event, and one of them has to be the one that responds (#330).
+ * Keeping a second notion of the active pane in the grid meant the two could
+ * disagree, and they did.
+ *
+ * Taking the target rather than only reading focus is what keeps a pane from
+ * answering for the rest of the app. An event from somewhere else that happens
+ * to be focused belongs to that somewhere else; only an event from nothing in
+ * particular falls back to the pane last pointed at (#328 review).
+ *
+ * `null` when nothing indicates a pane, which is the honest answer — the caller
+ * decides what to do without a preference.
+ */
+export function resultsPaneElementForEvent(target: EventTarget | null): HTMLElement | null {
+  return paneForEventTarget(target)?.element() ?? null;
 }
 
 /** Reset module state between tests. */

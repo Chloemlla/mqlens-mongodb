@@ -13,7 +13,11 @@ import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { EJSON } from 'bson';
 import { copyValueToText } from '../lib/copyValue';
 import { ResultsFindBar } from './ResultsFindBar';
-import { registerResultsFindTarget } from '../lib/resultsFindShortcut';
+import {
+  isTextEntryContext,
+  registerResultsFindTarget,
+  resultsPaneElementForEvent,
+} from '../lib/resultsFindShortcut';
 import { findMatches, isMatchAt, stepMatch, type FindCell } from '../lib/resultsFind';
 import {
   bsonCallOf,
@@ -515,8 +519,14 @@ const JsonRow = ({
           </button>
         )}
       </span>
+      {/* `select-text` re-enables selection against the app-wide
+          `body { user-select: none }`, and everything inside inherits it —
+          which is why the blanket `[&_*]:select-text` that used to sit here is
+          gone. It was not adding reach, it was overriding the row actions'
+          `select-none` below and dragging three empty buttons into every copy
+          (#329). */}
       <span
-        className="flex-1 whitespace-pre pr-4 text-foreground select-text [&_*]:select-text"
+        className="flex-1 whitespace-pre pr-4 text-foreground select-text"
         style={{ paddingLeft: line.depth * 18 }}
       >
         {renderContent(line)}
@@ -527,8 +537,13 @@ const JsonRow = ({
             {line.hasComma ? ',' : ''}
           </span>
         )}
+        {/* Controls, not content. They live inside the text span so they sit
+            next to the document they act on, but a selection that runs over
+            them must not pick them up: they carry no text, so the browser
+            serialised each button as its own empty block and a copied document
+            arrived with three blank lines under its opening brace (#329). */}
         {line.isDocRoot && hasRowActions && line.doc && (
-          <span className="ml-2.5 inline-flex align-middle opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
+          <span className="ml-2.5 inline-flex select-none align-middle opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
             <RowActions doc={line.doc} />
           </span>
         )}
@@ -790,16 +805,27 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Registered only while the results are actually showing: the find bar lives
   // in the results tab, so claiming the key from the explain or code tab would
   // swallow it and open a bar the user cannot see.
+  // Registered for the pane's whole life, not only while its results are
+  // showing. Being registered is what makes a click in this pane count as
+  // selecting it, and that is true on every tab: a pane on the explain tab used
+  // to vanish from the registry, so clicking it selected nothing and the copy
+  // it was about went to whichever pane was still registered (#330 review).
+  // Whether the find bar can open is asked separately, at the moment the key
+  // is pressed.
+  const effectiveTabRef = React.useRef(effectiveTab);
+  effectiveTabRef.current = effectiveTab;
   useEffect(() => {
-    if (effectiveTab !== 'results') return;
     return registerResultsFindTarget({
       element: () => paneRootRef.current,
+      canOpenFind: () => effectiveTabRef.current === 'results',
       open: () => {
         setFindOpen(true);
         setFindFocusToken((token) => token + 1);
       },
     });
-  }, [effectiveTab]);
+    // Registered once: re-registering on every tab change would mint a new id
+    // and drop the record of this pane having been pointed at.
+  }, []);
 
   const closeFind = React.useCallback(() => {
     setFindOpen(false);
@@ -1244,9 +1270,40 @@ export const DataGrid: React.FC<DataGridProps> = ({
     };
     document.addEventListener('selectionchange', onSelectionChange);
     return () => document.removeEventListener('selectionchange', onSelectionChange);
-  }, [viewMode]);
+    // The lines matter because a select-all is recorded as a row range, and its
+    // far end is the last line there is. The view no longer remounts between
+    // runs, so a listener left holding the previous result set would remember
+    // a select-all that stops short of the rows now on screen.
+  }, [viewMode, visibleJsonLines]);
 
-  const handleJsonCopy = (e: React.ClipboardEvent<HTMLDivElement>) => {
+  const handleJsonCopy = (e: ClipboardEvent) => {
+    // Another JSON view has already answered this event. Two can be on screen in
+    // a split, both listen on the document, and both would otherwise write to
+    // the clipboard — the second silently replacing the first (#330 review).
+    if (e.defaultPrevented) return;
+    const container = jsonViewRef.current;
+    if (!container) return;
+    // Whose copy is this? A drag settles it by itself: its endpoints are inside
+    // one view, and that view answers. A select-all leaves them on <body>,
+    // enclosing every view equally, so the pane the user last clicked in
+    // answers for it. With no click yet — a select-all into a fresh window —
+    // nobody is preferred, and the guard above makes the first to arrive the
+    // one that answers rather than the last.
+    const selection = document.getSelection();
+    const endpointsHere =
+      !!selection &&
+      ((!!selection.anchorNode && container.contains(selection.anchorNode)) ||
+        (!!selection.focusNode && container.contains(selection.focusNode)));
+    // Asked of the pane, not of this view. Selecting a pane includes clicking
+    // its toolbar — switching to JSON is itself such a click — and a notion of
+    // "active" that only counted clicks in the results body disagreed with the
+    // one the app already uses for shortcut routing (#330 review). One answer,
+    // one place: the pane holding focus, else the one last pointed at, else the
+    // only one. With several panes and no signal it returns null, and the
+    // `defaultPrevented` guard above makes the first view to arrive answer.
+    const activePane = resultsPaneElementForEvent(e.target);
+    const paneRoot = paneRootRef.current;
+    if (!endpointsHere && activePane && paneRoot && activePane !== paneRoot) return;
     const tracked = jsonRangeOf(jsonSelectionRef.current);
     if (!tracked) return;
     // Stand aside only when the browser can be trusted to copy this exactly,
@@ -1262,15 +1319,25 @@ export const DataGrid: React.FC<DataGridProps> = ({
     // present too.
     const ends = selectedJsonEnds();
     const live = ends && jsonRangeOf(ends);
-    const spansAll = !!live && live.start.row <= tracked.start.row && live.end.row >= tracked.end.row;
-    const container = jsonViewRef.current;
+    // Listening on the document means every copy in the app arrives here, so
+    // this view has to say whether it owns one. A live range is exactly that
+    // claim: `selectedJsonEnds` resolves an endpoint only for a selection that
+    // touches these rows, or encloses the view outright. Without it the
+    // remembered range would answer for a copy from the query editor.
+    if (!live) return;
+    const spansAll = live.start.row <= tracked.start.row && live.end.row >= tracked.end.row;
     const wanted = tracked.end.row - tracked.start.row + 1;
     const allMounted =
-      !!container &&
       container.querySelectorAll('[data-json-line]').length >= wanted &&
       !!container.querySelector(`[data-json-line="${tracked.start.row}"]`) &&
       !!container.querySelector(`[data-json-line="${tracked.end.row}"]`);
-    if (spansAll && allMounted) return;
+    // Standing aside says "the browser will copy exactly what this view holds",
+    // and that is only knowable when the selection lives inside this view. An
+    // enclosing selection covers the whole page, so leaving it to the browser
+    // yields every other selectable thing on it — in a split with two small
+    // panes, both panes' text, when the user asked for the one they clicked
+    // (#330 review). Those are rebuilt however many rows are mounted.
+    if (endpointsHere && spansAll && allMounted) return;
     const text = visibleJsonLines
       .slice(tracked.start.row, tracked.end.row + 1)
       .map((line, i) => {
@@ -1290,9 +1357,78 @@ export const DataGrid: React.FC<DataGridProps> = ({
       })
       .join('\n');
     if (!text) return;
+    if (!e.clipboardData) return;
     e.clipboardData.setData('text/plain', text);
     e.preventDefault();
   };
+
+  // The browser, not us, decides where a copy event lands: it targets the
+  // element holding the selection's focus, and a select-all leaves that on
+  // <body>. That is an ancestor of the React root, so an `onCopy` on the view
+  // is never reached and the copy fell through to the browser — which holds
+  // only the mounted screenful, or in practice nothing at all (#328).
+  //
+  // Listening on the document puts the handler where every copy passes,
+  // including the ones inside the view, which bubble here just the same. What
+  // it costs is the containment the React tree used to grant for free, so
+  // `handleJsonCopy` establishes that itself before it writes anything.
+  // Make the select-all a selection the page can actually see (#328).
+  //
+  // The app sets `user-select: none` on `body` so its chrome does not select
+  // like a web page. Under that, Chromium *paints* a select-all across the
+  // rows — every one of them highlights — while reporting the selection to
+  // script as collapsed and empty: `isCollapsed` true, `toString()` ''. So the
+  // browser had nothing to copy and neither did we, and the clipboard was left
+  // untouched. Not truncated: untouched, because there was nothing to truncate.
+  //
+  // Claiming the key and setting the range explicitly gives a real selection
+  // that both the native copy and the rebuild below can read. It is the better
+  // meaning of the shortcut too: in a results pane, select-all is about the
+  // results, not about the whole application around them.
+  useEffect(() => {
+    if (viewMode !== 'json') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if (e.key !== 'a' && e.key !== 'A') return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      // A query editor or a text field owns this key for its own content.
+      if (isTextEntryContext(e.target)) return;
+      const container = jsonViewRef.current;
+      if (!container) return;
+      // Same ownership question the copy asks, and the same answer: in a split,
+      // the pane the user is working in is the one that responds.
+      // Target-aware: an event from another region belongs to that region, and
+      // only one from nothing in particular falls back to the pane last pointed
+      // at. Reading focus alone let this pane answer for the whole app.
+      const active = resultsPaneElementForEvent(e.target);
+      if (active !== paneRootRef.current) return;
+      const selection = document.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(container);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      e.preventDefault();
+    };
+    // Capture, for the same reason the find shortcut uses it: to be ahead of
+    // any window-level handler that would otherwise claim the key first.
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => document.removeEventListener('keydown', onKeyDown, true);
+  }, [viewMode]);
+
+  const jsonCopyRef = React.useRef(handleJsonCopy);
+  useEffect(() => {
+    jsonCopyRef.current = handleJsonCopy;
+  });
+  useEffect(() => {
+    if (viewMode !== 'json') return;
+    const onCopy = (e: ClipboardEvent) => jsonCopyRef.current(e);
+    document.addEventListener('copy', onCopy);
+    // Nothing to unwind: ownership is the pane registry's, and a pane
+    // unregisters itself there when it goes.
+    return () => document.removeEventListener('copy', onCopy);
+  }, [viewMode]);
+
   const toggleFold = (id: number) => {
     setCollapsedFolds((prev) => {
       const next = new Set(prev);
@@ -2002,7 +2138,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
             onMouseDown={(e) => {
               if (e.button === 0) jsonSelectionRef.current = { anchor: null, focus: null };
             }}
-            onCopy={handleJsonCopy}
             className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed"
             data-testid="json-view"
           >
