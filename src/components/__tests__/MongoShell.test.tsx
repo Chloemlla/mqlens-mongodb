@@ -7,6 +7,7 @@ import {
   resetShellSessions,
   writeShellSession,
 } from '../../lib/mongoshSession';
+import { TabVisibleContext } from '../../workspace/tabVisibility';
 
 const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
@@ -33,6 +34,35 @@ vi.mock('@monaco-editor/react', () => ({
 }));
 
 describe('MongoShell Component', () => {
+  it('scrolls the transcript to the newest output when its hidden tab is shown again', async () => {
+    // A kept-alive tab (#240) is display:none while another tab is on screen.
+    // There scrollHeight is 0, so scrolling on new output resets the position
+    // — and nothing scrolled again on reveal, leaving the user at the top of
+    // the transcript instead of at the command that finished meanwhile.
+    const view = (visible: boolean) => (
+      <TabVisibleContext.Provider value={visible}>
+        <MongoShell connectionId="conn-1" connectionName="Local" connectionUri="mongodb://localhost:27017" databaseName="sales_db" sessionKey="shell-tab" />
+      </TabVisibleContext.Provider>
+    );
+    const { rerender } = render(view(true));
+    await screen.findByTestId('shell-restart-session');
+    const transcript = screen.getByTestId('shell-transcript');
+    let shown = true;
+    Object.defineProperty(transcript, 'scrollHeight', { configurable: true, get: () => (shown ? 500 : 0) });
+
+    shown = false;
+    rerender(view(false));
+    transcript.scrollTop = 0;
+    fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.orders.countDocuments()' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+    await screen.findByText('mongosh result');
+    expect(transcript.scrollTop).toBe(0);
+
+    shown = true;
+    rerender(view(true));
+    expect(transcript.scrollTop).toBe(500);
+  });
+
   beforeEach(() => {
     resetShellSessions();
     vi.clearAllMocks();
