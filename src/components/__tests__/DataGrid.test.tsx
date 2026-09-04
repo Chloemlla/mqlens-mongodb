@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, cleanup } from '@testing-library/react';
 
 // Monaco renders the Query Code panel; mock it as a plain textarea (same shape
 // as the other component tests) so assertions can read the generated code.
@@ -611,6 +611,98 @@ describe('DataGrid — Compare documents', () => {
     openMenuForRow('Bob');
     expect(screen.getByText('Compare with…')).toBeInTheDocument();
     expect(screen.queryByText('Compare with selected')).not.toBeInTheDocument();
+  });
+});
+
+
+// #268: re-running a query threw away every column width. The results pane
+// renders `{loading ? <spinner/> : <DataGrid/>}`, so the grid unmounts on every
+// run and its widths came back as {} — a column widened to read a field snapped
+// straight back to its default, after every single run.
+describe('DataGrid — column widths survive a run (#268)', () => {
+  const widen = (label: RegExp) => {
+    const handle = screen.getByRole('separator', { name: label });
+    fireEvent.keyDown(handle, { key: 'ArrowRight' });
+    return handle;
+  };
+
+  it('reports a resize to the caller that owns the widths', () => {
+    const onColumnWidthsChange = vi.fn();
+    render(
+      <DataGrid documents={mockDocuments} columnWidths={{}} onColumnWidthsChange={onColumnWidthsChange} />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    widen(/resize name column/i);
+
+    expect(onColumnWidthsChange).toHaveBeenCalledTimes(1);
+    // 180 default + one 16px step.
+    expect(onColumnWidthsChange.mock.calls[0][0]).toMatchObject({ name: 196 });
+  });
+
+  it('renders the width the caller gives it, so a remount keeps it', () => {
+    // The remount is the bug: this is what the grid comes back as after a run.
+    const { unmount } = render(<DataGrid documents={mockDocuments} columnWidths={{ name: 320 }} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(screen.getByTestId('table-header').textContent).toContain('name');
+    unmount();
+
+    render(<DataGrid documents={mockDocuments} columnWidths={{ name: 320 }} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    // Widened again from 320, not from the 180 default — which is only true if
+    // the width came from the caller rather than from remounted local state.
+    const onColumnWidthsChange = vi.fn();
+    cleanup();
+    render(
+      <DataGrid
+        documents={mockDocuments}
+        columnWidths={{ name: 320 }}
+        onColumnWidthsChange={onColumnWidthsChange}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    widen(/resize name column/i);
+    expect(onColumnWidthsChange.mock.calls[0][0]).toMatchObject({ name: 336 });
+  });
+
+  it('measures a resize made after a run from the width the run kept', () => {
+    // The whole scenario, in order: widen a column, run the query — which
+    // unmounts the grid — then widen again. The second drag has to start from
+    // the kept width, which is only true if the grid reads the caller's copy
+    // rather than the local one the remount just emptied.
+    const widths: Record<string, number> = {};
+    const onColumnWidthsChange = vi.fn((next: Record<string, number>) => {
+      Object.assign(widths, next);
+    });
+    const grid = () => (
+      <DataGrid
+        documents={mockDocuments}
+        columnWidths={{ ...widths }}
+        onColumnWidthsChange={onColumnWidthsChange}
+      />
+    );
+
+    render(grid());
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    widen(/resize name column/i);
+    expect(widths.name).toBe(196); // 180 + 16
+
+    // The run: spinner replaces the grid, then the grid comes back.
+    cleanup();
+    render(grid());
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    widen(/resize name column/i);
+
+    expect(widths.name).toBe(212); // 196 + 16, not 196 again
+  });
+
+  it('still manages its own widths when nobody owns them', () => {
+    // MongoShell renders the grid with nothing to persist to; it must keep
+    // working exactly as before.
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(() => widen(/resize name column/i)).not.toThrow();
   });
 });
 
