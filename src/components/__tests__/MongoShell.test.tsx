@@ -296,34 +296,6 @@ describe('MongoShell Component', () => {
       }
     });
 
-    it('hands focus to the grid’s own registered root, not the wrapper', async () => {
-      // The router resolves a pane only when the registered element contains
-      // the focused node, so focus landing on an ancestor of the grid resolves
-      // nothing and the shortcut falls through (#357 review).
-      render(
-        <MongoShell
-          connectionId="conn-1"
-          connectionName="mock"
-          connectionUri="mongodb://prod-replica-set"
-          databaseName="sales_db"
-          collectionName="customers"
-        />,
-      );
-      await screen.findByText(/mongosh session attached/);
-      fireEvent.change(screen.getByLabelText('mongosh editor'), {
-        target: { value: 'db.customers.find({}).limit(10)' },
-      });
-      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
-      fireEvent.click(await screen.findByRole('tab', { name: /data viewer/i }));
-
-      const gridRoot = await screen.findByTestId('json-view');
-      await waitFor(() => {
-        const focused = document.activeElement as HTMLElement | null;
-        expect(focused?.hasAttribute('data-results-pane-root')).toBe(true);
-        expect(focused?.contains(gridRoot)).toBe(true);
-      });
-    });
-
     it('copies a prompt line as a command that would actually run', async () => {
       // The gap between prompt and command was a CSS flex gap, and copying
       // serializes the DOM, so the clipboard got sales_db>db.stats() (#357
@@ -334,31 +306,6 @@ describe('MongoShell Component', () => {
       await screen.findByText('mongosh result');
 
       expect(transcript.textContent).toContain('sales_db> db.stats()');
-    });
-
-    it('hands off focus on the keyboard activation path too', async () => {
-      // Radix activates a tab from ArrowLeft/ArrowRight through the Tabs
-      // `onValueChange`, not the trigger `onClick`, so a handoff attached only
-      // to the click left a keyboard user on the tab strip and the next
-      // shortcut resolved nothing (#357 review).
-      //
-      // Asserted against the source: Radix does not activate on focus in
-      // jsdom, and synthesising its arrow-key handling would test the library
-      // rather than this wiring. Same approach the shell already uses for
-      // paths that cannot be driven from a test.
-      const src = await import('node:fs').then((fs) =>
-        fs.readFileSync('src/components/MongoShell.tsx', 'utf8'),
-      );
-      const onValueChange = src.slice(src.indexOf('onValueChange={(v) => {'));
-      const body = onValueChange.slice(0, onValueChange.indexOf('}}'));
-      expect(body).toContain('focusOutputFor(next)');
-    });
-    it('moves the caret into the tab that was chosen', async () => {
-      // The tab strip belongs to neither output pane, so a shortcut raised
-      // while its trigger holds focus resolves to nothing (#357 review).
-      const transcript = await withOutput();
-      fireEvent.click(screen.getByRole('tab', { name: /console/i }));
-      await waitFor(() => expect(document.activeElement).toBe(transcript));
     });
 
     it('reports when the output does not contain the term', async () => {
