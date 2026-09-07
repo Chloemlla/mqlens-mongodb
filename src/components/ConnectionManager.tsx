@@ -244,7 +244,12 @@ export const summarizeConnectionError = (raw: string): ConnectionErrorSummary =>
 // Used both when editing a saved profile and when importing a pasted URI.
 export const parseUriIntoFields = (uri: string) => {
   const isSrv = /^mongodb\+srv:\/\//i.test(uri);
-  const m = uri.match(/mongodb(?:\+srv)?:\/\/(?:([^:@]+):([^@]*)@)?([^/?]+)(?:\/([^?]*))?(?:\?(.*))?/i);
+  // The password is optional: X.509 and Kerberos authenticate without one and
+  // buildUri emits username-only userinfo for them, which a credentials group
+  // requiring a colon read as part of the hostname. Excluding `/` and `?` from
+  // the username keeps a query string containing `@` from being mistaken for
+  // credentials now that the colon is no longer required (#349 review).
+  const m = uri.match(/mongodb(?:\+srv)?:\/\/(?:([^:@/?]+)(?::([^@/?]*))?@)?([^/?]+)(?:\/([^?]*))?(?:\?(.*))?/i);
   let authUser = '';
   let authPass = '';
   let hostStr = isSrv ? 'localhost' : 'localhost:27017';
@@ -255,6 +260,14 @@ export const parseUriIntoFields = (uri: string) => {
   let tlsAllowInvalidCerts = false;
   let tlsAllowInvalidHosts = false;
   let authMethod = 'none';
+  // Auth settings default to what a blank form would hold. Everything the
+  // editor rebuilds from a saved URI has to be read back here: a field left
+  // unparsed silently reverts to the blank default when a saved connection is
+  // reopened, which is how a non-admin auth database came back as `admin` and
+  // quietly changed the authSource the connection used (#349).
+  let authDb = 'admin';
+  let awsSessionToken = '';
+  let kerberosServiceName = '';
   let query = '';
   if (m) {
     authUser = m[1] ? decodeURIComponent(m[1]) : '';
@@ -278,7 +291,50 @@ export const parseUriIntoFields = (uri: string) => {
     const insecure = /(?:^|&)tlsInsecure=true/i.test(query);
     tlsAllowInvalidCerts = insecure || /(?:^|&)tlsAllowInvalidCertificates=true/i.test(query);
     tlsAllowInvalidHosts = insecure || /(?:^|&)tlsAllowInvalidHostnames=true/i.test(query);
-    if (authUser) authMethod = 'scram-256';
+    // The inverse of the mechanism buildUri writes. Without this a saved
+    // SCRAM-SHA-1 or X.509 connection reopened as SCRAM-SHA-256.
+    const mechanisms: Record<string, string> = {
+      'SCRAM-SHA-1': 'scram-1',
+      'SCRAM-SHA-256': 'scram-256',
+      'MONGODB-X509': 'x509',
+      'MONGODB-AWS': 'aws',
+      GSSAPI: 'kerberos',
+      PLAIN: 'ldap',
+    };
+    const mechanism = mechanisms[(param('authMechanism') || '').toUpperCase()];
+    // A URI with credentials and no mechanism is SCRAM, the server default.
+    // X.509 carries no username, so the mechanism alone decides there.
+    if (mechanism) authMethod = mechanism;
+    else if (authUser) authMethod = 'scram-256';
+    // `$external` is not a database the user picks; it is what the external
+    // mechanisms authenticate against, and buildUri writes it from the
+    // mechanism rather than from this field.
+    const authSource = param('authSource');
+    if (authSource && authSource !== '$external') {
+      authDb = authSource;
+    } else if (!authSource && (authMethod === 'scram-1' || authMethod === 'scram-256')) {
+      // With no authSource, MongoDB authenticates against the path database
+      // and only falls back to admin when the path is empty — the same rule
+      // the backend applies in `strip_path_database`. Reporting admin here
+      // named a database the connection was not using, and left editing the
+      // default database silently moving where authentication happens.
+      let pathDb = defaultDb;
+      try {
+        pathDb = decodeURIComponent(defaultDb);
+      } catch {
+        // A malformed escape is left as written rather than failing the parse.
+      }
+      if (pathDb) authDb = pathDb;
+    }
+    // Split on the first colon only: the key never contains one, the value may.
+    for (const entry of (param('authMechanismProperties') || '').split(',')) {
+      const at = entry.indexOf(':');
+      if (at < 0) continue;
+      const key = entry.slice(0, at).trim().toUpperCase();
+      const value = entry.slice(at + 1);
+      if (key === 'AWS_SESSION_TOKEN') awsSessionToken = value;
+      else if (key === 'SERVICE_NAME') kerberosServiceName = value;
+    }
   }
   const hosts = hostStr.split(',').map((h) => {
     const [host, port] = h.split(':');
@@ -299,6 +355,9 @@ export const parseUriIntoFields = (uri: string) => {
     authUser,
     authPass,
     authMethod,
+    authDb,
+    awsSessionToken,
+    kerberosServiceName,
     tlsMode,
     tlsCa,
     tlsClientCert,
@@ -364,8 +423,24 @@ export const buildUri = (s: typeof BLANK_CONN) => {
   const isExternalAuth = ['x509', 'aws', 'kerberos', 'ldap'].includes(s.authMethod);
   if (isExternalAuth) {
     params.push('authSource=$external');
-  } else if (s.authMethod !== 'none' && s.authDb && s.authDb !== 'admin') {
-    params.push(`authSource=${s.authDb}`);
+  } else if (s.authMethod !== 'none' && s.authDb) {
+    // With authSource omitted MongoDB authenticates against the path database,
+    // or admin when there is no path. So the parameter is redundant only when
+    // it already matches that: dropping an explicit `admin` beside a path
+    // database moved authentication onto that database on the next save
+    // (#349 review).
+    // The path is compared decoded, because that is the form the auth database
+    // is held in, and the value is written back encoded: an unescaped `&` in a
+    // database name would start another query option and change what the URI
+    // means (#349 review).
+    let pathDb = s.defaultDb;
+    try {
+      pathDb = decodeURIComponent(s.defaultDb);
+    } catch {
+      // A malformed escape compares as written.
+    }
+    const implied = pathDb || 'admin';
+    if (s.authDb !== implied) params.push(`authSource=${encodeURIComponent(s.authDb)}`);
   }
   // Mechanism-specific properties (M5).
   if (s.authMethod === 'aws' && s.awsSessionToken) {

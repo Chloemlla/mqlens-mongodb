@@ -37,8 +37,22 @@ import { cn } from '@/lib/utils';
 import { useTabVisible } from '@/workspace/tabVisibility';
 import type { SpacingDensity } from '@/lib/themes/schema';
 
+/** A document's identity for comparing result sets, tolerant of any `_id` shape. */
+function stableDocId(doc: Record<string, any>): string {
+  try {
+    return JSON.stringify(doc?._id ?? null);
+  } catch {
+    return '';
+  }
+}
+
 interface DataGridProps {
   documents: Array<Record<string, any>>;
+  /** A run is in flight. The grid stays mounted and keeps showing the previous
+   *  results under a loading overlay, rather than being replaced by a spinner
+   *  — which unmounted it on every run and threw away its folds, its find bar,
+   *  its scroll position and everything else it holds (#344). */
+  loading?: boolean;
   density?: 'roomy' | 'cozy' | 'compact';
   explainResult?: string | null;
   // The query that produced these results, rendered as runnable driver code
@@ -59,10 +73,11 @@ interface DataGridProps {
   onPageChange?: (newSkip: number) => void;
   onPageSizeChange?: (newLimit: number) => void;
   /** Results view mode, owned by the caller so it survives this grid being
-   *  unmounted. The results pane renders `{loading ? <spinner/> : <DataGrid/>}`,
-   *  so the grid remounts on EVERY run, and switching tabs unmounts the whole
-   *  DocumentViewer subtree — local state reset to 'json' both times. Omit both
-   *  props to keep the old self-managed behaviour (MongoShell does). */
+   *  unmounted. The results pane used to render
+   *  `{loading ? <spinner/> : <DataGrid/>}`, remounting the grid on every run;
+   *  that is gone (#344), but switching tabs can still unmount the whole
+   *  DocumentViewer subtree, so the mode stays lifted. Omit both props to keep
+   *  the self-managed behaviour (MongoShell does). */
   viewMode?: ViewMode;
   onViewModeChange?: (mode: ViewMode) => void;
   /** Which results tab is showing. Owned by the caller for the same reason as
@@ -561,6 +576,7 @@ const JsonRow = ({
 
 export const DataGrid: React.FC<DataGridProps> = ({
   documents,
+  loading = false,
   density: densityProp,
   explainResult = null,
   querySpec = null,
@@ -604,6 +620,14 @@ export const DataGrid: React.FC<DataGridProps> = ({
   );
 
   // Right-click context menu shared by all result views (Table / Tree / JSON).
+  // A run in flight takes the grid out of reach: the overlay covers it, and
+  // `inert` takes the controls under it out of the tab order too, so a stale
+  // row cannot be acted on by keyboard either. An open context menu is
+  // portaled outside that subtree, so it is closed rather than covered.
+  useEffect(() => {
+    if (loading) setCtxMenu(null);
+  }, [loading]);
+
   const [ctxMenu, setCtxMenu] = useState<
     { x: number; y: number; doc: Record<string, any>; field?: string; value?: any } | null
   >(null);
@@ -721,6 +745,10 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // the body's horizontal scroll onto the header.
   const tableHeaderRef = React.useRef<HTMLDivElement>(null);
   const tableBodyRef = React.useRef<HTMLDivElement>(null);
+  // The JSON view's horizontal scroller is the overflow-auto wrapper around its
+  // list, not the list element: the list is widened to `jsonMaxWidthPx`, so the
+  // wrapper is what carries scrollLeft.
+  const jsonScrollRef = React.useRef<HTMLDivElement>(null);
   useEffect(() => {
     const body = tableBodyRef.current;
     if (!body) return;
@@ -860,10 +888,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Collapsed rows in the tree-table view (separate id space from JSON folds).
   const [treeCollapsed, setTreeCollapsed] = useState<Set<number>>(new Set());
 
-  // Reset JSON fold state whenever the result set changes (fold ids are positional).
-  useEffect(() => {
-    setCollapsedFolds(new Set());
-  }, [documents]);
+  // JSON folds are reset further down, once the lines they index are known.
 
   // Switch to the explain tab when a NEW plan arrives — not merely because one
   // exists.
@@ -1085,6 +1110,60 @@ export const DataGrid: React.FC<DataGridProps> = ({
     return { jsonLines: lines, jsonMaxWidthPx: maxWidthPx };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsedDocs, documents]);
+
+  // The result's identity: what was asked for — the query, the page — and the
+  // shape of what came back: its documents in order, then every foldable
+  // block in order with where it sits (document, depth, key). Fold ids are
+  // positional, and this is what makes them meaningful again on a new array:
+  // a re-run of the same query returns the same identity — the case where
+  // losing every fold on every run was the complaint (#344) — while another
+  // page, another query, or the same documents with their fields rearranged
+  // do not. Neither half would do alone: an aggregation's documents may all
+  // lack an _id, and a projection may drop it, so two pages can have the same
+  // shape; and the same query may return new documents.
+  //
+  // Two things hang off it. Folds — JSON and tree — are kept across the same
+  // identity and reset otherwise. The scroll position likewise: a refresh
+  // keeps the user's place, a new page starts at its first row — now that the
+  // grid stays mounted, nothing else would move it there.
+  const resultShape = useMemo(() => {
+    // One JSON serialization of everything that identifies the result, so no
+    // field name can impersonate a delimiter: an unescaped separator let a key
+    // like `x\u0001open/0/2/y` reproduce two fold-path parts and collide two
+    // structurally different results (#344 review). `empty` lines count
+    // alongside `open`: an empty container is not foldable in the JSON view but
+    // still takes a fold id in the tree, so one shifts every id after it.
+    const folds: Array<[string, number, number, string]> = [];
+    for (const line of jsonLines) {
+      if (line.kind === 'open' || line.kind === 'empty') {
+        folds.push([line.kind, line.docIndex, line.depth, line.keyName ?? '']);
+      }
+    }
+    return JSON.stringify([
+      querySpec ?? null,
+      skip ?? null,
+      limit ?? null,
+      documents.map(stableDocId),
+      folds,
+    ]);
+  }, [querySpec, skip, limit, jsonLines, documents]);
+  useEffect(() => {
+    setCollapsedFolds(new Set());
+    // A different result opens at the top-left, not wherever the last one was
+    // left scrolled. `scrollToRow` resets only the vertical offset and throws
+    // on an out-of-range index, so it is guarded.
+    for (const list of [jsonListRef, treeListRef, tableListRef]) {
+      if (documents.length > 0) list.current?.scrollToRow({ index: 0, align: 'start' });
+    }
+    // The horizontal offset lives on the overflow-auto wrappers, not the List
+    // elements: the JSON list is widened to `jsonMaxWidthPx` and the table body
+    // to its total column width, so those wrappers carry scrollLeft. The table
+    // header mirrors the body and is reset with it. (The tree view is
+    // full-width with no horizontal scroll.)
+    for (const scroller of [jsonScrollRef.current, tableBodyRef.current, tableHeaderRef.current]) {
+      if (scroller) scroller.scrollLeft = 0;
+    }
+  }, [resultShape]);
 
   // Only the lines not hidden inside a collapsed fold are rendered/virtualized.
   const visibleJsonLines = useMemo(
@@ -1545,10 +1624,15 @@ export const DataGrid: React.FC<DataGridProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsedDocs, documents]);
 
-  // Apply the default collapse set whenever the result set (and thus rows) changes.
+  // Apply the default collapse set when the result changes — by identity, not
+  // by array: a re-run of the same query rebuilds the rows and the defaults,
+  // but the tree the user has opened up is the same tree, so it stays (#344).
+  const treeShapeRef = React.useRef<string | null>(null);
   useEffect(() => {
+    if (treeShapeRef.current === resultShape) return;
+    treeShapeRef.current = resultShape;
     setTreeCollapsed(new Set(treeDefaultCollapsed));
-  }, [treeDefaultCollapsed]);
+  }, [resultShape, treeDefaultCollapsed]);
 
   // The text of one tree row: all three columns, since all three are on screen.
   // Container rows show their child count, so that label is searchable too.
@@ -1926,10 +2010,41 @@ export const DataGrid: React.FC<DataGridProps> = ({
     );
   };
   return (
+    <>
+      {/* The accessible announcement of a run in flight, kept OUTSIDE the inert
+          root below. `inert` removes its whole subtree from the accessibility
+          tree, so a live region rendered inside it would be silent to a screen
+          reader (#344 review). */}
+      {loading && (
+        <div role="status" className="sr-only">
+          {t('documents:dataGrid.labels.streamingDocuments')}
+        </div>
+      )}
     <div
       ref={paneRootRef}
-      className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+      className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+      aria-busy={loading || undefined}
+      // Everything under it — row actions, paging, the write buttons — is
+      // unreachable while a run is in flight, by pointer and by keyboard alike.
+      // The overlay below is decorative (aria-hidden); its accessible
+      // counterpart is the live region above, outside this inert subtree.
+      inert={loading || undefined}
     >
+      {/* A run in flight. Over the previous results, not in their place: the
+          grid stays mounted, so nothing it holds is lost, and the last result
+          stays readable until the next one lands (#344). */}
+      {loading && (
+        <div
+          aria-hidden
+          data-testid="results-loading"
+          className="absolute inset-0 z-50 flex items-center justify-center bg-background/60 text-muted-foreground"
+        >
+          <div className="flex select-none flex-col items-center gap-2">
+            <div className="h-5 w-5 animate-spin rounded-full border-b-2 border-primary" />
+            <span className="text-xs">{t('documents:dataGrid.labels.streamingDocuments')}</span>
+          </div>
+        </div>
+      )}
       {/* Control Bar — omitted for a chromeless render, where none of these
           controls have anything to act on. */}
       {!chromeless && (
@@ -2167,7 +2282,11 @@ export const DataGrid: React.FC<DataGridProps> = ({
             className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed"
             data-testid="json-view"
           >
-            <div className="min-h-0 flex-1 min-w-0 overflow-auto">
+            <div
+              ref={jsonScrollRef}
+              data-testid="json-scroll"
+              className="min-h-0 flex-1 min-w-0 overflow-auto"
+            >
               <List<JsonRowExtra>
                 rowCount={visibleJsonLines.length}
                 listRef={jsonListRef}
@@ -2480,5 +2599,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
         />
       )}
     </div>
+    </>
   );
 };
