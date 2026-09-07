@@ -17,6 +17,7 @@ import {
   isTextEntryContext,
   registerResultsFindTarget,
   resultsPaneElementForEvent,
+  RESULTS_PANE_ROOT_ATTR,
 } from '../lib/resultsFindShortcut';
 import { findMatches, isMatchAt, stepMatch, type FindCell } from '../lib/resultsFind';
 import {
@@ -2022,7 +2023,12 @@ export const DataGrid: React.FC<DataGridProps> = ({
       )}
     <div
       ref={paneRootRef}
-      className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+      className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background outline-none"
+      // This is the element registered as the find target, so it is also the
+      // one focus has to land on for the shortcut to resolve here. Focusable
+      // programmatically only — Tab still walks past it to the real controls.
+      {...{ [RESULTS_PANE_ROOT_ATTR]: '' }}
+      tabIndex={-1}
       aria-busy={loading || undefined}
       // Everything under it — row actions, paging, the write buttons — is
       // unreachable while a run is in flight, by pointer and by keyboard alike.

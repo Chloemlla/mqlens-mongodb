@@ -23,6 +23,16 @@
  */
 export const RESULTS_FIND_INPUT_ATTR = "data-results-find-input";
 
+/**
+ * Marks a registered pane's own root element.
+ *
+ * The router resolves a pane only when the registered element *contains* the
+ * focused node, so anything handing focus to a pane from outside has to land
+ * inside that exact element — a wrapper around it does not count. This is how
+ * such a caller finds it without reaching for a private ref (#357 review).
+ */
+export const RESULTS_PANE_ROOT_ATTR = "data-results-pane-root";
+
 /** A registered results pane. */
 interface Pane {
   /** Its root element, used to decide which pane the user means. */

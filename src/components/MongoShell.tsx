@@ -29,6 +29,7 @@ import {
   isTextEntryContext,
   registerResultsFindTarget,
   resultsPaneElementForEvent,
+  RESULTS_PANE_ROOT_ATTR,
 } from '../lib/resultsFindShortcut';
 import { findMatches, isMatchAt, stepMatch, type FindCell } from '../lib/resultsFind';
 import { useTabVisible } from '../workspace/tabVisibility';
@@ -1636,7 +1637,16 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                   className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
                   onClick={() => {
                     setTab('viewer');
-                    requestAnimationFrame(() => viewerPaneRef.current?.focus());
+                    requestAnimationFrame(() => {
+                      // Into the grid's own registered root, not this wrapper
+                      // around it: the router resolves a pane only when the
+                      // registered element contains the focused node, so focus
+                      // landing on an ancestor resolves nothing (#357 review).
+                      const gridRoot = viewerPaneRef.current?.querySelector<HTMLElement>(
+                        `[${RESULTS_PANE_ROOT_ATTR}]`
+                      );
+                      (gridRoot ?? viewerPaneRef.current)?.focus();
+                    });
                   }}
                 >
                   <Braces size={12} className={tab === 'viewer' ? 'text-primary' : ''} />

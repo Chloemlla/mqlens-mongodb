@@ -296,6 +296,34 @@ describe('MongoShell Component', () => {
       }
     });
 
+    it('hands focus to the grid’s own registered root, not the wrapper', async () => {
+      // The router resolves a pane only when the registered element contains
+      // the focused node, so focus landing on an ancestor of the grid resolves
+      // nothing and the shortcut falls through (#357 review).
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+          collectionName="customers"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.customers.find({}).limit(10)' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      fireEvent.click(await screen.findByRole('tab', { name: /data viewer/i }));
+
+      const gridRoot = await screen.findByTestId('json-view');
+      await waitFor(() => {
+        const focused = document.activeElement as HTMLElement | null;
+        expect(focused?.hasAttribute('data-results-pane-root')).toBe(true);
+        expect(focused?.contains(gridRoot)).toBe(true);
+      });
+    });
+
     it('moves the caret into the tab that was chosen', async () => {
       // The tab strip belongs to neither output pane, so a shortcut raised
       // while its trigger holds focus resolves to nothing (#357 review).
