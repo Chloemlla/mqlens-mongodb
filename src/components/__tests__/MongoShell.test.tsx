@@ -308,6 +308,50 @@ describe('MongoShell Component', () => {
       expect(transcript.textContent).toContain('sales_db> db.stats()');
     });
 
+    it('brings the active match back into view after a trip to the Data Viewer', async () => {
+      // Leaving unmounts the console subtree; coming back builds a fresh
+      // transcript scrolled to the top. Nothing the scroll effect watched
+      // changed across that, and bottom-pinning stands down while a search has
+      // matches, so the status named a match that was off screen (#357 review).
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+          collectionName="customers"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.customers.find({}).limit(10)' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      const viewerTab = await screen.findByRole('tab', { name: /data viewer/i });
+
+      // A recognised find switches to the viewer on its own; go back to the
+      // console, which is what the search is over.
+      fireEvent.click(screen.getByRole('tab', { name: /console/i }));
+      const transcript = await screen.findByTestId('shell-transcript');
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'Connecting to' },
+      });
+      await screen.findByTestId('results-find-status');
+
+      const scrolled = vi.fn();
+      const original = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = scrolled;
+      try {
+        fireEvent.click(viewerTab);
+        fireEvent.click(screen.getByRole('tab', { name: /console/i }));
+        await waitFor(() => expect(scrolled).toHaveBeenCalled());
+      } finally {
+        Element.prototype.scrollIntoView = original;
+      }
+    });
+
     it('reports when the output does not contain the term', async () => {
       const transcript = await withOutput();
       fireEvent.pointerDown(transcript);

@@ -655,7 +655,12 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   // including after output arrives underneath it and moves it.
   useEffect(() => {
     activeMatchRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [activeFind, findQuery, entries]);
+    // `tab` too: leaving for the Data Viewer unmounts the console subtree, and
+    // coming back builds a fresh transcript scrolled to the top. Nothing else
+    // here changes across that, and bottom-pinning stands down while a search
+    // has matches, so the status kept naming a match that was off screen
+    // (#357 review).
+  }, [activeFind, findQuery, entries, tab]);
 
   const closeFind = useCallback(() => {
     setFindOpen(false);
