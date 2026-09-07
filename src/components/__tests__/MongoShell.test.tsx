@@ -324,6 +324,35 @@ describe('MongoShell Component', () => {
       });
     });
 
+    it('copies a prompt line as a command that would actually run', async () => {
+      // The gap between prompt and command was a CSS flex gap, and copying
+      // serializes the DOM, so the clipboard got sales_db>db.stats() (#357
+      // review). The separator has to be a real text node.
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      expect(transcript.textContent).toContain('sales_db> db.stats()');
+    });
+
+    it('hands off focus on the keyboard activation path too', async () => {
+      // Radix activates a tab from ArrowLeft/ArrowRight through the Tabs
+      // `onValueChange`, not the trigger `onClick`, so a handoff attached only
+      // to the click left a keyboard user on the tab strip and the next
+      // shortcut resolved nothing (#357 review).
+      //
+      // Asserted against the source: Radix does not activate on focus in
+      // jsdom, and synthesising its arrow-key handling would test the library
+      // rather than this wiring. Same approach the shell already uses for
+      // paths that cannot be driven from a test.
+      const src = await import('node:fs').then((fs) =>
+        fs.readFileSync('src/components/MongoShell.tsx', 'utf8'),
+      );
+      const onValueChange = src.slice(src.indexOf('onValueChange={(v) => {'));
+      const body = onValueChange.slice(0, onValueChange.indexOf('}}'));
+      expect(body).toContain('focusOutputFor(next)');
+    });
     it('moves the caret into the tab that was chosen', async () => {
       // The tab strip belongs to neither output pane, so a shortcut raised
       // while its trigger holds focus resolves to nothing (#357 review).

@@ -659,6 +659,27 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     activeMatchRef.current?.scrollIntoView({ block: 'nearest' });
   }, [activeFind, findQuery, entries]);
 
+  /**
+   * Move the caret into the output the user just chose.
+   *
+   * The tab strip belongs to neither output pane, so a shortcut raised while a
+   * trigger holds focus resolves to nothing and falls through to the browser.
+   * The viewer's target is the grid's own registered root — an ancestor of it
+   * does not count, since the router matches on containment (#357 review).
+   */
+  const focusOutputFor = useCallback((next: ShellTab) => {
+    requestAnimationFrame(() => {
+      if (next === 'console') {
+        scrollRef.current?.focus();
+        return;
+      }
+      const gridRoot = viewerPaneRef.current?.querySelector<HTMLElement>(
+        `[${RESULTS_PANE_ROOT_ATTR}]`
+      );
+      (gridRoot ?? viewerPaneRef.current)?.focus();
+    });
+  }, []);
+
   const closeFind = useCallback(() => {
     setFindOpen(false);
     setFindQuery('');
@@ -1613,19 +1634,29 @@ export const MongoShell: React.FC<MongoShellProps> = ({
 
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="flex items-center gap-1 border-b border-border bg-card px-2 py-1">
-          <Tabs value={tab} onValueChange={(v) => setTab(v as ShellTab)}>
+          <Tabs
+            value={tab}
+            onValueChange={(v) => {
+              const next = v as ShellTab;
+              setTab(next);
+              // Here rather than on the triggers' onClick: Radix activates a tab
+              // from ArrowLeft/ArrowRight through this path only, so a keyboard
+              // user was left with focus on the tab strip — which belongs to
+              // neither output pane — and the next Cmd/Ctrl+F resolved nothing
+              // (#357 review).
+              focusOutputFor(next);
+            }}
+          >
             <TabsList className="h-8 bg-transparent p-0">
               <TabsTrigger
                 value="console"
                 className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
                 onClick={() => {
+                  // Both paths: a click lands here, ArrowLeft/ArrowRight lands on
+                  // the Tabs onValueChange above. Calling the handoff twice is
+                  // harmless, and missing either leaves focus on the strip.
                   setTab('console');
-                  // The tab strip belongs to neither output pane, so a shortcut
-                  // raised while its trigger holds focus resolves to nothing and
-                  // falls through to the browser. Choosing a tab moves the caret
-                  // into what was chosen, which is where the next Cmd/Ctrl+F is
-                  // meant to act anyway (#357 review).
-                  requestAnimationFrame(() => scrollRef.current?.focus());
+                  focusOutputFor('console');
                 }}
               >
                 <Terminal size={12} className={tab === 'console' ? 'text-success' : ''} />
@@ -1637,16 +1668,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                   className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
                   onClick={() => {
                     setTab('viewer');
-                    requestAnimationFrame(() => {
-                      // Into the grid's own registered root, not this wrapper
-                      // around it: the router resolves a pane only when the
-                      // registered element contains the focused node, so focus
-                      // landing on an ancestor resolves nothing (#357 review).
-                      const gridRoot = viewerPaneRef.current?.querySelector<HTMLElement>(
-                        `[${RESULTS_PANE_ROOT_ATTR}]`
-                      );
-                      (gridRoot ?? viewerPaneRef.current)?.focus();
-                    });
+                    focusOutputFor('viewer');
                   }}
                 >
                   <Braces size={12} className={tab === 'viewer' ? 'text-primary' : ''} />
@@ -1709,14 +1731,21 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               if (entry.kind === 'input') {
                 return (
                   <div
-                    className={cn('flex gap-2 py-0.5 text-foreground', rowHighlightClass(index))}
+                    className={cn('py-0.5 text-foreground', rowHighlightClass(index))}
                     key={index}
                     ref={rowRef}
                   >
                     {/* The prompt is searched as part of this entry, so it is
                         marked as well — otherwise a hit on the database name
-                        was counted and stepped to with nothing highlighted. */}
-                    <span className="text-success">{mark(`${entry.db}>`)}</span>
+                        was counted and stepped to with nothing highlighted.
+
+                        The space between the two is a real text node, not a
+                        flex gap: a gap is CSS, and copying serializes the DOM,
+                        so `sales_db> db.stats()` on screen came out of the
+                        clipboard as `sales_db>db.stats()` — not a command that
+                        runs (#357 review). It also matches what
+                        `shellEntryText` searches, so find and copy agree. */}
+                    <span className="text-success">{mark(`${entry.db}>`)}</span>{' '}
                     <span>{mark(entry.text)}</span>
                   </div>
                 );
