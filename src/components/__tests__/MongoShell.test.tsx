@@ -8,6 +8,7 @@ import {
   writeShellSession,
 } from '../../lib/mongoshSession';
 import { TabVisibleContext } from '../../workspace/tabVisibility';
+import { resetResultsFindShortcutForTests } from '../../lib/resultsFindShortcut';
 
 const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
@@ -34,6 +35,336 @@ vi.mock('@monaco-editor/react', () => ({
 }));
 
 describe('MongoShell Component', () => {
+  describe('console output can be selected, copied and searched (#357)', () => {
+    const withOutput = async () => {
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      return screen.getByTestId('shell-transcript');
+    };
+
+    it('opts the transcript back into text selection', async () => {
+      // The app disables selection app-wide with `user-select: none` on body,
+      // so a container that never opts back in cannot be selected at all —
+      // which is why the console could be read but not copied.
+      const transcript = await withOutput();
+      expect(transcript.className).toContain('select-text');
+    });
+
+    it('selects the whole transcript on Ctrl+A', async () => {
+      const transcript = await withOutput();
+      // Pointing at the console is what tells the shared resolver which pane
+      // the key is meant for; nothing in this app focuses on click.
+      fireEvent.pointerDown(transcript);
+      window.getSelection()?.removeAllRanges();
+
+      const event = new KeyboardEvent('keydown', {
+        key: 'a',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      transcript.dispatchEvent(event);
+
+      expect(event.defaultPrevented).toBe(true);
+      const selection = window.getSelection()!;
+      expect(selection.rangeCount).toBe(1);
+      expect(transcript.contains(selection.anchorNode)).toBe(true);
+    });
+
+    it('leaves Ctrl+A alone while the caret is in the editor', async () => {
+      // There it means "select the command I am typing".
+      await withOutput();
+      const editor = screen.getByLabelText('mongosh editor');
+      const event = new KeyboardEvent('keydown', {
+        key: 'a',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      editor.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    });
+
+    it('finds text in the output and steps between matches', async () => {
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      const input = await screen.findByTestId('results-find-input');
+      fireEvent.change(input, { target: { value: 'Connecting to' } });
+
+      // The startup banner contains it, so there is something to step to.
+      expect(await screen.findByTestId('results-find-status')).toHaveTextContent(/1/);
+      expect(transcript.querySelectorAll('mark').length).toBeGreaterThan(0);
+    });
+
+    it('reopens find when the caret is already in the search box', async () => {
+      // The find bar is a sibling of the transcript, so registering only the
+      // transcript left the caret in the search box resolving to no pane and
+      // the key falling through to the browser — the one flow the find input
+      // routing attribute exists for (#357 review).
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      const input = await screen.findByTestId('results-find-input');
+
+      const again = new KeyboardEvent('keydown', {
+        key: 'f',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      input.dispatchEvent(again);
+
+      expect(again.defaultPrevented).toBe(true);
+      expect(screen.getByTestId('results-find-bar')).toBeInTheDocument();
+    });
+
+    it('highlights a hit on the prompt, not just on the command', async () => {
+      // The entry is searched as `db> command`, so a hit on the database name
+      // counted and could be stepped to while nothing was marked (#357 review).
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.stats()' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      // Waiting on the output, which is unique: the command text also sits
+      // in the editor, so matching on it finds two elements.
+      await screen.findByText('mongosh result');
+
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'sales_db' },
+      });
+
+      // The prompt carries the database name, and it is marked.
+      const marks = [...transcript.querySelectorAll('mark')].map((m) => m.textContent);
+      expect(marks.some((text) => text?.includes('sales_db'))).toBe(true);
+    });
+
+    it('marks the matching row even when the term straddles the prompt', async () => {
+      // No single marked run can carry a match spanning the prompt and the
+      // command, so the row itself is highlighted and the count never claims
+      // something the transcript does not show.
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.stats()' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      // Waiting on the output, which is unique: the command text also sits
+      // in the editor, so matching on it finds two elements.
+      await screen.findByText('mongosh result');
+
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'sales_db> db.stats' },
+      });
+
+      expect(await screen.findByTestId('results-find-status')).toHaveTextContent(/1/);
+      expect(transcript.querySelector('.bg-warning\\/40, .bg-warning\\/15')).not.toBeNull();
+    });
+
+    it('lets the Data Viewer answer Cmd/Ctrl+F instead of the console swallowing it', async () => {
+      // The console pane must not enclose the viewer. When it did, a find from
+      // inside the grid resolved to the console — which cannot open a find bar
+      // while the viewer is showing — and the router stopped there rather than
+      // reaching the grid's own target, so the key fell through to the browser
+      // (#357 review).
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+          collectionName="customers"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.customers.find({}).limit(10)' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      fireEvent.click(await screen.findByRole('tab', { name: /data viewer/i }));
+
+      const grid = await screen.findByTestId('json-view');
+      fireEvent.pointerDown(grid);
+      fireEvent.keyDown(grid, { key: 'f', ctrlKey: true });
+
+      expect(await screen.findByTestId('results-find-bar')).toBeInTheDocument();
+    });
+    it('keeps the active match in view when new output arrives', async () => {
+      // A command finishing used to jump the transcript to the bottom, taking
+      // the selected match off screen while find still pointed at it.
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'Connecting to' },
+      });
+      await screen.findByTestId('results-find-status');
+
+      // Bottom-pinning is what would move it; record where it is asked to go.
+      let pinned = 0;
+      Object.defineProperty(transcript, 'scrollHeight', { configurable: true, get: () => 5000 });
+      transcript.scrollTop = 0;
+
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      pinned = transcript.scrollTop;
+      expect(pinned).toBe(0);
+    });
+
+    it('still pins to the newest output when find has no match to hold', async () => {
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'nothing-here-at-all' },
+      });
+
+      Object.defineProperty(transcript, 'scrollHeight', { configurable: true, get: () => 5000 });
+      transcript.scrollTop = 0;
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      expect(transcript.scrollTop).toBe(5000);
+    });
+
+    it('keeps the stepped-to match when matching output arrives', async () => {
+      // Output containing the term lengthens the match list. Resetting on that
+      // length change snapped the selection back to the first match and moved
+      // the user off the one they had stepped to (#357 review).
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'mongosh' },
+      });
+
+      const status = () => screen.getByTestId('results-find-status').textContent ?? '';
+      // "2 of 5" — the first number is the match the user is on.
+      const current = () => Number(status().match(/\d+/)?.[0] ?? -1);
+      const total = () => Number(status().match(/(\d+)\D+(\d+)/)?.[2] ?? -1);
+
+      fireEvent.click(screen.getByTestId('results-find-next'));
+      const steppedTo = current();
+      const before = total();
+      expect(steppedTo).toBeGreaterThan(1);
+
+      // A command whose output also contains the term.
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      // The new output matches too, so the total grows.
+      await waitFor(() => expect(total()).toBeGreaterThan(before));
+
+      // ...and the user is still on the match they stepped to.
+      expect(current()).toBe(steppedTo);
+    });
+    it('marks the right characters when lowercasing would shift them', async () => {
+      // `İ`.toLowerCase() is two code units, so offsets taken from a fully
+      // lowercased copy do not index the original and the wrong characters
+      // were marked (#357 review).
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'İstanbul' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'stan' },
+      });
+
+      // Whatever is marked is exactly what was searched for, never a run
+      // shifted off by the case folding.
+      for (const mark of transcript.querySelectorAll('mark')) {
+        expect(mark.textContent?.toLowerCase()).toBe('stan');
+      }
+    });
+
+    it('copies a prompt line as a command that would actually run', async () => {
+      // The gap between prompt and command was a CSS flex gap, and copying
+      // serializes the DOM, so the clipboard got sales_db>db.stats() (#357
+      // review). The separator has to be a real text node.
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      expect(transcript.textContent).toContain('sales_db> db.stats()');
+    });
+
+    it('brings the active match back into view after a trip to the Data Viewer', async () => {
+      // Leaving unmounts the console subtree; coming back builds a fresh
+      // transcript scrolled to the top. Nothing the scroll effect watched
+      // changed across that, and bottom-pinning stands down while a search has
+      // matches, so the status named a match that was off screen (#357 review).
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+          collectionName="customers"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.customers.find({}).limit(10)' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      const viewerTab = await screen.findByRole('tab', { name: /data viewer/i });
+
+      // A recognised find switches to the viewer on its own; go back to the
+      // console, which is what the search is over.
+      fireEvent.click(screen.getByRole('tab', { name: /console/i }));
+      const transcript = await screen.findByTestId('shell-transcript');
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'Connecting to' },
+      });
+      await screen.findByTestId('results-find-status');
+
+      const scrolled = vi.fn();
+      const original = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = scrolled;
+      try {
+        fireEvent.click(viewerTab);
+        fireEvent.click(screen.getByRole('tab', { name: /console/i }));
+        await waitFor(() => expect(scrolled).toHaveBeenCalled());
+      } finally {
+        Element.prototype.scrollIntoView = original;
+      }
+    });
+
+    it('reports when the output does not contain the term', async () => {
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'nothing-here-at-all' },
+      });
+
+      expect(transcript.querySelectorAll('mark')).toHaveLength(0);
+    });
+  });
+
+
   it('scrolls the transcript to the newest output when its hidden tab is shown again', async () => {
     // A kept-alive tab (#240) is display:none while another tab is on screen.
     // There scrollHeight is 0, so scrolling on new output resets the position
@@ -64,6 +395,7 @@ describe('MongoShell Component', () => {
   });
 
   beforeEach(() => {
+    resetResultsFindShortcutForTests();
     resetShellSessions();
     vi.clearAllMocks();
     // The AI Helper persists per-collection transcripts to localStorage now, so
