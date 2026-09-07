@@ -672,6 +672,61 @@ async fn run_mongosh_command_on_session(
     }
 }
 
+/// Every line a one-shot script wrote, under the same caps as a session's.
+///
+/// Reading continues to EOF even once the caps are full: the surplus is
+/// discarded rather than kept, but the pipe still has to be drained or the
+/// child blocks writing into it and never exits (#359 review).
+///
+/// Read in fixed chunks rather than with `lines()`, and the line being built is
+/// bounded as it grows. `lines()` materialises a whole newline-delimited run
+/// before anything can cap it, so a script writing one enormous string with no
+/// newline in it — `print` of a huge document, a stack trace on one line — grew
+/// memory without limit before `push_mongosh_line` ever saw it (#360 review).
+///
+/// The bound is in bytes, at four per permitted character, which is the widest
+/// UTF-8 encoding: enough that the whole allowed prefix always survives, while
+/// the buffer itself can never exceed a fixed size. Bytes past it are dropped
+/// until the next newline, and `push_mongosh_line` applies the character cap to
+/// what is kept.
+async fn read_capped_mongosh_output<R>(reader: Option<R>) -> Vec<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines: Vec<String> = Vec::new();
+    let Some(mut reader) = reader else { return lines };
+    let max_line_bytes = crate::limits::MAX_MONGOSH_LINE_CHARS * 4;
+    let mut chunk = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    // True once this line has given us everything we are going to keep; the
+    // rest of it is read and thrown away so the pipe keeps draining.
+    let mut past_the_cap = false;
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                let mut line = std::mem::take(&mut pending);
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                push_mongosh_line(&mut lines, String::from_utf8_lossy(&line).into_owned());
+                past_the_cap = false;
+            } else if !past_the_cap {
+                pending.push(byte);
+                past_the_cap = pending.len() >= max_line_bytes;
+            }
+        }
+    }
+    // Whatever the script wrote without a trailing newline is still output.
+    if !pending.is_empty() {
+        push_mongosh_line(&mut lines, String::from_utf8_lossy(&pending).into_owned());
+    }
+    lines
+}
+
 fn push_mongosh_line(lines: &mut Vec<String>, text: String) {
     use crate::limits::{MAX_MONGOSH_LINE_CHARS, MAX_MONGOSH_LINES, MAX_MONGOSH_TOTAL_CHARS};
     if lines.len() >= MAX_MONGOSH_LINES {
@@ -984,6 +1039,130 @@ pub async fn run_mongosh_command_impl(
         started,
         "mongosh",
         Some(command),
+        &result,
+    );
+    result
+}
+
+
+/// Run a whole script as a one-shot `mongosh --file` program, the way a script
+/// is meant to run: parsed and executed as one unit, then the process exits.
+///
+/// This is the counterpart to the persistent REPL session. Feeding a script to
+/// the REPL a line at a time is what made big pastes unpredictable — an
+/// unclosed brace left the REPL waiting, and a script that called `quit()` (as
+/// diagnostic scripts routinely do) tore the session down before its completion
+/// marker could return, which surfaced as "session closed". None of that
+/// applies here: `--file` handles `quit()`, `use`/`show`, unclosed braces and
+/// syntax errors on its own, reporting an error once and exiting non-zero.
+///
+/// The cost is that nothing carries over between runs. The one piece of state
+/// that matters in practice, the current database, is passed in and applied
+/// with a leading `use`, exactly as the REPL session does on startup, so `db`
+/// still points where the tab expects. A script may `use` elsewhere itself.
+pub async fn run_mongosh_script_impl(
+    state: &AppState,
+    connection_id: &str,
+    uri: &str,
+    database: &str,
+    mongosh_path: &str,
+    script: &str,
+) -> Result<MongoshCommandOutput, String> {
+    if write_guard::connection_mode(state, connection_id)? == connections::ConnectionMode::ReadOnly
+    {
+        return Err(write_guard::READ_ONLY_MSG.to_string());
+    }
+    let is_mock = {
+        let mocks = state.mocks.lock_safe()?;
+        *mocks
+            .get(connection_id)
+            .ok_or_else(|| "Connection not found".to_string())?
+    };
+    if is_mock || uri.starts_with("mongodb://mock") {
+        return Err("External mongosh sessions require a real MongoDB URI".to_string());
+    }
+
+    let executable = if mongosh_path.trim().is_empty() {
+        "mongosh".to_string()
+    } else {
+        mongosh_path.trim().to_string()
+    };
+
+    // The script goes in a temp file, not an `--eval` argument: it can be large,
+    // and a file sidesteps every argument-length and shell-quoting limit.
+    let path =
+        std::env::temp_dir().join(format!("mqlens-shell-{}.js", Uuid::new_v4().simple()));
+    tokio::fs::write(&path, script.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to stage the script: {}", e))?;
+
+    let started = std::time::Instant::now();
+    let mut command = TokioCommand::new(&executable);
+    command
+        .arg("--quiet")
+        .arg(connections::normalize_mongodb_uri_options(uri));
+    // `use <db>` only when the name is a plain one — a control character could
+    // not appear in a real database name and must never reach the argument.
+    let db = database.trim();
+    if !db.is_empty() && !db.chars().any(|c| c.is_control()) {
+        command.arg("--eval").arg(format!("use {}", db));
+    }
+    command.arg("--file").arg(&path);
+
+    // Streamed and capped rather than buffered whole. `Command::output()` holds
+    // every byte of stdout and stderr in memory until the process exits and then
+    // sends the lot over IPC, so one verbose script could exhaust the backend —
+    // the persistent-session path has never had that exposure, because it puts
+    // every line through `push_mongosh_line` (#359 review). The pipes are still
+    // drained to EOF after the caps are reached, so the child is never blocked
+    // writing into a full pipe; the surplus is simply not kept.
+    let spawned = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let result: Result<MongoshCommandOutput, String> = match spawned {
+        Ok(mut child) => {
+            let out = child.stdout.take();
+            let err = child.stderr.take();
+            let (stdout, stderr, status) = tokio::join!(
+                read_capped_mongosh_output(out),
+                read_capped_mongosh_output(err),
+                child.wait(),
+            );
+            let mut stderr = stderr;
+            // A non-zero exit with nothing on stderr still has to read as a
+            // failure rather than a silent, empty success.
+            let failed = status.as_ref().map(|s| !s.success()).unwrap_or(true);
+            if failed && stderr.is_empty() {
+                let code = status
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| s.code())
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                push_mongosh_line(&mut stderr, format!("mongosh exited with status {}", code));
+            }
+            Ok(MongoshCommandOutput { stdout, stderr })
+        }
+        Err(e) => Err(format!("Failed to run mongosh: {}", e)),
+    };
+
+    // Best effort: a leaked temp file must never fail an otherwise good run.
+    let _ = tokio::fs::remove_file(&path).await;
+
+    crate::audit::maybe_record_result(
+        state,
+        Some(connection_id),
+        None,
+        None,
+        "run_mongosh_script",
+        crate::audit::OpClass::Shell,
+        Some("shell"),
+        started,
+        "mongosh",
+        Some(script),
         &result,
     );
     result
@@ -1849,6 +2028,26 @@ async fn await_mongosh_idle(
     let session = get_mongosh_session(&state, &session_id)?;
     let _idle = session.command_lock.lock().await;
     Ok(())
+}
+
+#[tauri::command]
+async fn run_mongosh_script(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    uri: String,
+    database: String,
+    mongosh_path: String,
+    script: String,
+) -> Result<MongoshCommandOutput, String> {
+    use tauri::Manager;
+    // Exactly as `start_mongosh_session` does. An app-managed mongosh is not
+    // necessarily on PATH, so falling back to the bare name meant a warm
+    // session started from the managed binary while every multi-line script
+    // failed with "Failed to run mongosh" (#359 review).
+    let app_data_dir = app_handle.path().app_data_dir().ok();
+    let resolved_path = toolsetup::resolve_mongosh_executable(&mongosh_path, app_data_dir.as_deref());
+    run_mongosh_script_impl(&state, &connection_id, &uri, &database, &resolved_path, &script).await
 }
 
 #[tauri::command]
@@ -3379,6 +3578,7 @@ pub fn run() {
             get_mongodb_version,
             start_mongosh_session,
             run_mongosh_command,
+            run_mongosh_script,
             await_mongosh_idle,
             stop_mongosh_session,
             get_shell_tab_state,
