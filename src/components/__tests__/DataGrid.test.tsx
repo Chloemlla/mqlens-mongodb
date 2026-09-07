@@ -2188,6 +2188,218 @@ describe('DataGrid — tab guards survive StrictMode replay (#325 review)', () =
   });
 });
 
+describe('DataGrid — stays mounted across a run (#344)', () => {
+  const docs = () => [{ _id: '1', name: 'Alice Smith', address: { city: 'Oslo' } }];
+  const firstFold = () => screen.getAllByTestId('json-fold-btn')[0];
+
+  it('keeps a fold collapsed across a run that returns the same documents', () => {
+    // Re-running a query gives a fresh array of the same result. The fold ids
+    // are positional, and the positions have not moved.
+    const { rerender } = render(<DataGrid documents={docs()} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={docs()} loading />);
+    rerender(<DataGrid documents={docs()} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+  });
+
+  it('resets folds when a different result set arrives', () => {
+    const { rerender } = render(<DataGrid documents={docs()} />);
+    fireEvent.click(firstFold());
+
+    rerender(<DataGrid documents={[{ _id: '2', name: 'Bob', address: { city: 'Rome' } }]} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('resets folds for a result with the same ids and block count but a different structure', () => {
+    // Aggregation output may carry no _id at all; the structure of the folds
+    // is what tells one such result from another.
+    const { rerender } = render(<DataGrid documents={[{ _id: null, a: { x: 1 } }]} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={[{ _id: null, b: { y: 1 } }]} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('keeps the scroll position across a refresh, and starts a new page at its first row', () => {
+    const page = (from: number) =>
+      Array.from({ length: 40 }, (_, i) => ({ _id: String(from + i), name: `doc ${from + i}` }));
+    const { rerender } = render(<DataGrid documents={page(0)} />);
+    const list = within(screen.getByTestId('json-view')).getByRole('list');
+    // jsdom lays nothing out and scrolls nothing; record what the list is told.
+    Object.defineProperty(list, 'scrollTo', {
+      configurable: true,
+      value: ({ top }: { top: number }) => {
+        list.scrollTop = top;
+      },
+    });
+    list.scrollTop = 300;
+
+    // The same result again: the user's place is kept.
+    rerender(<DataGrid documents={page(0)} />);
+    expect(list.scrollTop).toBe(300);
+
+    // The next page: it starts at its first row.
+    rerender(<DataGrid documents={page(40)} />);
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it('starts the next page at its first row even when a projection hides every _id', () => {
+    // Projected out, the ids say nothing; the page asked for does.
+    const page = (skip: number) =>
+      Array.from({ length: 40 }, (_, i) => ({ name: `doc ${skip + i}` }));
+    const { rerender } = render(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    const list = within(screen.getByTestId('json-view')).getByRole('list');
+    Object.defineProperty(list, 'scrollTo', {
+      configurable: true,
+      value: ({ top }: { top: number }) => {
+        list.scrollTop = top;
+      },
+    });
+    list.scrollTop = 300;
+
+    rerender(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    expect(list.scrollTop).toBe(300);
+
+    rerender(<DataGrid documents={page(40)} skip={40} limit={40} />);
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it('keeps tree folds across a run that returns the same documents', () => {
+    const nested = () => [{ _id: '1', g: { a: { akey: 'one' } } }];
+    const foldState = (keyName: string): 'open' | 'closed' => {
+      const row = screen.getByTitle(keyName).closest('[data-doc-even]');
+      const button = row?.querySelector('[data-testid="tree-fold-btn"]');
+      const label = button?.getAttribute('aria-label') ?? '';
+      if (/expand/i.test(label)) return 'closed';
+      if (/collapse/i.test(label)) return 'open';
+      throw new Error(`no fold for ${keyName}: ${label}`);
+    };
+    const { rerender } = render(<DataGrid documents={nested()} />);
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+    // Depth >= 2 starts collapsed; the user opens it.
+    expect(foldState('a')).toBe('closed');
+    fireEvent.click(screen.getByTitle('a').closest('[data-doc-even]')!.querySelector('[data-testid="tree-fold-btn"]')!);
+    expect(foldState('a')).toBe('open');
+
+    rerender(<DataGrid documents={nested()} loading />);
+    rerender(<DataGrid documents={nested()} />);
+    expect(foldState('a')).toBe('open');
+
+    // A different result: back to the defaults.
+    rerender(<DataGrid documents={[{ _id: '2', g: { a: { akey: 'two' } } }]} />);
+    expect(foldState('a')).toBe('closed');
+  });
+
+  it('resets folds when an empty container shifts every fold id', () => {
+    // An empty object is not foldable in the JSON view, so it was left out of
+    // the identity — but the tree walker still gives it a fold id, and every
+    // id after it moves. Folds kept over that shift would point at other nodes.
+    const before = [{ _id: '1', g: { a: { akey: 'one' } } }];
+    const after = [{ _id: '1', g: { empty: {}, a: { akey: 'one' } } }];
+    const { rerender } = render(<DataGrid documents={before} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={after} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('puts the grid out of reach while a run is in flight', () => {
+    // The overlay stops the pointer; the inert attribute stops the keyboard, so a stale
+    // row cannot be acted on by tabbing to its buttons.
+    const { container, rerender } = render(<DataGrid documents={docs()} />);
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.hasAttribute('inert')).toBe(false);
+
+    rerender(<DataGrid documents={docs()} loading />);
+    expect(root.hasAttribute('inert')).toBe(true);
+
+    rerender(<DataGrid documents={docs()} />);
+    expect(root.hasAttribute('inert')).toBe(false);
+  });
+
+  it('closes an open context menu when a run starts', () => {
+    // It is portaled out of the grid, above the overlay, so covering it is
+    // not enough — its actions would still run against the stale result.
+    const { rerender } = render(<DataGrid documents={docs()} onDeleteDocument={() => {}} />);
+    const line = screen.getByTestId('json-view').querySelector('[data-json-line]') as HTMLElement;
+    fireEvent.contextMenu(line, { clientX: 10, clientY: 10 });
+    expect(screen.getByTestId('context-menu')).toBeInTheDocument();
+
+    rerender(<DataGrid documents={docs()} onDeleteDocument={() => {}} loading />);
+
+    expect(screen.queryByTestId('context-menu')).toBeNull();
+  });
+
+  it('does not let a field name impersonate the result-identity delimiters', () => {
+    // Under an unescaped `/`-joined-then-`\u0001`-joined key, a single fold
+    // path could look like two, colliding two different structures. The key
+    // `x\u0001open/0/2/y` is exactly such a forgery of two nested paths.
+    const nested = [{ _id: '1', x: { y: { n: 1 } } }];
+    const crafted = [{ _id: '1', ['x\u0001open/0/2/y']: { n: 1 } }];
+    const { rerender } = render(<DataGrid documents={nested} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={crafted} />);
+
+    // Different structure, so the identity changed and folds reset to default.
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('opens a different result at the left edge, but keeps the scroll on a refresh', () => {
+    // scrollToRow only resets the vertical axis; a wide result left scrolled
+    // right would otherwise open with its first fields off-screen.
+    const page = (from: number) =>
+      Array.from({ length: 40 }, (_, i) => ({ _id: String(from + i), name: `doc ${from + i}` }));
+    const { rerender } = render(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    // The real horizontal scroller is the overflow-auto wrapper, not the list.
+    const scroller = screen.getByTestId('json-scroll');
+    scroller.scrollLeft = 120;
+
+    // Same result: the user's place is kept.
+    rerender(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    expect(scroller.scrollLeft).toBe(120);
+
+    // A different page: back to the left edge.
+    rerender(<DataGrid documents={page(40)} skip={40} limit={40} />);
+    expect(scroller.scrollLeft).toBe(0);
+  });
+
+  it('announces a run in flight outside the inert subtree, so a screen reader hears it', () => {
+    // inert removes its whole subtree from the accessibility tree, so a status
+    // inside the inert root would be silent. It has to sit outside.
+    const { container, rerender } = render(<DataGrid documents={docs()} />);
+    expect(screen.queryByRole('status')).toBeNull();
+
+    rerender(<DataGrid documents={docs()} loading />);
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent(/\S/);
+    const paneRoot = container.querySelector('[aria-busy]') as HTMLElement;
+    expect(paneRoot.hasAttribute('inert')).toBe(true);
+    expect(paneRoot.contains(status)).toBe(false);
+  });
+
+  it('shows a run in flight over the previous results, not in their place', () => {
+    const { rerender } = render(<DataGrid documents={docs()} />);
+    expect(screen.queryByTestId('results-loading')).toBeNull();
+
+    rerender(<DataGrid documents={docs()} loading />);
+    expect(screen.getByTestId('results-loading')).toBeInTheDocument();
+    expect(screen.getByText(/"Alice Smith"/)).toBeInTheDocument();
+
+    rerender(<DataGrid documents={docs()} />);
+    expect(screen.queryByTestId('results-loading')).toBeNull();
+  });
+});
+
 describe('DataGrid — a hidden tab does not answer the clipboard (#240)', () => {
   const view = (visible: boolean) => (
     <TabVisibleContext.Provider value={visible}>
