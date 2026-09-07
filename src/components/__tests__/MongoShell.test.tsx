@@ -8,6 +8,7 @@ import {
   writeShellSession,
 } from '../../lib/mongoshSession';
 import { TabVisibleContext } from '../../workspace/tabVisibility';
+import { resetResultsFindShortcutForTests } from '../../lib/resultsFindShortcut';
 
 const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
@@ -34,6 +35,89 @@ vi.mock('@monaco-editor/react', () => ({
 }));
 
 describe('MongoShell Component', () => {
+  describe('console output can be selected, copied and searched (#357)', () => {
+    const withOutput = async () => {
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      return screen.getByTestId('shell-transcript');
+    };
+
+    it('opts the transcript back into text selection', async () => {
+      // The app disables selection app-wide with `user-select: none` on body,
+      // so a container that never opts back in cannot be selected at all —
+      // which is why the console could be read but not copied.
+      const transcript = await withOutput();
+      expect(transcript.className).toContain('select-text');
+    });
+
+    it('selects the whole transcript on Ctrl+A', async () => {
+      const transcript = await withOutput();
+      // Pointing at the console is what tells the shared resolver which pane
+      // the key is meant for; nothing in this app focuses on click.
+      fireEvent.pointerDown(transcript);
+      window.getSelection()?.removeAllRanges();
+
+      const event = new KeyboardEvent('keydown', {
+        key: 'a',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      transcript.dispatchEvent(event);
+
+      expect(event.defaultPrevented).toBe(true);
+      const selection = window.getSelection()!;
+      expect(selection.rangeCount).toBe(1);
+      expect(transcript.contains(selection.anchorNode)).toBe(true);
+    });
+
+    it('leaves Ctrl+A alone while the caret is in the editor', async () => {
+      // There it means "select the command I am typing".
+      await withOutput();
+      const editor = screen.getByLabelText('mongosh editor');
+      const event = new KeyboardEvent('keydown', {
+        key: 'a',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      editor.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    });
+
+    it('finds text in the output and steps between matches', async () => {
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      const input = await screen.findByTestId('results-find-input');
+      fireEvent.change(input, { target: { value: 'Connecting to' } });
+
+      // The startup banner contains it, so there is something to step to.
+      expect(await screen.findByTestId('results-find-status')).toHaveTextContent(/1/);
+      expect(transcript.querySelectorAll('mark').length).toBeGreaterThan(0);
+    });
+
+    it('reports when the output does not contain the term', async () => {
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'nothing-here-at-all' },
+      });
+
+      expect(transcript.querySelectorAll('mark')).toHaveLength(0);
+    });
+  });
+
+
   it('scrolls the transcript to the newest output when its hidden tab is shown again', async () => {
     // A kept-alive tab (#240) is display:none while another tab is on screen.
     // There scrollHeight is 0, so scrolling on new output resets the position
@@ -64,6 +148,7 @@ describe('MongoShell Component', () => {
   });
 
   beforeEach(() => {
+    resetResultsFindShortcutForTests();
     resetShellSessions();
     vi.clearAllMocks();
     // The AI Helper persists per-collection transcripts to localStorage now, so
