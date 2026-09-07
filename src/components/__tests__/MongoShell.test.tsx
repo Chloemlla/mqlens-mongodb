@@ -173,6 +173,75 @@ describe('MongoShell Component', () => {
       expect(transcript.querySelector('.bg-warning\\/40, .bg-warning\\/15')).not.toBeNull();
     });
 
+    it('lets the Data Viewer answer Cmd/Ctrl+F instead of the console swallowing it', async () => {
+      // The console pane must not enclose the viewer. When it did, a find from
+      // inside the grid resolved to the console — which cannot open a find bar
+      // while the viewer is showing — and the router stopped there rather than
+      // reaching the grid's own target, so the key fell through to the browser
+      // (#357 review).
+      render(
+        <MongoShell
+          connectionId="conn-1"
+          connectionName="mock"
+          connectionUri="mongodb://prod-replica-set"
+          databaseName="sales_db"
+          collectionName="customers"
+        />,
+      );
+      await screen.findByText(/mongosh session attached/);
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.customers.find({}).limit(10)' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      fireEvent.click(await screen.findByRole('tab', { name: /data viewer/i }));
+
+      const grid = await screen.findByTestId('json-view');
+      fireEvent.pointerDown(grid);
+      fireEvent.keyDown(grid, { key: 'f', ctrlKey: true });
+
+      expect(await screen.findByTestId('results-find-bar')).toBeInTheDocument();
+    });
+    it('keeps the active match in view when new output arrives', async () => {
+      // A command finishing used to jump the transcript to the bottom, taking
+      // the selected match off screen while find still pointed at it.
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'Connecting to' },
+      });
+      await screen.findByTestId('results-find-status');
+
+      // Bottom-pinning is what would move it; record where it is asked to go.
+      let pinned = 0;
+      Object.defineProperty(transcript, 'scrollHeight', { configurable: true, get: () => 5000 });
+      transcript.scrollTop = 0;
+
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      pinned = transcript.scrollTop;
+      expect(pinned).toBe(0);
+    });
+
+    it('still pins to the newest output when find has no match to hold', async () => {
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'nothing-here-at-all' },
+      });
+
+      Object.defineProperty(transcript, 'scrollHeight', { configurable: true, get: () => 5000 });
+      transcript.scrollTop = 0;
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      expect(transcript.scrollTop).toBe(5000);
+    });
+
     it('reports when the output does not contain the term', async () => {
       const transcript = await withOutput();
       fireEvent.pointerDown(transcript);

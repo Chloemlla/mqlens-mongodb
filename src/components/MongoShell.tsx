@@ -559,11 +559,18 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     // keeps the read fresh without re-triggering (the ref guard above).
   }, [reconnectSignal, sessionId]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  // The whole console pane: its tab controls, the find bar and the transcript.
-  // Registering only the transcript left the find bar outside the pane, so a
-  // second Cmd/Ctrl+F with the caret already in the search box resolved no pane
-  // and fell through to the browser — the one flow the find input's routing
-  // attribute exists to support (#357 review).
+  // The console's own content: the find bar and the transcript, and nothing
+  // else. It has to reach past the transcript so a second Cmd/Ctrl+F with the
+  // caret already in the search box resolves this pane and refocuses the input
+  // rather than falling through to the browser — the one flow the find input's
+  // routing attribute exists to support.
+  //
+  // It deliberately stops short of the tab strip above. That is shared chrome:
+  // with it inside, a Cmd/Ctrl+F from the Data Viewer tab's trigger resolved to
+  // the console, which cannot open a find bar while the viewer is showing, and
+  // the router stopped there instead of reaching the DataGrid's own target.
+  // This element does not exist at all on the viewer tab, so the grid answers
+  // for it (#357 review).
   const consolePaneRef = useRef<HTMLDivElement>(null);
 
   // Find over the transcript (#357). The console renders every entry — it is
@@ -607,10 +614,11 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     setActiveFind(findMatchList.length > 0 ? 0 : -1);
   }, [findQuery, findMatchList.length]);
 
-  // The match the user stepped to has to be on screen to be of any use.
+  // The match the user stepped to has to be on screen to be of any use —
+  // including after output arrives underneath it and moves it.
   useEffect(() => {
     activeMatchRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [activeFind, findQuery]);
+  }, [activeFind, findQuery, entries]);
 
   const closeFind = useCallback(() => {
     setFindOpen(false);
@@ -963,9 +971,14 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   const tabVisible = useTabVisible();
   useEffect(() => {
     if (!tabVisible) return;
+    // Not while a search has something selected: a command finishing — or
+    // another mounted instance of this shell appending output — would jump the
+    // view to the bottom and take the active match off screen, while the find
+    // status went on pointing at it (#357 review).
+    if (findOpen && findMatchList.length > 0) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [entries, tab, tabVisible]);
+  }, [entries, tab, tabVisible, findOpen, findMatchList.length]);
 
   // When the session failed to attach, probe for a usable mongosh (managed
   // install, PATH, well-known locations) so the gate can offer a one-click
@@ -1559,7 +1572,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         <span className="h-0.5 w-8 rounded-full bg-muted-foreground/40" />
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col" ref={consolePaneRef}>
+      <div className="flex min-h-0 flex-1 flex-col">
         <div className="flex items-center gap-1 border-b border-border bg-card px-2 py-1">
           <Tabs value={tab} onValueChange={(v) => setTab(v as ShellTab)}>
             <TabsList className="h-8 bg-transparent p-0">
@@ -1598,7 +1611,9 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           )}
         </div>
 
-        {tab === 'console' && findOpen && (
+        {tab === 'console' ? (
+          <div className="flex min-h-0 flex-1 flex-col" ref={consolePaneRef}>
+          {findOpen && (
           <ResultsFindBar
             query={findQuery}
             onQueryChange={setFindQuery}
@@ -1609,8 +1624,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
             onClose={closeFind}
             focusToken={findFocusToken}
           />
-        )}
-        {tab === 'console' ? (
+          )}
           <div
             // `select-text` re-enables selection against the app-wide
             // `user-select: none`. Without it the console could not be selected
@@ -1688,6 +1702,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                 </div>
               );
             })}
+          </div>
           </div>
         ) : (
           viewer && <DataGrid documents={viewer.docs} density={density} />
