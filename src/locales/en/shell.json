@@ -306,6 +306,12 @@
     "searchPlaceholder": "Search shortcuts…",
     "title": "Keyboard shortcuts"
   },
+  "mcpWriteConfirm": {
+    "allow": "Allow",
+    "description": "An MCP client connected to MQLens is asking to change data. Approve it only if you asked for this.",
+    "refuse": "Refuse",
+    "title": "An MCP client wants to change data"
+  },
   "mongoShell": {
     "console": {
       "cleared": "Console cleared - run a command above.",
