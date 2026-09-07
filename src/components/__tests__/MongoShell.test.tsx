@@ -105,6 +105,74 @@ describe('MongoShell Component', () => {
       expect(transcript.querySelectorAll('mark').length).toBeGreaterThan(0);
     });
 
+    it('reopens find when the caret is already in the search box', async () => {
+      // The find bar is a sibling of the transcript, so registering only the
+      // transcript left the caret in the search box resolving to no pane and
+      // the key falling through to the browser — the one flow the find input
+      // routing attribute exists for (#357 review).
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      const input = await screen.findByTestId('results-find-input');
+
+      const again = new KeyboardEvent('keydown', {
+        key: 'f',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      input.dispatchEvent(again);
+
+      expect(again.defaultPrevented).toBe(true);
+      expect(screen.getByTestId('results-find-bar')).toBeInTheDocument();
+    });
+
+    it('highlights a hit on the prompt, not just on the command', async () => {
+      // The entry is searched as `db> command`, so a hit on the database name
+      // counted and could be stepped to while nothing was marked (#357 review).
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.stats()' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      // Waiting on the output, which is unique: the command text also sits
+      // in the editor, so matching on it finds two elements.
+      await screen.findByText('mongosh result');
+
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'sales_db' },
+      });
+
+      // The prompt carries the database name, and it is marked.
+      const marks = [...transcript.querySelectorAll('mark')].map((m) => m.textContent);
+      expect(marks.some((text) => text?.includes('sales_db'))).toBe(true);
+    });
+
+    it('marks the matching row even when the term straddles the prompt', async () => {
+      // No single marked run can carry a match spanning the prompt and the
+      // command, so the row itself is highlighted and the count never claims
+      // something the transcript does not show.
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'db.stats()' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      // Waiting on the output, which is unique: the command text also sits
+      // in the editor, so matching on it finds two elements.
+      await screen.findByText('mongosh result');
+
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'sales_db> db.stats' },
+      });
+
+      expect(await screen.findByTestId('results-find-status')).toHaveTextContent(/1/);
+      expect(transcript.querySelector('.bg-warning\\/40, .bg-warning\\/15')).not.toBeNull();
+    });
+
     it('reports when the output does not contain the term', async () => {
       const transcript = await withOutput();
       fireEvent.pointerDown(transcript);

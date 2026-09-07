@@ -217,6 +217,7 @@ const stringifyShellValue = (value: unknown, indent = 0): string => {
 export const shellEntryText = (entry: ShellEntry): string => {
   switch (entry.kind) {
     case 'input':
+      // Exactly what the row renders: the prompt, a space, the command.
       return `${entry.db}> ${entry.text}`;
     case 'note':
       return entry.text;
@@ -558,6 +559,12 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     // keeps the read fresh without re-triggering (the ref guard above).
   }, [reconnectSignal, sessionId]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // The whole console pane: its tab controls, the find bar and the transcript.
+  // Registering only the transcript left the find bar outside the pane, so a
+  // second Cmd/Ctrl+F with the caret already in the search box resolved no pane
+  // and fell through to the browser — the one flow the find input's routing
+  // attribute exists to support (#357 review).
+  const consolePaneRef = useRef<HTMLDivElement>(null);
 
   // Find over the transcript (#357). The console renders every entry — it is
   // not virtualized — so matching against the entry text is matching against
@@ -579,6 +586,20 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     [findOpen, findCells, findQuery]
   );
   const activeFindMatch = activeFind >= 0 ? findMatchList[activeFind] : undefined;
+  const matchedRows = useMemo(
+    () => new Set(findMatchList.map((m) => m.rowIndex)),
+    [findMatchList]
+  );
+  // The same two states the results grid uses, so a match reads the same in
+  // both places — and so the count always corresponds to something visible even
+  // when the term straddles the prompt and the command, where no single marked
+  // run can carry it (#357 review).
+  const rowHighlightClass = (index: number): string | undefined => {
+    if (!matchedRows.has(index)) return undefined;
+    return isMatchAt(activeFindMatch, index)
+      ? 'bg-warning/40 ring-1 ring-inset ring-warning'
+      : 'bg-warning/15';
+  };
 
   // A new query starts at its first match rather than keeping an index into a
   // list that no longer exists.
@@ -603,7 +624,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   useEffect(
     () =>
       registerResultsFindTarget({
-        element: () => scrollRef.current,
+        element: () => consolePaneRef.current,
         open: () => {
           setFindOpen(true);
           setFindFocusToken((n) => n + 1);
@@ -628,15 +649,18 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       // Inside the editor or the find box the key means "select what I am
       // typing", which is not ours to answer.
       if (isTextEntryContext(event.target)) return;
-      const container = scrollRef.current;
-      if (!container) return;
-      // The same resolver the find shortcut uses, so the two never disagree
-      // about which pane the user is in.
-      if (resultsPaneElementForEvent(event.target) !== container) return;
+      const transcript = scrollRef.current;
+      const pane = consolePaneRef.current;
+      if (!transcript || !pane) return;
+      // The same resolver, and the same element it was registered with, so the
+      // two can never disagree about which pane the user is in. The selection
+      // itself still covers the transcript alone — the toolbar and find bar are
+      // chrome, not output.
+      if (resultsPaneElementForEvent(event.target) !== pane) return;
       const selection = window.getSelection();
       if (!selection) return;
       const range = document.createRange();
-      range.selectNodeContents(container);
+      range.selectNodeContents(transcript);
       selection.removeAllRanges();
       selection.addRange(range);
       event.preventDefault();
@@ -1535,7 +1559,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         <span className="h-0.5 w-8 rounded-full bg-muted-foreground/40" />
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 flex-1 flex-col" ref={consolePaneRef}>
         <div className="flex items-center gap-1 border-b border-border bg-card px-2 py-1">
           <Tabs value={tab} onValueChange={(v) => setTab(v as ShellTab)}>
             <TabsList className="h-8 bg-transparent p-0">
@@ -1608,15 +1632,26 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               );
               if (entry.kind === 'input') {
                 return (
-                  <div className="flex gap-2 py-0.5 text-foreground" key={index} ref={rowRef}>
-                    <span className="text-success">{entry.db}&gt;</span>
+                  <div
+                    className={cn('flex gap-2 py-0.5 text-foreground', rowHighlightClass(index))}
+                    key={index}
+                    ref={rowRef}
+                  >
+                    {/* The prompt is searched as part of this entry, so it is
+                        marked as well — otherwise a hit on the database name
+                        was counted and stepped to with nothing highlighted. */}
+                    <span className="text-success">{mark(`${entry.db}>`)}</span>
                     <span>{mark(entry.text)}</span>
                   </div>
                 );
               }
               if (entry.kind === 'note') {
                 return (
-                  <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground" key={index} ref={rowRef}>
+                  <div
+                    className={cn('flex items-center gap-1.5 py-0.5 text-muted-foreground', rowHighlightClass(index))}
+                    key={index}
+                    ref={rowRef}
+                  >
                     <CornerDownLeft size={12} />
                     <span>{mark(entry.text)}</span>
                   </div>
@@ -1624,7 +1659,11 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               }
               if (entry.kind === 'error') {
                 return (
-                  <div className="flex items-center gap-1.5 py-0.5 text-destructive" key={index} ref={rowRef}>
+                  <div
+                    className={cn('flex items-center gap-1.5 py-0.5 text-destructive', rowHighlightClass(index))}
+                    key={index}
+                    ref={rowRef}
+                  >
                     <AlertCircle size={12} />
                     <span>{mark(entry.message)}</span>
                   </div>
@@ -1632,7 +1671,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               }
               if (entry.kind === 'text') {
                 return (
-                  <div key={index} ref={rowRef}>
+                  <div key={index} ref={rowRef} className={rowHighlightClass(index)}>
                     <pre className="m-0 whitespace-pre-wrap py-0.5 text-muted-foreground">
                       {mark(entry.lines.join('\n'))}
                     </pre>
@@ -1640,7 +1679,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                 );
               }
               return (
-                <div key={index} ref={rowRef}>
+                <div key={index} ref={rowRef} className={rowHighlightClass(index)}>
                   <HighlightedValue
                     value={entry.value}
                     query={findOpen ? findQuery : ''}
