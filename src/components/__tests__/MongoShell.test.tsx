@@ -242,6 +242,68 @@ describe('MongoShell Component', () => {
       expect(transcript.scrollTop).toBe(5000);
     });
 
+    it('keeps the stepped-to match when matching output arrives', async () => {
+      // Output containing the term lengthens the match list. Resetting on that
+      // length change snapped the selection back to the first match and moved
+      // the user off the one they had stepped to (#357 review).
+      const transcript = await withOutput();
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'mongosh' },
+      });
+
+      const status = () => screen.getByTestId('results-find-status').textContent ?? '';
+      // "2 of 5" — the first number is the match the user is on.
+      const current = () => Number(status().match(/\d+/)?.[0] ?? -1);
+      const total = () => Number(status().match(/(\d+)\D+(\d+)/)?.[2] ?? -1);
+
+      fireEvent.click(screen.getByTestId('results-find-next'));
+      const steppedTo = current();
+      const before = total();
+      expect(steppedTo).toBeGreaterThan(1);
+
+      // A command whose output also contains the term.
+      fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      // The new output matches too, so the total grows.
+      await waitFor(() => expect(total()).toBeGreaterThan(before));
+
+      // ...and the user is still on the match they stepped to.
+      expect(current()).toBe(steppedTo);
+    });
+    it('marks the right characters when lowercasing would shift them', async () => {
+      // `İ`.toLowerCase() is two code units, so offsets taken from a fully
+      // lowercased copy do not index the original and the wrong characters
+      // were marked (#357 review).
+      const transcript = await withOutput();
+      fireEvent.change(screen.getByLabelText('mongosh editor'), {
+        target: { value: 'İstanbul' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      fireEvent.pointerDown(transcript);
+      fireEvent.keyDown(transcript, { key: 'f', ctrlKey: true });
+      fireEvent.change(await screen.findByTestId('results-find-input'), {
+        target: { value: 'stan' },
+      });
+
+      // Whatever is marked is exactly what was searched for, never a run
+      // shifted off by the case folding.
+      for (const mark of transcript.querySelectorAll('mark')) {
+        expect(mark.textContent?.toLowerCase()).toBe('stan');
+      }
+    });
+
+    it('moves the caret into the tab that was chosen', async () => {
+      // The tab strip belongs to neither output pane, so a shortcut raised
+      // while its trigger holds focus resolves to nothing (#357 review).
+      const transcript = await withOutput();
+      fireEvent.click(screen.getByRole('tab', { name: /console/i }));
+      await waitFor(() => expect(document.activeElement).toBe(transcript));
+    });
+
     it('reports when the output does not contain the term', async () => {
       const transcript = await withOutput();
       fireEvent.pointerDown(transcript);

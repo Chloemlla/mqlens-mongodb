@@ -237,6 +237,29 @@ export const shellEntryText = (entry: ShellEntry): string => {
  * because the entry is what stepping moves between, but a long line of output
  * with the term three times should show all three.
  */
+/**
+ * `haystack.indexOf(needle)`, case-insensitively, in the haystack's own offsets.
+ *
+ * Lowercasing the whole string first and reusing those offsets is wrong: for a
+ * character whose lowercase form is longer — `İ`.toLowerCase() is two code
+ * units — every offset after it is shifted, and the slice taken back out of the
+ * original marks the wrong characters. Comparing equal-length slices of the
+ * original keeps every offset valid in the string being sliced (#357 review).
+ *
+ * A run whose case folding changes length therefore does not match here, while
+ * `findMatches` (which lowercases whole strings) still counts it. The row
+ * highlight covers that gap: a counted match always shows on its row, even when
+ * no individual run can be marked.
+ */
+function caseInsensitiveIndexOf(haystack: string, needle: string, from: number): number {
+  const width = needle.length;
+  const folded = needle.toLowerCase();
+  for (let i = Math.max(0, from); i + width <= haystack.length; i++) {
+    if (haystack.slice(i, i + width).toLowerCase() === folded) return i;
+  }
+  return -1;
+}
+
 const MarkedText: React.FC<{ text: string; query: string; active: boolean }> = ({
   text,
   query,
@@ -244,13 +267,11 @@ const MarkedText: React.FC<{ text: string; query: string; active: boolean }> = (
 }) => {
   const needle = query.trim();
   if (needle === '') return <>{text}</>;
-  const haystack = text.toLowerCase();
-  const target = needle.toLowerCase();
   const out: React.ReactNode[] = [];
   let from = 0;
   let key = 0;
   for (;;) {
-    const at = haystack.indexOf(target, from);
+    const at = caseInsensitiveIndexOf(text, needle, from);
     if (at < 0) break;
     if (at > from) out.push(text.slice(from, at));
     out.push(
@@ -572,6 +593,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   // This element does not exist at all on the viewer tab, so the grid answers
   // for it (#357 review).
   const consolePaneRef = useRef<HTMLDivElement>(null);
+  const viewerPaneRef = useRef<HTMLDivElement>(null);
 
   // Find over the transcript (#357). The console renders every entry — it is
   // not virtualized — so matching against the entry text is matching against
@@ -609,9 +631,25 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   };
 
   // A new query starts at its first match rather than keeping an index into a
-  // list that no longer exists.
+  // list that no longer exists. A longer list under the SAME query does not:
+  // output arriving mid-search that happens to contain the term used to snap
+  // the selection back to the first match, moving the user off the one they had
+  // stepped to (#357 review). Matches are in transcript order and new output is
+  // appended, so the indexes already held stay pointing at the same entries;
+  // only the tail is new, and the index is clamped in case entries were cleared.
+  const lastFindQuery = useRef(findQuery);
   useEffect(() => {
-    setActiveFind(findMatchList.length > 0 ? 0 : -1);
+    const queryChanged = lastFindQuery.current !== findQuery;
+    lastFindQuery.current = findQuery;
+    if (queryChanged) {
+      setActiveFind(findMatchList.length > 0 ? 0 : -1);
+      return;
+    }
+    setActiveFind((current) => {
+      if (findMatchList.length === 0) return -1;
+      if (current < 0) return 0;
+      return Math.min(current, findMatchList.length - 1);
+    });
   }, [findQuery, findMatchList.length]);
 
   // The match the user stepped to has to be on screen to be of any use —
@@ -1579,7 +1617,15 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               <TabsTrigger
                 value="console"
                 className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
-                onClick={() => setTab('console')}
+                onClick={() => {
+                  setTab('console');
+                  // The tab strip belongs to neither output pane, so a shortcut
+                  // raised while its trigger holds focus resolves to nothing and
+                  // falls through to the browser. Choosing a tab moves the caret
+                  // into what was chosen, which is where the next Cmd/Ctrl+F is
+                  // meant to act anyway (#357 review).
+                  requestAnimationFrame(() => scrollRef.current?.focus());
+                }}
               >
                 <Terminal size={12} className={tab === 'console' ? 'text-success' : ''} />
                 {t('mongoShell.console.tabLabel')}
@@ -1588,7 +1634,10 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                 <TabsTrigger
                   value="viewer"
                   className="gap-1.5 rounded-none border-b-2 border-transparent text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent"
-                  onClick={() => setTab('viewer')}
+                  onClick={() => {
+                    setTab('viewer');
+                    requestAnimationFrame(() => viewerPaneRef.current?.focus());
+                  }}
                 >
                   <Braces size={12} className={tab === 'viewer' ? 'text-primary' : ''} />
                   {t('mongoShell.console.dataViewerTabLabel')}
@@ -1630,9 +1679,12 @@ export const MongoShell: React.FC<MongoShellProps> = ({
             // `user-select: none`. Without it the console could not be selected
             // with the mouse and Ctrl/Cmd+A had nothing to select, so output
             // could be read but never copied (#357).
-            className="min-h-0 flex-1 select-text overflow-y-auto p-2 font-mono text-xs"
+            className="min-h-0 flex-1 select-text overflow-y-auto p-2 font-mono text-xs outline-none"
             ref={scrollRef}
             data-testid="shell-transcript"
+            // Focusable only programmatically: choosing the tab moves the caret
+            // here, but Tab still walks past it to the real controls.
+            tabIndex={-1}
           >
             {entries.length === 0 && (
               <div className="py-4 text-center text-muted-foreground">{t('mongoShell.console.cleared')}</div>
@@ -1705,7 +1757,15 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           </div>
           </div>
         ) : (
-          viewer && <DataGrid documents={viewer.docs} density={density} />
+          viewer && (
+            <div
+              className="flex min-h-0 flex-1 flex-col outline-none"
+              ref={viewerPaneRef}
+              tabIndex={-1}
+            >
+              <DataGrid documents={viewer.docs} density={density} />
+            </div>
+          )
         )}
       </div>
     </div>
