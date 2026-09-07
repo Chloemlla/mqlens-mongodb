@@ -6,6 +6,7 @@ import {
   toProfileSpaceId,
   toLiveSpaceId,
   materializeArrivingTab,
+  carriedDocumentEdit,
   type PersistableTab,
   type PersistableConnection,
   type PersistedTab,
@@ -333,6 +334,121 @@ describe('materializeArrivingTab', () => {
     expect(isLive).toBe(false);
     expect(tab.id).toBe('tasks');
     expect(tab.connectionId).toBe('');
+  });
+});
+
+
+// #326 review: a tab moved or detached to another window is rebuilt there from
+// the persisted model, so anything missing from the model the move discards.
+// Before this, that included the document the user was part-way through typing.
+describe('an in-progress document edit travels with its tab (#326 review)', () => {
+  const connections: PersistableConnection[] = [{ id: 'live-conn-1', profileId: 'p1', name: 'Profile 1' }];
+  const edit = {
+    id: 'edit-1',
+    mode: 'edit',
+    initialJson: '{"_id":"1"}',
+    targetDoc: { _id: '1' },
+    draft: '{"_id":"1","name":"half typed"}',
+    error: 'a failure from the window it left',
+    saving: true,
+  };
+
+  it('carries the text, and leaves the pending save and its failure behind', () => {
+    const carried = carriedDocumentEdit(edit) as Record<string, unknown>;
+    expect(carried).toEqual({
+      id: 'edit-1',
+      mode: 'edit',
+      initialJson: '{"_id":"1"}',
+      targetDoc: { _id: '1' },
+      draft: '{"_id":"1","name":"half typed"}',
+    });
+    // `saving` must not travel: the request belongs to the window that made it
+    // and settles there, so an arriving tab claiming one was in flight would
+    // disable Save with nothing left to finish it.
+    expect(carried.saving).toBeUndefined();
+    expect(carried.error).toBeUndefined();
+  });
+
+  it('has nothing to carry for a tab with no edit open', () => {
+    expect(carriedDocumentEdit(undefined)).toBeUndefined();
+    expect(carriedDocumentEdit(null)).toBeUndefined();
+  });
+
+  it('puts it on the persisted tab', () => {
+    const persisted = toPersistedTab(
+      {
+        id: 'live-conn-1.mydb.mycoll',
+        type: 'collection',
+        connectionId: 'live-conn-1',
+        db: 'mydb',
+        collection: 'mycoll',
+        documentEdit: edit,
+      },
+      { id: 'live-conn-1', profileId: 'p1', name: 'Profile 1' },
+      undefined
+    );
+    expect((persisted?.documentEdit as Record<string, unknown>).draft).toBe('{"_id":"1","name":"half typed"}');
+    expect((persisted?.documentEdit as Record<string, unknown>).saving).toBeUndefined();
+  });
+
+  it('hands it to the tab the destination window builds', () => {
+    const { tab } = materializeArrivingTab(
+      {
+        id: 'profile:p1.mydb.mycoll',
+        type: 'collection',
+        profileId: 'p1',
+        profileName: 'Profile 1',
+        db: 'mydb',
+        collection: 'mycoll',
+        documentEdit: carriedDocumentEdit(edit),
+      },
+      connections
+    );
+    expect((tab.documentEdit as Record<string, unknown>).draft).toBe('{"_id":"1","name":"half typed"}');
+  });
+});
+
+
+// #326 review: three ways the transfer could still lose or duplicate work —
+// the boot path a detached window actually takes, the debounce racing an
+// immediate move, and a request that cannot travel with the tab that made it.
+describe('a document edit survives the whole transfer (#326 review)', () => {
+  const carried = {
+    id: 'edit-1',
+    mode: 'insert',
+    initialJson: '{}',
+    targetDoc: null,
+    draft: '{"name":"half typed"}',
+  };
+
+  it('reaches a window that boots into it, not only one already running', () => {
+    // "Detach to New Window" starts the destination renderer, which reads the
+    // workspace through this function rather than through
+    // `materializeArrivingTab` — so omitting the field here discarded the draft
+    // on exactly the path the transfer exists for.
+    const ws: PersistedWorkspace = {
+      revision: 1,
+      windows: [
+        {
+          id: 'win-2',
+          splitTree: { kind: 'pane', id: 'pane-1', tabIds: ['profile:p1.mydb.mycoll'], activeTabId: 'profile:p1.mydb.mycoll' },
+          focusedPaneId: 'pane-1',
+        },
+      ],
+      tabs: [
+        {
+          id: 'profile:p1.mydb.mycoll',
+          type: 'collection',
+          profileId: 'p1',
+          profileName: 'Profile 1',
+          db: 'mydb',
+          collection: 'mycoll',
+          documentEdit: carried,
+        },
+      ],
+    };
+    const { tabs } = toDisconnectedSnapshot(ws, 'win-2');
+    expect((tabs[0].documentEdit as Record<string, unknown>).draft).toBe('{"name":"half typed"}');
   });
 });
 

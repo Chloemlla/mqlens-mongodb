@@ -13,7 +13,11 @@ import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { EJSON } from 'bson';
 import { copyValueToText } from '../lib/copyValue';
 import { ResultsFindBar } from './ResultsFindBar';
-import { registerResultsFindTarget } from '../lib/resultsFindShortcut';
+import {
+  isTextEntryContext,
+  registerResultsFindTarget,
+  resultsPaneElementForEvent,
+} from '../lib/resultsFindShortcut';
 import { findMatches, isMatchAt, stepMatch, type FindCell } from '../lib/resultsFind';
 import {
   bsonCallOf,
@@ -30,10 +34,25 @@ import { Badge } from '@/components/ui/badge';
 import { useThemeOptional } from '@/hooks/use-theme';
 import { getScaledRowHeight } from '@/lib/themes/ui-scale';
 import { cn } from '@/lib/utils';
+import { useTabVisible } from '@/workspace/tabVisibility';
 import type { SpacingDensity } from '@/lib/themes/schema';
+
+/** A document's identity for comparing result sets, tolerant of any `_id` shape. */
+function stableDocId(doc: Record<string, any>): string {
+  try {
+    return JSON.stringify(doc?._id ?? null);
+  } catch {
+    return '';
+  }
+}
 
 interface DataGridProps {
   documents: Array<Record<string, any>>;
+  /** A run is in flight. The grid stays mounted and keeps showing the previous
+   *  results under a loading overlay, rather than being replaced by a spinner
+   *  — which unmounted it on every run and threw away its folds, its find bar,
+   *  its scroll position and everything else it holds (#344). */
+  loading?: boolean;
   density?: 'roomy' | 'cozy' | 'compact';
   explainResult?: string | null;
   // The query that produced these results, rendered as runnable driver code
@@ -54,12 +73,24 @@ interface DataGridProps {
   onPageChange?: (newSkip: number) => void;
   onPageSizeChange?: (newLimit: number) => void;
   /** Results view mode, owned by the caller so it survives this grid being
-   *  unmounted. The results pane renders `{loading ? <spinner/> : <DataGrid/>}`,
-   *  so the grid remounts on EVERY run, and switching tabs unmounts the whole
-   *  DocumentViewer subtree — local state reset to 'json' both times. Omit both
-   *  props to keep the old self-managed behaviour (MongoShell does). */
+   *  unmounted. The results pane used to render
+   *  `{loading ? <spinner/> : <DataGrid/>}`, remounting the grid on every run;
+   *  that is gone (#344), but switching tabs can still unmount the whole
+   *  DocumentViewer subtree, so the mode stays lifted. Omit both props to keep
+   *  the self-managed behaviour (MongoShell does). */
   viewMode?: ViewMode;
   onViewModeChange?: (mode: ViewMode) => void;
+  /** Which results tab is showing. Owned by the caller for the same reason as
+   *  viewMode above — the grid remounts on every run, so a tab kept here is a
+   *  choice the user loses (#281). Omit both to self-manage. */
+  activeTab?: ResultsTab;
+  onActiveTabChange?: (tab: ResultsTab) => void;
+  /** Table column widths, owned by the caller for the same reason as the two
+   *  above: the grid remounts on every run, so widths kept here are widths the
+   *  user re-drags after every query (#268). Keyed by column name. Omit both to
+   *  self-manage. */
+  columnWidths?: Record<string, number>;
+  onColumnWidthsChange?: (widths: Record<string, number>) => void;
   /**
    * Drop the control bar — the Results/Explain tabs, the view-mode switcher and
    * the row actions — and render the documents alone.
@@ -83,6 +114,9 @@ interface DataGridProps {
 }
 
 export type ViewMode = 'table' | 'tree' | 'json' | 'chart';
+
+/** Which pane of the results area is showing. */
+export type ResultsTab = 'results' | 'explain' | 'query';
 
 interface ExplainNode {
   name: string;
@@ -369,6 +403,12 @@ const RenderTreeNode: React.FC<{ node: ExplainNode }> = ({ node }) => {
 
 // Lightweight, data-only descriptor for one rendered JSON line (no React nodes,
 // so building thousands of them stays cheap; content is rendered lazily per row).
+/** One end of a selection: the row it sits on and how far into that row. */
+interface JsonEndpoint {
+  row: number;
+  offset: number;
+}
+
 interface JsonLine {
   num: number;
   depth: number;
@@ -477,6 +517,9 @@ const JsonRow = ({
         line.isDocRoot && line.docIndex > 0 && 'border-t border-border',
         findHighlightClass(line.num)
       )}
+      // Lets a copy reconstruct the selected range from the line data even
+      // after virtualization has unmounted the rows it started on (#311).
+      data-json-line={index}
       data-doc-even={line.docIndex % 2 === 0}
       onContextMenu={(e) => openCtxMenu(e, documents[line.docIndex], line.kind === 'scalar' ? line.keyName ?? undefined : undefined, line.value)}
     >
@@ -498,8 +541,14 @@ const JsonRow = ({
           </button>
         )}
       </span>
+      {/* `select-text` re-enables selection against the app-wide
+          `body { user-select: none }`, and everything inside inherits it —
+          which is why the blanket `[&_*]:select-text` that used to sit here is
+          gone. It was not adding reach, it was overriding the row actions'
+          `select-none` below and dragging three empty buttons into every copy
+          (#329). */}
       <span
-        className="flex-1 whitespace-pre pr-4 text-foreground select-text [&_*]:select-text"
+        className="flex-1 whitespace-pre pr-4 text-foreground select-text"
         style={{ paddingLeft: line.depth * 18 }}
       >
         {renderContent(line)}
@@ -510,8 +559,13 @@ const JsonRow = ({
             {line.hasComma ? ',' : ''}
           </span>
         )}
+        {/* Controls, not content. They live inside the text span so they sit
+            next to the document they act on, but a selection that runs over
+            them must not pick them up: they carry no text, so the browser
+            serialised each button as its own empty block and a copied document
+            arrived with three blank lines under its opening brace (#329). */}
         {line.isDocRoot && hasRowActions && line.doc && (
-          <span className="ml-2.5 inline-flex align-middle opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
+          <span className="ml-2.5 inline-flex select-none align-middle opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
             <RowActions doc={line.doc} />
           </span>
         )}
@@ -522,6 +576,7 @@ const JsonRow = ({
 
 export const DataGrid: React.FC<DataGridProps> = ({
   documents,
+  loading = false,
   density: densityProp,
   explainResult = null,
   querySpec = null,
@@ -540,6 +595,10 @@ export const DataGrid: React.FC<DataGridProps> = ({
   onPageChange,
   onPageSizeChange,
   viewMode: controlledViewMode,
+  activeTab: controlledActiveTab,
+  onActiveTabChange,
+  columnWidths: controlledColWidths,
+  onColumnWidthsChange,
   onViewModeChange,
   onCreateSuggestedIndex,
   connectionMode,
@@ -561,6 +620,14 @@ export const DataGrid: React.FC<DataGridProps> = ({
   );
 
   // Right-click context menu shared by all result views (Table / Tree / JSON).
+  // A run in flight takes the grid out of reach: the overlay covers it, and
+  // `inert` takes the controls under it out of the tab order too, so a stale
+  // row cannot be acted on by keyboard either. An open context menu is
+  // portaled outside that subtree, so it is closed rather than covered.
+  useEffect(() => {
+    if (loading) setCtxMenu(null);
+  }, [loading]);
+
   const [ctxMenu, setCtxMenu] = useState<
     { x: number; y: number; doc: Record<string, any>; field?: string; value?: any } | null
   >(null);
@@ -644,13 +711,33 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setUncontrolledViewMode(mode);
     onViewModeChange?.(mode);
   };
-  const [activeTab, setActiveTab] = useState<'results' | 'explain' | 'query'>('results');
+  // Which results tab is showing, owned by the caller for the same reason
+  // `viewMode` is: the grid remounts on every run, so state kept here is state
+  // the user loses. Left uncontrolled it behaves as before, for callers with
+  // nothing to persist it to.
+  const [uncontrolledActiveTab, setUncontrolledActiveTab] =
+    useState<ResultsTab>('results');
+  const activeTab = controlledActiveTab ?? uncontrolledActiveTab;
+  const setActiveTab = (tab: ResultsTab) => {
+    setUncontrolledActiveTab(tab);
+    onActiveTabChange?.(tab);
+  };
   // Chromeless callers have no tabs to switch and no explain plan to show.
   const effectiveTab = chromeless ? 'results' : activeTab;
 
-  // Column resize: table view keeps per-column widths (session-scoped — the
-  // column set changes per collection); the tree view's key column persists.
-  const [colWidths, setColWidths] = useState<Record<string, number>>({});
+  // Column resize: table view keeps per-column widths, owned by the caller for
+  // the same reason `viewMode` and `activeTab` are. Held here they died with
+  // every run — the grid remounts, the widths came back as {}, and a column
+  // widened to read a field snapped back to 180px (#268).
+  const [uncontrolledColWidths, setUncontrolledColWidths] = useState<Record<string, number>>({});
+  const colWidths = controlledColWidths ?? uncontrolledColWidths;
+  const setColWidths = (update: (prev: Record<string, number>) => Record<string, number>) => {
+    setUncontrolledColWidths(update);
+    // Computed from the widths on screen rather than from the uncontrolled copy,
+    // which a controlled caller never updates and which would otherwise send
+    // every drag as though it were the first.
+    onColumnWidthsChange?.(update(colWidths));
+  };
   const colWidth = (col: string) => colWidths[col] ?? 180;
   // The table header and the virtualized body are separate boxes: only the body
   // scrolls. Once resized columns overflow the viewport the header would stay
@@ -658,6 +745,10 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // the body's horizontal scroll onto the header.
   const tableHeaderRef = React.useRef<HTMLDivElement>(null);
   const tableBodyRef = React.useRef<HTMLDivElement>(null);
+  // The JSON view's horizontal scroller is the overflow-auto wrapper around its
+  // list, not the list element: the list is widened to `jsonMaxWidthPx`, so the
+  // wrapper is what carries scrollLeft.
+  const jsonScrollRef = React.useRef<HTMLDivElement>(null);
   useEffect(() => {
     const body = tableBodyRef.current;
     if (!body) return;
@@ -761,16 +852,27 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Registered only while the results are actually showing: the find bar lives
   // in the results tab, so claiming the key from the explain or code tab would
   // swallow it and open a bar the user cannot see.
+  // Registered for the pane's whole life, not only while its results are
+  // showing. Being registered is what makes a click in this pane count as
+  // selecting it, and that is true on every tab: a pane on the explain tab used
+  // to vanish from the registry, so clicking it selected nothing and the copy
+  // it was about went to whichever pane was still registered (#330 review).
+  // Whether the find bar can open is asked separately, at the moment the key
+  // is pressed.
+  const effectiveTabRef = React.useRef(effectiveTab);
+  effectiveTabRef.current = effectiveTab;
   useEffect(() => {
-    if (effectiveTab !== 'results') return;
     return registerResultsFindTarget({
       element: () => paneRootRef.current,
+      canOpenFind: () => effectiveTabRef.current === 'results',
       open: () => {
         setFindOpen(true);
         setFindFocusToken((token) => token + 1);
       },
     });
-  }, [effectiveTab]);
+    // Registered once: re-registering on every tab change would mint a new id
+    // and drop the record of this pane having been pointed at.
+  }, []);
 
   const closeFind = React.useCallback(() => {
     setFindOpen(false);
@@ -786,25 +888,49 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Collapsed rows in the tree-table view (separate id space from JSON folds).
   const [treeCollapsed, setTreeCollapsed] = useState<Set<number>>(new Set());
 
-  // Reset JSON fold state whenever the result set changes (fold ids are positional).
-  useEffect(() => {
-    setCollapsedFolds(new Set());
-  }, [documents]);
+  // JSON folds are reset further down, once the lines they index are known.
 
-  // Automatically switch to explain tab when a new explain result is received
+  // Switch to the explain tab when a NEW plan arrives — not merely because one
+  // exists.
+  //
+  // Without the mount guard this fired every time the grid remounted, which is
+  // once per run. A plan is not cleared when a query re-runs, so after a single
+  // visit to Explain every subsequent run reopened it and the Results tab had
+  // to be clicked again each time (#281). The results effect below was already
+  // guarded this way and so could not push back.
+  // Both switches below compare against the previous value rather than counting
+  // mounts.
+  //
+  // A one-shot flag looks equivalent and is not: StrictMode runs each effect
+  // twice on mount, and the first setup spends the flag, so the replayed setup
+  // sees a guard that is already gone and fires anyway. That put this bug
+  // straight back for anyone running the app in development (#325 review).
+  // Comparing values is idempotent — a replay is simply not a change — so the
+  // guard survives however many times React chooses to run the effect.
+  //
+  // The seed carries the earlier decision. A controlled caller owns the tab, so
+  // mount must not override the choice it just handed us; an uncontrolled one
+  // has expressed no preference, and its long-standing contract is that a plan
+  // passed at mount opens it.
+  const lastExplainResult = React.useRef<string | null | undefined>(
+    controlledActiveTab !== undefined ? explainResult : undefined
+  );
   useEffect(() => {
+    const previous = lastExplainResult.current;
+    lastExplainResult.current = explainResult;
+    if (previous === explainResult) return;
     if (explainResult) {
       setActiveTab('explain');
     }
   }, [explainResult]);
 
-  // Automatically switch to results tab when new query results (documents) are loaded (skipping mount)
-  const isFirstRender = React.useRef(true);
+  // Switch to results when a new set of documents arrives — seeded with the
+  // current set so arriving at one does not count as a change.
+  const lastDocuments = React.useRef(documents);
   useEffect(() => {
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
+    const previous = lastDocuments.current;
+    lastDocuments.current = documents;
+    if (previous === documents) return;
     setActiveTab('results');
   }, [documents]);
 
@@ -985,6 +1111,60 @@ export const DataGrid: React.FC<DataGridProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsedDocs, documents]);
 
+  // The result's identity: what was asked for — the query, the page — and the
+  // shape of what came back: its documents in order, then every foldable
+  // block in order with where it sits (document, depth, key). Fold ids are
+  // positional, and this is what makes them meaningful again on a new array:
+  // a re-run of the same query returns the same identity — the case where
+  // losing every fold on every run was the complaint (#344) — while another
+  // page, another query, or the same documents with their fields rearranged
+  // do not. Neither half would do alone: an aggregation's documents may all
+  // lack an _id, and a projection may drop it, so two pages can have the same
+  // shape; and the same query may return new documents.
+  //
+  // Two things hang off it. Folds — JSON and tree — are kept across the same
+  // identity and reset otherwise. The scroll position likewise: a refresh
+  // keeps the user's place, a new page starts at its first row — now that the
+  // grid stays mounted, nothing else would move it there.
+  const resultShape = useMemo(() => {
+    // One JSON serialization of everything that identifies the result, so no
+    // field name can impersonate a delimiter: an unescaped separator let a key
+    // like `x\u0001open/0/2/y` reproduce two fold-path parts and collide two
+    // structurally different results (#344 review). `empty` lines count
+    // alongside `open`: an empty container is not foldable in the JSON view but
+    // still takes a fold id in the tree, so one shifts every id after it.
+    const folds: Array<[string, number, number, string]> = [];
+    for (const line of jsonLines) {
+      if (line.kind === 'open' || line.kind === 'empty') {
+        folds.push([line.kind, line.docIndex, line.depth, line.keyName ?? '']);
+      }
+    }
+    return JSON.stringify([
+      querySpec ?? null,
+      skip ?? null,
+      limit ?? null,
+      documents.map(stableDocId),
+      folds,
+    ]);
+  }, [querySpec, skip, limit, jsonLines, documents]);
+  useEffect(() => {
+    setCollapsedFolds(new Set());
+    // A different result opens at the top-left, not wherever the last one was
+    // left scrolled. `scrollToRow` resets only the vertical offset and throws
+    // on an out-of-range index, so it is guarded.
+    for (const list of [jsonListRef, treeListRef, tableListRef]) {
+      if (documents.length > 0) list.current?.scrollToRow({ index: 0, align: 'start' });
+    }
+    // The horizontal offset lives on the overflow-auto wrappers, not the List
+    // elements: the JSON list is widened to `jsonMaxWidthPx` and the table body
+    // to its total column width, so those wrappers carry scrollLeft. The table
+    // header mirrors the body and is reset with it. (The tree view is
+    // full-width with no horizontal scroll.)
+    for (const scroller of [jsonScrollRef.current, tableBodyRef.current, tableHeaderRef.current]) {
+      if (scroller) scroller.scrollLeft = 0;
+    }
+  }, [resultShape]);
+
   // Only the lines not hidden inside a collapsed fold are rendered/virtualized.
   const visibleJsonLines = useMemo(
     () => jsonLines.filter((line) => !line.ancestors.some((a) => collapsedFolds.has(a))),
@@ -1047,6 +1227,312 @@ export const DataGrid: React.FC<DataGridProps> = ({
         return `${line.bracket || '}'}${comma}`;
     }
   };
+
+  // ── Copying a selection that scrolled (#311) ──────────────────────────────
+  //
+  // The JSON view is virtualized, so dragging a selection downwards unmounts
+  // the rows it started on. The browser's selection lives in the DOM, so those
+  // rows are simply gone by the time Cmd+C runs and only the last screenful is
+  // copied — silently, which is the worst part: the paste looks like a
+  // successful copy of the wrong thing.
+  //
+  // The extent is therefore recorded as the drag happens, while both ends are
+  // still mounted, and the copy is rebuilt from the line data rather than from
+  // the DOM.
+  const jsonViewRef = React.useRef<HTMLDivElement | null>(null);
+  // These grids listen on `document` for copy and select-all, and answer for a
+  // selection whose endpoints are inside their own container — which bypasses
+  // the active-pane check on purpose (#330). A kept-alive tab (#240) stays
+  // mounted with its selection intact, so a hidden grid would go on answering
+  // Ctrl+C in the tab the user switched to, copying data they cannot see. Only
+  // the grid on screen listens.
+  const tabVisible = useTabVisible();
+  // The two ends of the selection, each remembered independently at the last
+  // row it was seen on. Modelling the ends rather than a min/max span is what
+  // lets the range CONTRACT: during a drag the anchor is fixed and only the
+  // focus moves, so a span that could only grow kept lines the user had dragged
+  // back over and deselected, and then copied them (#319 review).
+  const jsonSelectionRef = React.useRef<{
+    anchor: JsonEndpoint | null;
+    focus: JsonEndpoint | null;
+  }>({ anchor: null, focus: null });
+
+  /**
+   * The row an endpoint sits on, plus how far into that row's text it falls.
+   *
+   * The offset is what lets a partial endpoint be trimmed later. Without it the
+   * rebuild had only row numbers, so a drag starting mid-value and ending
+   * mid-value put the leading key and trailing text of both endpoint lines on
+   * the clipboard as well (#319 review).
+   *
+   * Counting characters across the row's text nodes works because a row's
+   * rendered text is exactly `jsonLineText`: the gutter's line number is a
+   * ::before pseudo-element and the fold control and row actions are icons, so
+   * none of them contribute text.
+   */
+  const jsonEndpointOf = (node: Node | null, offset: number): JsonEndpoint | null => {
+    const el = node instanceof Element ? node : (node?.parentElement ?? null);
+    const row = el?.closest('[data-json-line]') ?? null;
+    const index = Number(row?.getAttribute('data-json-line'));
+    if (!row || !Number.isInteger(index)) return null;
+    // Measure with a Range rather than counting text nodes by hand, because
+    // `offset` means different things depending on what `node` is: characters
+    // when it is a text node, but a CHILD INDEX when the boundary lands on an
+    // element — which happens readily, e.g. clicking in the padding to the
+    // right of a row's text. Range.setEnd applies each rule correctly, and the
+    // text before that point is then just the range's length.
+    //
+    // Hand-counting had to guess at the element case and chose either the start
+    // or the end of the line, so an endpoint there could drop the final line or
+    // pull in a whole one nobody selected (#322 review).
+    const range = document.createRange();
+    range.selectNodeContents(row);
+    try {
+      range.setEnd(node!, offset);
+    } catch {
+      // Boundary outside this row, so nothing meaningful to measure.
+      return { row: index, offset: 0 };
+    }
+    return { row: index, offset: range.toString().length };
+  };
+
+  /**
+   * Both ends of the live selection, each resolved on its own.
+   *
+   * Resolving them independently is the crux of this mechanism rather than
+   * defensive coding. Once the drag passes the first window, the row holding
+   * the anchor is exactly what react-window unmounts — so requiring both to
+   * resolve threw away every update from the moment tracking started to
+   * matter, freezing the range at the first screenful (#319 review).
+   */
+  const selectedJsonEnds = (): {
+    anchor: JsonEndpoint | null;
+    focus: JsonEndpoint | null;
+  } | null => {
+    const selection = document.getSelection();
+    const container = jsonViewRef.current;
+    if (!selection || selection.isCollapsed || !container) return null;
+    const endpoint = (node: Node | null, offset: number) =>
+      node && container.contains(node) ? jsonEndpointOf(node, offset) : null;
+    const ends = {
+      anchor: endpoint(selection.anchorNode, selection.anchorOffset),
+      focus: endpoint(selection.focusNode, selection.focusOffset),
+    };
+    if (ends.anchor || ends.focus) return ends;
+    // Neither end sits on a row, which is what a select-all looks like: its
+    // endpoints land on <body>, outside the view entirely. Only treat that as
+    // "everything" once the selection is confirmed to ENCLOSE the view —
+    // clamping any unresolvable endpoint to the view's bounds would claim rows
+    // for selections that merely pass nearby, or that live somewhere else in
+    // the UI altogether (#320).
+    if (!enclosesJsonView(selection, container)) return ends;
+    return {
+      anchor: { row: 0, offset: 0 },
+      // Past the end of any line; the copy clamps it to the real length.
+      focus: { row: Math.max(visibleJsonLines.length - 1, 0), offset: Number.MAX_SAFE_INTEGER },
+    };
+  };
+
+  /** Does the selection start at or before the view and end at or after it? */
+  const enclosesJsonView = (selection: Selection, container: HTMLElement): boolean => {
+    if (selection.rangeCount === 0) return false;
+    const contents = document.createRange();
+    contents.selectNodeContents(container);
+    try {
+      const range = selection.getRangeAt(0);
+      return (
+        range.compareBoundaryPoints(Range.START_TO_START, contents) <= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_END, contents) >= 0
+      );
+    } catch {
+      // Ranges in different documents cannot be compared; treat as no match
+      // rather than assuming the view is covered.
+      return false;
+    }
+  };
+
+  /** The two endpoints in document order, or null if neither resolved. */
+  const jsonRangeOf = (ends: { anchor: JsonEndpoint | null; focus: JsonEndpoint | null }) => {
+    const ordered = [ends.anchor, ends.focus]
+      .filter((end): end is JsonEndpoint => end !== null)
+      .sort((a, b) => a.row - b.row || a.offset - b.offset);
+    return ordered.length ? { start: ordered[0], end: ordered[ordered.length - 1] } : null;
+  };
+
+  useEffect(() => {
+    if (viewMode !== 'json') return;
+    // Each end keeps the last place it was seen, so an end that scrolls out of
+    // the DOM is remembered while the other stays free to move in either
+    // direction — extending the selection or pulling it back.
+    const onSelectionChange = () => {
+      const ends = selectedJsonEnds();
+      if (!ends) return;
+      const seen = jsonSelectionRef.current;
+      jsonSelectionRef.current = {
+        anchor: ends.anchor ?? seen.anchor,
+        focus: ends.focus ?? seen.focus,
+      };
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+    // The lines matter because a select-all is recorded as a row range, and its
+    // far end is the last line there is. The view no longer remounts between
+    // runs, so a listener left holding the previous result set would remember
+    // a select-all that stops short of the rows now on screen.
+  }, [viewMode, visibleJsonLines]);
+
+  const handleJsonCopy = (e: ClipboardEvent) => {
+    // Another JSON view has already answered this event. Two can be on screen in
+    // a split, both listen on the document, and both would otherwise write to
+    // the clipboard — the second silently replacing the first (#330 review).
+    if (e.defaultPrevented) return;
+    const container = jsonViewRef.current;
+    if (!container) return;
+    // Whose copy is this? A drag settles it by itself: its endpoints are inside
+    // one view, and that view answers. A select-all leaves them on <body>,
+    // enclosing every view equally, so the pane the user last clicked in
+    // answers for it. With no click yet — a select-all into a fresh window —
+    // nobody is preferred, and the guard above makes the first to arrive the
+    // one that answers rather than the last.
+    const selection = document.getSelection();
+    const endpointsHere =
+      !!selection &&
+      ((!!selection.anchorNode && container.contains(selection.anchorNode)) ||
+        (!!selection.focusNode && container.contains(selection.focusNode)));
+    // Asked of the pane, not of this view. Selecting a pane includes clicking
+    // its toolbar — switching to JSON is itself such a click — and a notion of
+    // "active" that only counted clicks in the results body disagreed with the
+    // one the app already uses for shortcut routing (#330 review). One answer,
+    // one place: the pane holding focus, else the one last pointed at, else the
+    // only one. With several panes and no signal it returns null, and the
+    // `defaultPrevented` guard above makes the first view to arrive answer.
+    const activePane = resultsPaneElementForEvent(e.target);
+    const paneRoot = paneRootRef.current;
+    if (!endpointsHere && activePane && paneRoot && activePane !== paneRoot) return;
+    const tracked = jsonRangeOf(jsonSelectionRef.current);
+    if (!tracked) return;
+    // Stand aside only when the browser can be trusted to copy this exactly,
+    // which takes both signals agreeing.
+    //
+    // The live selection still spanning everything tracked says nothing was
+    // dragged out of range. That alone was the old test, and a select-all slips
+    // straight through it: its span covers the tracked rows on paper while the
+    // DOM holds only a screenful (#320).
+    //
+    // So the rows must also actually be there. react-window renders a
+    // contiguous window, so finding both ends means everything between them is
+    // present too.
+    const ends = selectedJsonEnds();
+    const live = ends && jsonRangeOf(ends);
+    // Listening on the document means every copy in the app arrives here, so
+    // this view has to say whether it owns one. A live range is exactly that
+    // claim: `selectedJsonEnds` resolves an endpoint only for a selection that
+    // touches these rows, or encloses the view outright. Without it the
+    // remembered range would answer for a copy from the query editor.
+    if (!live) return;
+    const spansAll = live.start.row <= tracked.start.row && live.end.row >= tracked.end.row;
+    const wanted = tracked.end.row - tracked.start.row + 1;
+    const allMounted =
+      container.querySelectorAll('[data-json-line]').length >= wanted &&
+      !!container.querySelector(`[data-json-line="${tracked.start.row}"]`) &&
+      !!container.querySelector(`[data-json-line="${tracked.end.row}"]`);
+    // Standing aside says "the browser will copy exactly what this view holds",
+    // and that is only knowable when the selection lives inside this view. An
+    // enclosing selection covers the whole page, so leaving it to the browser
+    // yields every other selectable thing on it — in a split with two small
+    // panes, both panes' text, when the user asked for the one they clicked
+    // (#330 review). Those are rebuilt however many rows are mounted.
+    if (endpointsHere && spansAll && allMounted) return;
+    const text = visibleJsonLines
+      .slice(tracked.start.row, tracked.end.row + 1)
+      .map((line, i) => {
+        const folded = line.foldId !== undefined && collapsedFolds.has(line.foldId);
+        const suffix = folded ? ` … ${line.closeChar ?? ''}${line.hasComma ? ',' : ''}` : '';
+        const body = jsonLineText(line) + suffix;
+        const first = i === 0;
+        const last = tracked.start.row + i === tracked.end.row;
+        const from = first ? Math.min(tracked.start.offset, body.length) : 0;
+        const to = last ? Math.min(tracked.end.offset, body.length) : body.length;
+        // Indentation is added for readability, not copied — on screen it is
+        // padding, so no row's text contains it. That makes it a reasonable
+        // aid for a line taken whole and an intrusion on a line the selection
+        // only clipped, so a trimmed line goes without.
+        const whole = from === 0 && to === body.length;
+        return (whole ? '  '.repeat(line.depth) : '') + body.slice(from, to);
+      })
+      .join('\n');
+    if (!text) return;
+    if (!e.clipboardData) return;
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
+  };
+
+  // The browser, not us, decides where a copy event lands: it targets the
+  // element holding the selection's focus, and a select-all leaves that on
+  // <body>. That is an ancestor of the React root, so an `onCopy` on the view
+  // is never reached and the copy fell through to the browser — which holds
+  // only the mounted screenful, or in practice nothing at all (#328).
+  //
+  // Listening on the document puts the handler where every copy passes,
+  // including the ones inside the view, which bubble here just the same. What
+  // it costs is the containment the React tree used to grant for free, so
+  // `handleJsonCopy` establishes that itself before it writes anything.
+  // Make the select-all a selection the page can actually see (#328).
+  //
+  // The app sets `user-select: none` on `body` so its chrome does not select
+  // like a web page. Under that, Chromium *paints* a select-all across the
+  // rows — every one of them highlights — while reporting the selection to
+  // script as collapsed and empty: `isCollapsed` true, `toString()` ''. So the
+  // browser had nothing to copy and neither did we, and the clipboard was left
+  // untouched. Not truncated: untouched, because there was nothing to truncate.
+  //
+  // Claiming the key and setting the range explicitly gives a real selection
+  // that both the native copy and the rebuild below can read. It is the better
+  // meaning of the shortcut too: in a results pane, select-all is about the
+  // results, not about the whole application around them.
+  useEffect(() => {
+    if (viewMode !== 'json' || !tabVisible) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if (e.key !== 'a' && e.key !== 'A') return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      // A query editor or a text field owns this key for its own content.
+      if (isTextEntryContext(e.target)) return;
+      const container = jsonViewRef.current;
+      if (!container) return;
+      // Same ownership question the copy asks, and the same answer: in a split,
+      // the pane the user is working in is the one that responds.
+      // Target-aware: an event from another region belongs to that region, and
+      // only one from nothing in particular falls back to the pane last pointed
+      // at. Reading focus alone let this pane answer for the whole app.
+      const active = resultsPaneElementForEvent(e.target);
+      if (active !== paneRootRef.current) return;
+      const selection = document.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(container);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      e.preventDefault();
+    };
+    // Capture, for the same reason the find shortcut uses it: to be ahead of
+    // any window-level handler that would otherwise claim the key first.
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => document.removeEventListener('keydown', onKeyDown, true);
+  }, [viewMode, tabVisible]);
+
+  const jsonCopyRef = React.useRef(handleJsonCopy);
+  useEffect(() => {
+    jsonCopyRef.current = handleJsonCopy;
+  });
+  useEffect(() => {
+    if (viewMode !== 'json' || !tabVisible) return;
+    const onCopy = (e: ClipboardEvent) => jsonCopyRef.current(e);
+    document.addEventListener('copy', onCopy);
+    // Nothing to unwind: ownership is the pane registry's, and a pane
+    // unregisters itself there when it goes.
+    return () => document.removeEventListener('copy', onCopy);
+  }, [viewMode, tabVisible]);
 
   const toggleFold = (id: number) => {
     setCollapsedFolds((prev) => {
@@ -1138,10 +1624,15 @@ export const DataGrid: React.FC<DataGridProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsedDocs, documents]);
 
-  // Apply the default collapse set whenever the result set (and thus rows) changes.
+  // Apply the default collapse set when the result changes — by identity, not
+  // by array: a re-run of the same query rebuilds the rows and the defaults,
+  // but the tree the user has opened up is the same tree, so it stays (#344).
+  const treeShapeRef = React.useRef<string | null>(null);
   useEffect(() => {
+    if (treeShapeRef.current === resultShape) return;
+    treeShapeRef.current = resultShape;
     setTreeCollapsed(new Set(treeDefaultCollapsed));
-  }, [treeDefaultCollapsed]);
+  }, [resultShape, treeDefaultCollapsed]);
 
   // The text of one tree row: all three columns, since all three are on screen.
   // Container rows show their child count, so that label is searchable too.
@@ -1519,10 +2010,41 @@ export const DataGrid: React.FC<DataGridProps> = ({
     );
   };
   return (
+    <>
+      {/* The accessible announcement of a run in flight, kept OUTSIDE the inert
+          root below. `inert` removes its whole subtree from the accessibility
+          tree, so a live region rendered inside it would be silent to a screen
+          reader (#344 review). */}
+      {loading && (
+        <div role="status" className="sr-only">
+          {t('documents:dataGrid.labels.streamingDocuments')}
+        </div>
+      )}
     <div
       ref={paneRootRef}
-      className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+      className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background"
+      aria-busy={loading || undefined}
+      // Everything under it — row actions, paging, the write buttons — is
+      // unreachable while a run is in flight, by pointer and by keyboard alike.
+      // The overlay below is decorative (aria-hidden); its accessible
+      // counterpart is the live region above, outside this inert subtree.
+      inert={loading || undefined}
     >
+      {/* A run in flight. Over the previous results, not in their place: the
+          grid stays mounted, so nothing it holds is lost, and the last result
+          stays readable until the next one lands (#344). */}
+      {loading && (
+        <div
+          aria-hidden
+          data-testid="results-loading"
+          className="absolute inset-0 z-50 flex items-center justify-center bg-background/60 text-muted-foreground"
+        >
+          <div className="flex select-none flex-col items-center gap-2">
+            <div className="h-5 w-5 animate-spin rounded-full border-b-2 border-primary" />
+            <span className="text-xs">{t('documents:dataGrid.labels.streamingDocuments')}</span>
+          </div>
+        </div>
+      )}
       {/* Control Bar — omitted for a chromeless render, where none of these
           controls have anything to act on. */}
       {!chromeless && (
@@ -1748,8 +2270,23 @@ export const DataGrid: React.FC<DataGridProps> = ({
             <div>{t('dataGrid.empty.noDocuments')}</div>
           </div>
         ) : viewMode === 'json' ? (
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed" data-testid="json-view">
-            <div className="min-h-0 flex-1 min-w-0 overflow-auto">
+          <div
+            ref={jsonViewRef}
+            // A fresh drag starts fresh tracking. Primary button only: a
+            // right-click opens a menu over an existing selection rather than
+            // replacing it, so resetting there threw away the recorded range
+            // just before the copy that needed it (#319 review).
+            onMouseDown={(e) => {
+              if (e.button === 0) jsonSelectionRef.current = { anchor: null, focus: null };
+            }}
+            className="flex min-h-0 min-w-0 flex-1 flex-col bg-background font-mono text-xs leading-relaxed"
+            data-testid="json-view"
+          >
+            <div
+              ref={jsonScrollRef}
+              data-testid="json-scroll"
+              className="min-h-0 flex-1 min-w-0 overflow-auto"
+            >
               <List<JsonRowExtra>
                 rowCount={visibleJsonLines.length}
                 listRef={jsonListRef}
@@ -2062,5 +2599,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
         />
       )}
     </div>
+    </>
   );
 };

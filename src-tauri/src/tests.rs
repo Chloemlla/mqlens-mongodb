@@ -27,6 +27,1275 @@ mod tests {
         std::array::from_fn(|_| byte)
     }
 
+    #[test]
+    fn model_listing_parses_both_http_shapes() {
+        use crate::ai::parse_models_json;
+        // OpenAI and Anthropic.
+        let openai = serde_json::json!({"object":"list","data":[
+            {"id":"gpt-4o","object":"model"},{"id":"gpt-4o-mini","object":"model"}]});
+        assert_eq!(parse_models_json(&openai).unwrap(), ["gpt-4o", "gpt-4o-mini"]);
+        let anthropic = serde_json::json!({"data":[
+            {"id":"claude-opus-4-8","display_name":"Claude Opus 4.8","type":"model"}]});
+        assert_eq!(parse_models_json(&anthropic).unwrap(), ["claude-opus-4-8"]);
+        // Ollama's native route, for servers that only half-pretend to be OpenAI.
+        let ollama = serde_json::json!({"models":[{"name":"llama3:latest"},{"name":"mistral:7b"}]});
+        assert_eq!(parse_models_json(&ollama).unwrap(), ["llama3:latest", "mistral:7b"]);
+    }
+
+    #[test]
+    fn model_listing_dedupes_and_skips_nameless_entries() {
+        use crate::ai::parse_models_json;
+        let v = serde_json::json!({"data":[{"id":"a"},{"id":"a"},{"object":"model"},{"id":"  "},{"id":"b"}]});
+        assert_eq!(parse_models_json(&v).unwrap(), ["a", "b"]);
+    }
+
+    #[test]
+    fn model_listing_explains_an_unrecognised_shape() {
+        use crate::ai::parse_models_json;
+        let err = parse_models_json(&serde_json::json!({"result":"ok"})).unwrap_err();
+        assert!(err.contains("`data`") && err.contains("`models`"), "{err}");
+        let err = parse_models_json(&serde_json::json!({"data":[]})).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn cli_model_listing_reads_a_table_under_its_header() {
+        use crate::ai::parse_models_cli_output;
+        let ollama = "NAME              ID            SIZE    MODIFIED\n\
+                      llama3:latest     365c0bd3c000  4.7 GB  2 days ago\n\
+                      mistral:7b        f974a74358d6  4.1 GB  3 weeks ago\n";
+        assert_eq!(parse_models_cli_output(ollama), ["llama3:latest", "mistral:7b"]);
+    }
+
+    #[test]
+    fn cli_model_listing_reads_prose_after_the_provider_label() {
+        use crate::ai::parse_models_cli_output;
+        let llm = "OpenAI Chat: gpt-4o (aliases: 4o)\n\
+                   OpenAI Chat: gpt-4o-mini\n\
+                   Anthropic Messages: claude-3-5-sonnet-latest\n";
+        assert_eq!(
+            parse_models_cli_output(llm),
+            ["gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet-latest"]
+        );
+    }
+
+    #[test]
+    fn cli_model_listing_keeps_colons_inside_names() {
+        // `llama3:latest` has a colon and no space after it — that is a name, not a
+        // provider label.
+        use crate::ai::parse_models_cli_output;
+        assert_eq!(parse_models_cli_output("llama3:latest\n"), ["llama3:latest"]);
+    }
+
+    #[test]
+    fn cli_model_listing_ignores_blank_lines_and_duplicates() {
+        use crate::ai::parse_models_cli_output;
+        assert_eq!(parse_models_cli_output("\n  a  \n\na\nb\n\n"), ["a", "b"]);
+        assert!(parse_models_cli_output("").is_empty());
+        assert!(parse_models_cli_output("NAME SIZE\n").is_empty(), "header only = nothing");
+    }
+
+    #[test]
+    fn the_model_placeholder_is_substituted_as_its_own_argument() {
+        use crate::ai::parse_command_template;
+        let (prog, args) =
+            parse_command_template("ollama run {model} {prompt}", "find users", "llama3:latest", None).unwrap();
+        assert_eq!(prog, "ollama");
+        assert_eq!(args, ["run", "llama3:latest", "find users"]);
+    }
+
+    #[test]
+    fn the_model_list_refuses_a_cleartext_key_before_any_request_leaves() {
+        // `list_ai_models` never went through `validate`, and it runs 600 ms
+        // after a key is typed — so Save was far too late to be the first check.
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        let mut p = AiProvider {
+            id: "p".into(),
+            name: "Remote".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "http://api.example.com/v1".into(),
+            api_key: "sk-secret".into(),
+            model: "m".into(),
+            command: String::new(),
+            models_command: String::new(),
+        };
+        let err = p.check_transport().unwrap_err();
+        assert!(err.contains("clear text"), "{err}");
+        p.base_url = "https://api.example.com/v1".into();
+        p.check_transport().expect("TLS is fine");
+        p.base_url = "http://localhost:11434/v1".into();
+        p.check_transport().expect("this machine is fine");
+    }
+
+    #[test]
+    fn a_redirect_to_cleartext_is_not_followed() {
+        // `check_transport` judges the URL the user typed. reqwest then followed up
+        // to ten redirects on its own, so an https endpoint answering 302 with an
+        // http location got the key sent again over that hop — and `x-api-key` is
+        // an ordinary header, so unlike `authorization` it is not stripped across
+        // origins. Automatic model loading meant no further user action was needed.
+        use crate::ai::redirect_is_safe;
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+
+        // From an https cloud endpoint: only the same host, and only over TLS.
+        let from = url("https://api.openai.com/v1/chat/completions");
+        assert!(
+            redirect_is_safe(&url("https://api.openai.com/v2/chat"), &from),
+            "same origin, different path"
+        );
+        // A different port on the same host is a different origin, and may well be
+        // a different program listening there.
+        assert!(
+            !redirect_is_safe(&url("https://api.openai.com:8443/v1"), &from),
+            "a port change must not carry the key"
+        );
+        for bad in [
+            // Another host, even over TLS: `x-api-key` is an ordinary header, so
+            // reqwest keeps it across origins and the credential would go with it.
+            "https://elsewhere.example/v1",
+            "https://api.openai.com.attacker.example/v1",
+            // A downgrade on the same host puts it on the wire in clear text.
+            "http://api.openai.com/v1",
+            "http://attacker.example/collect",
+        ] {
+            assert!(!redirect_is_safe(&url(bad), &from), "{bad} must not be followed");
+        }
+
+        // A local server is reached over http by design, and may stay there.
+        let local = url("http://localhost:11434/v1/models");
+        assert!(redirect_is_safe(&url("http://localhost:11434/api/tags"), &local));
+        // ...but not hop to whatever else is listening on this machine: Ollama on
+        // 11434 and something else on 1234 are not the same service.
+        assert!(
+            !redirect_is_safe(&url("http://localhost:1234/v1"), &local),
+            "another loopback port is another program"
+        );
+        // ...but not hop off the machine, TLS or not.
+        assert!(!redirect_is_safe(&url("https://elsewhere.example/v1"), &local));
+        assert!(!redirect_is_safe(&url("http://192.168.1.50:8000/v1"), &local));
+
+        // A plain scheme upgrade on the same host is strictly better than what was
+        // asked for: the port changes only because the scheme did.
+        let plain = url("http://llm.internal.example/v1/models");
+        assert!(redirect_is_safe(&url("https://llm.internal.example/v1/models"), &plain));
+        // An upgrade that also moves to a non-default port is not that case.
+        assert!(
+            !redirect_is_safe(&url("https://llm.internal.example:8443/v1"), &plain),
+            "an upgrade may not also change the port"
+        );
+        // Explicit ports that agree are fine.
+        let explicit = url("https://llm.internal.example:8443/v1/models");
+        assert!(redirect_is_safe(&url("https://llm.internal.example:8443/v2"), &explicit));
+    }
+
+    #[test]
+    fn both_model_list_commands_share_the_transport_checked_path() {
+        // The check was in `list_ai_models` and not `list_ai_models_for`, so a
+        // provider saved with a key and an `http://` endpoint still reached the
+        // network — automatically, on opening the panel.
+        let src = include_str!("lib.rs");
+        assert_eq!(
+            src.matches("ai::list_models_http(").count(),
+            1,
+            "only `list_models_for_provider` may issue an HTTP model list"
+        );
+        assert_eq!(
+            src.matches("ai::list_models_cli(").count(),
+            1,
+            "only `list_models_for_provider` may run a CLI model list"
+        );
+        assert_eq!(
+            src.matches("list_models_for_provider(").count(),
+            3,
+            "the definition plus both commands — a new caller must come through it"
+        );
+    }
+
+    #[test]
+    fn every_request_shares_the_one_redirect_constrained_client() {
+        // A new provider path is added by copying an existing one, and a bare
+        // `Client::new()` silently restores reqwest's follow-anything default.
+        let src = include_str!("ai.rs");
+        assert_eq!(
+            src.matches("Client::builder()").count(),
+            1,
+            "only `http_client` may build a client"
+        );
+        assert_eq!(
+            src.matches("reqwest::Client::new()").count(),
+            0,
+            "`Client::new()` restores reqwest's follow-anything redirect default"
+        );
+        assert_eq!(
+            src.matches("http_client()").count(),
+            7,
+            "six request paths plus the definition — a new one must go through it"
+        );
+    }
+
+    #[test]
+    fn only_provider_relevant_settings_changes_ask_the_panels_to_refresh() {
+        // Every successful patch used to broadcast, so changing the interface
+        // language or the theme made every open panel re-read its options — and
+        // the model-list effect that follows sends a *credentialed* request to the
+        // selected provider. An unrelated preference must not cause that.
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        let base = crate::connections::AppSettings::default();
+
+        // Unrelated preferences: no refresh.
+        let mut themed = base.clone();
+        themed.update_channel = "beta".into();
+        assert!(!crate::ai_options_changed(&base, &themed), "update channel");
+        let mut shell = base.clone();
+        shell.mongosh_path = "/usr/local/bin/mongosh".into();
+        assert!(!crate::ai_options_changed(&base, &shell), "mongosh path");
+        // A built-in key IS an AI-settings change, even though the options payload
+        // does not carry it: a picker whose first listing failed for want of a key
+        // stayed stuck on an empty list however often the key was corrected.
+        let mut anthropic = base.clone();
+        anthropic.anthropic_api_key = "sk-new".into();
+        assert!(crate::ai_options_changed(&base, &anthropic), "anthropic key");
+        let mut openai = base.clone();
+        openai.openai_api_key = "sk-new".into();
+        assert!(crate::ai_options_changed(&base, &openai), "openai key");
+        let mut gemini = base.clone();
+        gemini.gemini_api_key = "sk-new".into();
+        assert!(crate::ai_options_changed(&base, &gemini), "gemini key");
+
+        // Everything the picker actually shows: refresh.
+        let mut chosen = base.clone();
+        chosen.ai_provider = "deepseek".into();
+        assert!(crate::ai_options_changed(&base, &chosen), "default provider");
+        let mut added = base.clone();
+        added.ai_providers = vec![AiProvider {
+            id: "deepseek".into(), name: "DeepSeek".into(), kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.deepseek.com/v1".into(), api_key: "k".into(),
+            model: "deepseek-chat".into(), command: String::new(), models_command: String::new(),
+        }];
+        assert!(crate::ai_options_changed(&base, &added), "provider list");
+        let mut model = base.clone();
+        model.openai_model = "gpt-4o-mini".into();
+        assert!(crate::ai_options_changed(&base, &model), "built-in model");
+        let mut cmd = base.clone();
+        cmd.local_commands.insert("codex".into(), "codex exec {model} {prompt}".into());
+        assert!(crate::ai_options_changed(&base, &cmd), "local command");
+    }
+
+    #[tokio::test]
+    async fn a_pasted_key_is_trimmed_before_it_reaches_the_headers() {
+        // Model loading runs on the uncommitted draft, so the trim on the save
+        // path came too late: a key pasted with a trailing newline went out raw
+        // and came back 401, while the same provider worked after saving.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read until the end of the headers. TCP does not promise one read
+            // returns the whole request, so asserting on a single read would
+            // inspect a truncated request whenever it happened to split.
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break; // peer half-closed
+                }
+                received.extend_from_slice(&chunk[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let received = String::from_utf8_lossy(&received).to_string();
+            let body = br#"{"data":[{"id":"m1"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+            sock.flush().await.unwrap();
+            received
+        });
+
+        let models = crate::ai::list_models_http(
+            crate::ai_providers::ProviderKind::OpenAiCompatible,
+            &format!("http://{addr}/v1/models"),
+            "  sk-padded\n",
+            "Test provider",
+        )
+        .await
+        .expect("the stub answers");
+        assert_eq!(models, ["m1"]);
+
+        let received = served.await.unwrap();
+        assert!(
+            received.contains("Bearer sk-padded\r\n"),
+            "the key must reach the header trimmed on both ends: {received}"
+        );
+    }
+
+    #[test]
+    fn a_custom_provider_aimed_at_a_built_in_cloud_service_still_needs_a_key() {
+        // The presets are what the form offers; OpenAI, Anthropic and Gemini are
+        // reached through their own settings fields and appear in no preset — so
+        // a custom provider pointed at `https://api.openai.com/v1` slipped past
+        // the preset lookup and posted the schema and prompt unauthenticated.
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        let aimed_at = |url: &str| AiProvider {
+            id: "p".into(),
+            name: "My provider".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: url.into(),
+            api_key: String::new(),
+            model: "m".into(),
+            command: String::new(),
+            models_command: String::new(),
+        };
+        for (url, service) in [
+            ("https://api.openai.com/v1", "OpenAI"),
+            ("https://api.anthropic.com/v1", "Anthropic"),
+            ("https://generativelanguage.googleapis.com/v1beta/models", "Google Gemini"),
+        ] {
+            let err = aimed_at(url).validate().unwrap_err();
+            assert!(err.contains("needs an API key"), "{url}: {err}");
+            assert!(err.contains(service), "the reason names the service: {err}");
+            let mut with_key = aimed_at(url);
+            with_key.api_key = "sk-key".into();
+            with_key.validate().unwrap_or_else(|e| panic!("{url} with a key: {e}"));
+        }
+        // The URLs are the built-in constants, not copies, so they cannot drift.
+        assert!(crate::ai::OPENAI_URL.starts_with("https://api.openai.com/"));
+        assert!(crate::ai::ANTHROPIC_URL.starts_with("https://api.anthropic.com/"));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_endpoint_gives_up_instead_of_hanging_the_chat() {
+        // A server that accepts the connection and then says nothing at all.
+        // Bounding only `send()` would not catch this once headers had arrived,
+        // and bounding neither left the chat disabled with no way out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accepting = tokio::spawn(async move {
+            // Hold every connection open, unanswered, for as long as the test runs.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let request = reqwest::Client::new().post(format!("http://{addr}/v1/chat/completions"));
+        let err = crate::ai::send_json_within(
+            request,
+            "Stalled provider",
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .expect_err("a stalled endpoint must not be waited on forever");
+        assert!(err.contains("did not answer within"), "{err}");
+        assert!(err.contains("Stalled provider"), "{err}");
+    }
+
+    #[test]
+    fn every_request_in_ai_rs_goes_through_the_bounded_helper() {
+        // The deadline can only be verified per call site, and a new provider
+        // path is added by copying an existing one. Keeping `send()` in exactly
+        // one place is what makes "every request is bounded" checkable at all.
+        let src = include_str!("ai.rs");
+        assert_eq!(
+            src.matches(".send()").count(),
+            1,
+            "a request outside `send_json_within` would have no deadline; route it through the helper"
+        );
+    }
+
+    #[test]
+    fn a_quoted_path_survives_command_parsing() {
+        // `split_whitespace` kept the quotes and split the path, so Python got
+        // two malformed arguments and listing failed for a valid setup.
+        use crate::ai::split_command_line;
+        assert_eq!(
+            split_command_line(r#"python3 "/Users/me/My Scripts/models.py" --json"#).unwrap(),
+            ["python3", "/Users/me/My Scripts/models.py", "--json"]
+        );
+        assert_eq!(
+            split_command_line("llm 'my model' --n 5").unwrap(),
+            ["llm", "my model", "--n", "5"]
+        );
+        // An escaped space needs no quotes, and a backslash is literal inside
+        // single quotes, as in a shell. Off Windows: see the Windows test below.
+        assert_eq!(
+            crate::ai::split_command_line_for(r"cmd /My\ Path/x", false).unwrap(),
+            ["cmd", "/My Path/x"]
+        );
+        assert_eq!(
+            split_command_line(r"cmd 'a\b'").unwrap(),
+            ["cmd", r"a\b"],
+        );
+        // An empty quoted argument is a real argument.
+        assert_eq!(split_command_line(r#"cmd "" x"#).unwrap(), ["cmd", "", "x"]);
+    }
+
+    #[test]
+    fn an_unclosed_quote_or_dangling_backslash_is_refused_rather_than_guessed() {
+        use crate::ai::split_command_line;
+        let err = split_command_line("python3 \"/My Scripts/x.py").unwrap_err();
+        assert!(err.contains("unclosed"), "{err}");
+        // A trailing backslash escapes nothing; guessing what was meant would be
+        // worse than saying so. Off Windows, where a backslash is an escape.
+        let err = crate::ai::split_command_line_for("cmd x\\", false).unwrap_err();
+        assert!(err.contains("dangling"), "{err}");
+        // An escaped backslash is a literal one.
+        assert_eq!(
+            crate::ai::split_command_line_for("cmd x\\\\", false).unwrap(),
+            ["cmd", "x\\"]
+        );
+    }
+
+    #[test]
+    fn a_windows_path_keeps_its_separators_instead_of_being_eaten_as_escapes() {
+        // `C:\tools\ollama.exe list` was reaching the OS as the program
+        // `C:toolsollama.exe`: every unquoted backslash consumed the character
+        // after it, so an ordinary Windows command could not run at all.
+        use crate::ai::split_command_line_for;
+        assert_eq!(
+            split_command_line_for(r"C:\tools\ollama.exe list", true).unwrap(),
+            [r"C:\tools\ollama.exe", "list"]
+        );
+        // Quotes still group, which is what a path with spaces needs...
+        assert_eq!(
+            split_command_line_for(r#""C:\Program Files\Ollama\ollama.exe" list"#, true).unwrap(),
+            [r"C:\Program Files\Ollama\ollama.exe", "list"]
+        );
+        // ...and a trailing separator before the closing quote stays a separator
+        // rather than escaping the quote and swallowing the rest of the line.
+        assert_eq!(
+            split_command_line_for(r#""C:\Program Files\Ollama\" list"#, true).unwrap(),
+            [r"C:\Program Files\Ollama\", "list"]
+        );
+        // A lone trailing backslash is a path separator here, not a dangling
+        // escape, so there is nothing to refuse.
+        assert_eq!(split_command_line_for(r"cmd x\", true).unwrap(), ["cmd", r"x\"]);
+    }
+
+    #[test]
+    fn nothing_is_expanded_the_way_a_shell_would() {
+        // The command is executed directly, never through a shell, so these must
+        // arrive verbatim rather than being interpreted.
+        use crate::ai::split_command_line;
+        assert_eq!(
+            split_command_line("cmd $HOME *.py ~/x `id`").unwrap(),
+            ["cmd", "$HOME", "*.py", "~/x", "`id`"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_template_keeps_its_argument_whole() {
+        use crate::ai::parse_command_template;
+        let (prog, args) =
+            parse_command_template(r#""/opt/My Agents/run" --prompt={prompt}"#, "find users", "", None).unwrap();
+        assert_eq!(prog, "/opt/My Agents/run");
+        assert_eq!(args, ["--prompt=find users"]);
+    }
+
+    #[test]
+    fn placeholders_are_substituted_inside_a_token_too() {
+        // `agent --prompt={prompt}` passed validation but the old parser only
+        // matched a whole-token `{prompt}`, so the CLI got the literal text plus
+        // the prompt appended as an extra argument.
+        use crate::ai::parse_command_template;
+        let (prog, args) =
+            parse_command_template("agent --model={model} --prompt={prompt}", "find users", "m1", None).unwrap();
+        assert_eq!(prog, "agent");
+        assert_eq!(args, ["--model=m1", "--prompt=find users"]);
+    }
+
+    #[test]
+    fn the_model_placeholder_without_a_model_is_an_error_not_an_empty_argument() {
+        use crate::ai::parse_command_template;
+        // An empty argument would make the CLI run its default model silently,
+        // which is not what the user configured.
+        let err = parse_command_template("ollama run {model} {prompt}", "p", "", None).unwrap_err();
+        assert!(err.contains("{model}"), "{err}");
+    }
+
+    #[test]
+    fn templates_without_the_model_placeholder_are_unchanged() {
+        use crate::ai::parse_command_template;
+        let (prog, args) = parse_command_template("claude -p {prompt}", "find users", "ignored", None).unwrap();
+        assert_eq!(prog, "claude");
+        assert_eq!(args, ["-p", "find users"]);
+    }
+
+    #[test]
+    fn settings_writes_go_through_the_durable_helper() {
+        // Interrupting a write mid-call is not reproducible in-process, so the
+        // guard is at the source level — and this is the claim that was wrong
+        // once: the atomic call had been applied to the *profiles* writer while
+        // the settings writer, which every patch touches, still truncated in
+        // place. A behavioural test could not see the difference, which is why
+        // the first version of it passed.
+        let src = include_str!("connections.rs");
+        for writer in [
+            "pub fn save_settings_encrypted",
+            "pub fn save_profiles_encrypted",
+            "pub fn write_vault_meta",
+        ] {
+            let start = src.find(writer).unwrap_or_else(|| panic!("{writer} not found"));
+            let body = &src[start..start + src[start..].find("\n}").unwrap()];
+            assert!(
+                body.contains("durable::write_atomic"),
+                "{writer} must write atomically; found a bare write"
+            );
+            assert!(!body.contains("fs::write("), "{writer} still calls fs::write directly");
+        }
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_encrypted_file() {
+        use crate::connections::{load_settings_encrypted, save_settings_encrypted, AppSettings};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.enc");
+        let key = [3u8; 32];
+        let mut st = AppSettings::default();
+        st.ai_provider = "deepseek".into();
+        save_settings_encrypted(&path, &key, &st).unwrap();
+        assert!(!dir.path().join("settings.enc.tmp").exists(), "temp file left behind");
+        assert_eq!(load_settings_encrypted(&path, &key).unwrap().ai_provider, "deepseek");
+    }
+
+    #[test]
+    fn a_settings_patch_replaces_only_its_own_fields() {
+        use crate::connections::{merge_settings_patch, AppSettings};
+        let mut current = AppSettings::default();
+        current.locale = "de".into();
+        current.mongosh_path = "/opt/mongosh".into();
+        let patch = serde_json::json!({ "ai_provider": "deepseek", "ai_providers": [] });
+        let merged = merge_settings_patch(&current, &patch).unwrap();
+        assert_eq!(merged.ai_provider, "deepseek");
+        assert_eq!(merged.locale, "de", "untouched field survives");
+        assert_eq!(merged.mongosh_path, "/opt/mongosh");
+    }
+
+    #[test]
+    fn a_settings_patch_rejects_unknown_fields_and_bad_values() {
+        use crate::connections::{merge_settings_patch, AppSettings};
+        let current = AppSettings::default();
+        let err = merge_settings_patch(&current, &serde_json::json!({ "ai_provdier": "x" })).unwrap_err();
+        assert!(err.contains("unknown settings field `ai_provdier`"), "{err}");
+        let err = merge_settings_patch(&current, &serde_json::json!({ "audit_retention_days": "thirty" })).unwrap_err();
+        assert!(err.contains("invalid settings patch"), "{err}");
+        assert!(merge_settings_patch(&current, &serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn the_prompt_text_is_never_scanned_for_placeholders() {
+        use crate::ai::parse_command_template;
+        // The prompt is user content and may say "{model}" literally.
+        let (_, args) = parse_command_template("agent --model={model} {prompt}", r#"find "{model}""#, "m1", None).unwrap();
+        assert_eq!(args, ["--model=m1", r#"find "{model}""#]);
+        // …and a prompt containing "{prompt}" is not re-expanded either.
+        let (_, args) = parse_command_template("agent {prompt}", "say {prompt}", "", None).unwrap();
+        assert_eq!(args, ["say {prompt}"]);
+    }
+
+    // ── AiReply: thoughts, notes, images ─────────────────────────────────
+
+    #[test]
+    fn split_keeps_the_prose_around_the_json_as_notes() {
+        use crate::ai::split_json_object;
+        let text = "Looking at the fields, `age` is numeric so a range filter works.\n\
+                    {\"queryType\":\"find\",\"filter\":{\"age\":{\"$gt\":30}},\"sort\":{},\"pipeline\":[]}\n\
+                    That should be indexed.";
+        let (json, notes) = split_json_object(text).unwrap();
+        assert!(json.starts_with("{\"queryType\""), "{json}");
+        let notes = notes.expect("prose is kept");
+        assert!(notes.contains("range filter"), "{notes}");
+        assert!(notes.contains("should be indexed"), "{notes}");
+        assert!(!notes.contains("queryType"), "the JSON itself is not part of the notes: {notes}");
+    }
+
+    #[test]
+    fn split_takes_the_last_parsing_object_so_braces_in_notes_do_not_mislead() {
+        // Notes about a query naturally contain braces. `{ age: {$gt: 30} }` is
+        // not valid JSON (bare keys) and must not be mistaken for the answer.
+        use crate::ai::split_json_object;
+        let text = "I'll filter with { age: {$gt: 30} } and sort by name.\n\
+                    {\"queryType\":\"find\",\"filter\":{\"age\":{\"$gt\":30}},\"sort\":{\"name\":1}}";
+        let (json, notes) = split_json_object(text).unwrap();
+        assert!(json.contains("\"name\":1"), "picked the real answer: {json}");
+        assert!(notes.unwrap().contains("sort by name"));
+    }
+
+    #[test]
+    fn split_prefers_the_final_object_when_two_valid_ones_appear() {
+        // A model that "shows its work" with a draft object then a corrected one
+        // means the last one. The prompt asks for exactly that.
+        use crate::ai::split_json_object;
+        let text = "Draft: {\"a\":1}\nFinal:\n{\"a\":2}";
+        let (json, _) = split_json_object(text).unwrap();
+        assert_eq!(json, "{\"a\":2}");
+    }
+
+    #[test]
+    fn split_strips_fences_from_notes_and_reports_no_notes_when_there_are_none() {
+        use crate::ai::split_json_object;
+        let (json, notes) = split_json_object("```json\n{\"a\":1}\n```").unwrap();
+        assert_eq!(json, "{\"a\":1}");
+        assert!(notes.is_none(), "fences alone are not notes: {notes:?}");
+        let (_, notes) = split_json_object("{\"a\":1}").unwrap();
+        assert!(notes.is_none());
+    }
+
+    #[test]
+    fn split_never_returns_a_fragment_of_a_malformed_answer() {
+        // A trailing comma makes the outer object invalid. The old scan stepped
+        // inside and returned the nested `{}` — which the panel read as "find
+        // everything". A broken answer has to surface as an error.
+        use crate::ai::split_json_object;
+        let bad = r#"{"queryType":"find","filter":{"age":{"$gt":30}},"sort":{},}"#;
+        let err = split_json_object(bad).unwrap_err();
+        assert!(err.contains("no valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn split_refuses_a_truncated_answer_instead_of_returning_a_nested_part_of_it() {
+        // An answer cut off before its last brace never closes, so everything in
+        // it is nested inside an object with no end. Stepping past the opening
+        // brace and scanning inside handed back the nested filter as the whole
+        // reply, which the panel ran as a query of its own.
+        use crate::ai::split_json_object;
+        let err = split_json_object(r#"{"queryType":"find","filter":{"tenant":"acme"}"#)
+            .unwrap_err();
+        assert!(err.contains("unterminated"), "{err}");
+
+        // A brace in prose has no quoted key, so it is still just stepped over:
+        // covered by `split_survives_a_stray_brace_in_prose_before_the_answer`.
+
+        // The cost of the rule, pinned deliberately rather than left to be
+        // discovered: a note containing a *JSON-shaped* truncated brace before the
+        // real answer fails the whole reply. Everything after an unterminated `{`
+        // is nested inside it, so the answer cannot be told apart from a fragment
+        // of a cut-off one — and refusing is the safe half of that ambiguity,
+        // since the alternative silently runs a query the user never asked for.
+        let err = split_json_object(
+            "The filter is {\"tenant\": \"acme\"\n{\"queryType\":\"find\",\"filter\":{}}",
+        )
+        .unwrap_err();
+        assert!(err.contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn split_refuses_a_malformed_final_object_rather_than_returning_note_json() {
+        // The model wrote a note containing a valid object, then its intended
+        // answer with a trailing comma. Skipping the broken answer and returning
+        // the note leaves the panel with a filter the user never asked for, and
+        // one that looks entirely valid — so the reply has to be refused.
+        use crate::ai::split_json_object;
+        let text = "Using {\"status\":\"active\"} as a starting point.\n\
+                    {\"queryType\":\"find\",\"filter\":{\"status\":\"active\"},}";
+        let err = split_json_object(text).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn split_survives_a_stray_brace_in_prose_before_the_answer() {
+        use crate::ai::split_json_object;
+        let (json, notes) = split_json_object("use { for grouping\n{\"a\":1}").unwrap();
+        assert_eq!(json, "{\"a\":1}");
+        assert!(notes.unwrap().contains("grouping"));
+    }
+
+    #[test]
+    fn split_distinguishes_no_json_from_invalid_json() {
+        use crate::ai::split_json_object;
+        assert!(split_json_object("no braces here").unwrap_err().contains("no JSON object"));
+        assert!(split_json_object("only { bare: keys }").unwrap_err().contains("no valid JSON"));
+    }
+
+    #[test]
+    fn the_prompts_now_allow_notes_but_still_demand_one_final_object() {
+        use crate::ai::{mql_shell_system_prompt, mql_system_prompt};
+        for p in [mql_system_prompt("c", &[]), mql_shell_system_prompt("c", &[])] {
+            assert!(p.contains("working notes"), "{p}");
+            assert!(p.contains("exactly one JSON object"), "{p}");
+            assert!(!p.contains("Output only that JSON"), "old rule must be gone: {p}");
+        }
+    }
+
+    fn png(data: &str) -> crate::ai::ImageAttachment {
+        crate::ai::ImageAttachment { media_type: "image/png".into(), data: data.into() }
+    }
+
+    #[test]
+    fn the_dispatch_distinguishes_all_three_reaches() {
+        // `mcp_availability_note` is tested on its own, and passed while the call
+        // site collapsed "no config injected" back into "server off" — the same
+        // shape of gap as the credentials wiring. Computing the reach needs a live
+        // AppHandle, so this pins the call site.
+        let src = include_str!("lib.rs");
+        let call = src.find("ai::mcp_availability_note(").expect("the note's call site");
+        let arm = src[..call].rfind("LocalCli =>").expect("its match arm");
+        let dispatch = &src[arm..call];
+        for state in ["McpReach::Off", "McpReach::Injected", "McpReach::Unknown"] {
+            assert!(dispatch.contains(state), "the dispatch must distinguish {state}");
+        }
+        // Injected is the only one that may be concluded from the command text.
+        assert!(
+            dispatch.contains("contains(\"{mcp_config}\")"),
+            "injection is decided by the command carrying the placeholder"
+        );
+    }
+
+    #[test]
+    fn the_agents_endpoint_is_wired_to_the_helper_credentials() {
+        // `helper_access` and `mcp_config_json` are each tested on their own, and
+        // both passed while `lib.rs` still handed over the *external* token — the
+        // wiring between them was the untested part, and it is the part that was
+        // vulnerable. Exercising it properly needs a live `AppHandle`, so this
+        // pins the call site instead.
+        let src = include_str!("lib.rs");
+        // Anchored on the call itself: `ProviderKind::LocalCli` also appears in
+        // the model-listing helper, and matching that one proves nothing.
+        let call = src.find("ai::generate_local(").expect("the local-agent dispatch");
+        // From the arm that precedes the call to the call itself — a fixed window
+        // of characters was not enough, and `ProviderKind::LocalCli` also appears
+        // in the model-listing helper, so matching the first one proves nothing.
+        let arm = src[..call].rfind("LocalCli =>").expect("its match arm");
+        let dispatch = &src[arm..call];
+        assert!(
+            dispatch.contains("mcp::helper_access("),
+            "the agent's endpoint must come from helper_access"
+        );
+        assert!(
+            dispatch.contains("mcp::helper_path()"),
+            "and its path from helper_path"
+        );
+        // The external token reaches the frontend for display; it must never be
+        // what the agent is handed.
+        assert!(
+            !dispatch.contains("get_status_impl"),
+            "the agent must not be given the external token"
+        );
+    }
+
+    #[test]
+    fn the_mcp_config_is_the_shape_the_agent_expects() {
+        // Not inferred: this is what `claude mcp add --transport http` writes
+        // itself. A config an agent cannot parse fails by silently having no
+        // tools, which looks exactly like the problem it is meant to solve.
+        use crate::ai::{mcp_config_json, McpEndpoint};
+        let json: serde_json::Value = serde_json::from_str(&mcp_config_json(&McpEndpoint {
+            port: 8765,
+            token: "helper-tok".into(),
+            path: crate::mcp::helper_path().to_string(),
+        }))
+        .unwrap();
+        let server = &json["mcpServers"]["mqlens"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["headers"]["Authorization"], "Bearer helper-tok");
+        // Loopback, always: the token is the whole of the server's authentication.
+        let url = server["url"].as_str().unwrap();
+        assert!(url.starts_with("http://127.0.0.1:8765"), "{url}");
+        // The helper route, never the one external clients use — that separation
+        // is what puts the agent's writes in front of the user.
+        assert!(url.ends_with("/helper/mcp"), "{url}");
+        assert_ne!(url, "http://127.0.0.1:8765/mcp");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_mcp_config_file_is_private_and_does_not_outlive_the_run() {
+        // It holds the bearer token, so it is created 0600 before a byte is
+        // written and removed however the run ends.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("agent");
+        // The stub prints the file's mode to STDOUT, where the reply can see it.
+        // An earlier version sent it to stderr, which `generate_local` discards on
+        // success — so the test claimed to check 0600 and checked nothing.
+        // `stat` differs between macOS and Linux, and the ORDER matters: GNU's
+        // `-f` means "filesystem status" and *succeeds*, printing filesystem info,
+        // so trying it first never falls through on Linux. macOS rejects `-c`
+        // outright, so asking for the GNU spelling first fails cleanly there.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nCFG=\"$1\"\n\
+             echo \"mode=$(stat -c %a \"$CFG\" 2>/dev/null || stat -f %Lp \"$CFG\")\"\n\
+             cat \"$CFG\"\necho '{\"queryType\":\"find\",\"filter\":{}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let endpoint = crate::ai::McpEndpoint {
+            port: 8765,
+            token: "tok-abc".into(),
+            path: crate::mcp::helper_path().to_string(),
+        };
+        let reply = crate::ai::generate_local(
+            &format!("{} {{mcp_config}} {{prompt}}", stub.to_string_lossy()),
+            "anything",
+            "",
+            Some(&endpoint),
+        )
+        .await
+        .expect("the stub answers");
+        let notes = reply.notes.as_deref().unwrap_or("").to_string();
+        // The agent really received the config: it echoed it back...
+        assert!(notes.contains("mqlens"), "{notes}");
+        assert!(notes.contains("Bearer tok-abc"), "the token reaches the agent: {notes}");
+        // ...and it was readable by nobody else.
+        assert!(notes.contains("mode=600"), "config must be 0600: {notes}");
+
+        // Nothing of ours is left afterwards. The prefix is distinctive on purpose:
+        // an earlier draft used `mqlens-mcp-` and matched another test's directory.
+        let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("mqlens-agent-mcp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "config file left behind: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_command_wanting_mcp_says_so_when_the_server_is_off() {
+        // Silently running without the tools is how an agent ends up guessing at
+        // values it never sampled.
+        let err = crate::ai::generate_local("some-agent {mcp_config} {prompt}", "hi", "", None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("switched off"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_is_told_whether_mqlens_tools_are_reachable() {
+        use crate::ai::mcp_availability_note;
+        let on = mcp_availability_note(crate::ai::McpReach::Injected, Some("prod"), Some("conn-7"), Some("shop"), "orders");
+        assert!(on.contains("schema_analysis"), "{on}");
+        assert!(on.contains("not observed data") || on.contains("observed"), "{on}");
+        let off = mcp_availability_note(crate::ai::McpReach::Off, Some("prod"), Some("conn-7"), Some("shop"), "orders");
+        assert!(off.contains("switched off"), "{off}");
+        // ...and told to say what it could not check, rather than implying it did.
+        assert!(off.contains("could not verify"), "{off}");
+
+        // The third state, which is the honest one when the server is up but this
+        // command was handed no config: the user may have configured the agent
+        // globally via `claude mcp add`, and claiming the server is off would talk
+        // it out of an inspection it can actually do.
+        let unknown = mcp_availability_note(
+            crate::ai::McpReach::Unknown,
+            Some("prod"),
+            Some("conn-7"),
+            Some("shop"),
+            "orders",
+        );
+        assert!(unknown.contains("may be available"), "{unknown}");
+        assert!(!unknown.contains("switched off"), "must not claim it is off: {unknown}");
+        // Still told to report what it could not check, either way.
+        assert!(unknown.contains("could not verify"), "{unknown}");
+        // ...and only the genuinely-off case says so.
+        assert!(off.contains("switched off"), "{off}");
+        assert!(!on.contains("switched off"), "{on}");
+
+        // Both name the namespace outright: told to inspect but not *where*, an
+        // agent picks one itself, and two connections can hold `shop.orders`.
+        for note in [&on, &off] {
+            assert!(note.contains("`shop.orders`"), "{note}");
+            assert!(note.contains("`prod`"), "{note}");
+            // The id as well as the name: two profiles can share a display name,
+            // and the tools take an id, so this is the value the agent can use.
+            assert!(note.contains("`conn-7`"), "{note}");
+        }
+        // Without a connection name it still says which collection is meant.
+        let partial = mcp_availability_note(crate::ai::McpReach::Injected, None, Some("conn-7"), Some("shop"), "orders");
+        assert!(partial.contains("`shop.orders`"), "{partial}");
+        // And says nothing misleading when the tab has no database yet.
+        let bare = mcp_availability_note(crate::ai::McpReach::Injected, None, None, None, "orders");
+        assert!(!bare.contains("Use exactly that namespace"), "{bare}");
+    }
+
+    #[test]
+    fn an_agents_event_stream_yields_its_answer_and_what_it_ran() {
+        // The fixture is a real `claude -p --output-format stream-json` run,
+        // captured rather than hand-written: a parser tested only against output
+        // invented to match it proves nothing about the format it will meet.
+        use crate::ai::parse_agent_events;
+        let run = parse_agent_events(include_str!("../tests/fixtures/claude_stream_json.jsonl"))
+            .expect("a stream of events is recognised as one");
+
+        // The agent's own summary of the turn is the answer.
+        assert_eq!(run.text, "6");
+
+        assert_eq!(run.tool_calls.len(), 1, "{:?}", run.tool_calls);
+        let call = &run.tool_calls[0];
+        assert_eq!(call.name, "Bash");
+        assert!(
+            call.input.as_deref().unwrap_or("").contains("ls -A"),
+            "{:?}",
+            call.input
+        );
+        // The result is matched back to the call it belongs to by `tool_use_id`.
+        assert!(
+            call.output.as_deref().unwrap_or("").contains('6'),
+            "{:?}",
+            call.output
+        );
+        assert!(!call.failed);
+    }
+
+    #[test]
+    fn the_chat_store_cannot_hold_what_a_tool_returned() {
+        // An agent told to sample the collection runs `find`, and the result holds
+        // real documents. `chats.json` is plain JSON on disk, so the stored shape
+        // has nowhere to put them — the same rule attachments follow.
+        let from_panel = serde_json::json!({
+            "id": "m1", "role": "assistant", "text": "ok",
+            "toolCalls": [{
+                "name": "find",
+                "input": "{\"filter\":{\"email\":\"real.person@example.com\"}}",
+                "output": "[{\"_id\":1,\"email\":\"real.person@example.com\",\"ssn\":\"123-45-6789\"}]",
+                "failed": false
+            }]
+        });
+        let msg: crate::chats::ChatMessage = serde_json::from_value(from_panel).unwrap();
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].name, "find");
+
+        let on_disk = serde_json::to_string(&msg).unwrap();
+        assert!(on_disk.contains("find"), "the call itself is still recorded");
+        for leaked in ["real.person@example.com", "123-45-6789", "ssn", "filter"] {
+            assert!(!on_disk.contains(leaked), "{leaked} must not reach the store: {on_disk}");
+        }
+    }
+
+    #[test]
+    fn a_long_agent_run_is_bounded_in_what_it_keeps() {
+        // A transcript entry, not a log: an agent that ran hundreds of tools, or
+        // one whose tool returned a whole file, must not put either in the panel.
+        use crate::ai::parse_agent_events;
+        let mut stream = String::new();
+        for i in 0..60 {
+            stream.push_str(&format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t{i}","name":"Bash","input":{{"n":{i}}}}}]}}}}"#
+            ));
+            stream.push('\n');
+            // A result far larger than anything worth showing.
+            stream.push_str(&format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t{i}","content":"{}"}}]}}}}"#,
+                "x".repeat(9000)
+            ));
+            stream.push('\n');
+        }
+        let run = parse_agent_events(&stream).expect("a stream");
+        assert_eq!(run.tool_calls.len(), 50, "kept calls are capped");
+        let out = run.tool_calls[0].output.as_deref().unwrap();
+        assert!(out.chars().count() <= 2_001, "output clipped: {} chars", out.chars().count());
+        assert!(out.ends_with('…'), "clipping is visible rather than silent");
+    }
+
+    #[test]
+    fn ordinary_agent_output_is_left_as_text() {
+        // A custom command emits whatever it emits, and today that is prose with
+        // a JSON object in it. Treating that as an event stream would break every
+        // setup that works now.
+        use crate::ai::parse_agent_events;
+        assert!(parse_agent_events("Looking at the fields...\n{\"queryType\":\"find\"}").is_none());
+        assert!(parse_agent_events("").is_none());
+        // A single JSON line is an answer, not a stream.
+        assert!(parse_agent_events("{\"type\":\"find\",\"filter\":{}}").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_agent_reporting_events_has_its_tool_calls_carried_through() {
+        // End to end through the subprocess path: the fixture test above pins the
+        // *format*, this pins that `generate_local` actually routes through it.
+        // The captured run answered "6", which is not a query object, so the stub
+        // emits the same verified shapes with a JSON answer instead.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("agent");
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"schema_analysis","input":{"collection":"orders"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"state: DONE | PENDING"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"{\"queryType\":\"find\",\"filter\":{\"state\":\"DONE\"}}"}"#,
+            "\n",
+        );
+        std::fs::write(&stub, format!("#!/bin/sh\ncat <<'EOF'\n{stream}EOF\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let reply = crate::ai::generate_local(
+            &format!("{} {{prompt}}", stub.to_string_lossy()),
+            "which orders are done",
+            "",
+            None,
+        )
+        .await
+        .expect("the stub answers");
+
+        assert!(
+            reply.query.contains("\"state\":\"DONE\""),
+            "{}",
+            reply.query
+        );
+        assert_eq!(reply.tool_calls.len(), 1, "{:?}", reply.tool_calls);
+        assert_eq!(reply.tool_calls[0].name, "schema_analysis");
+        assert!(reply.tool_calls[0]
+            .output
+            .as_deref()
+            .unwrap_or("")
+            .contains("DONE"));
+        // The events are not left in `notes` as prose once they are understood.
+        assert!(
+            reply.notes.as_deref().unwrap_or("").is_empty(),
+            "events should not also arrive as prose: {:?}",
+            reply.notes
+        );
+    }
+
+    #[test]
+    fn images_are_validated_before_any_request() {
+        use crate::ai::{validate_images, ImageAttachment, MAX_IMAGES};
+        validate_images(&[]).unwrap();
+        validate_images(&[png("aGVsbG8=")]).unwrap();
+        let too_many: Vec<_> = (0..=MAX_IMAGES).map(|_| png("aGVsbG8=")).collect();
+        assert!(validate_images(&too_many).unwrap_err().contains("At most"));
+        let bad_type = ImageAttachment { media_type: "image/tiff".into(), data: "x".into() };
+        assert!(validate_images(&[bad_type]).unwrap_err().contains("image/tiff"));
+        assert!(validate_images(&[png("   ")]).unwrap_err().contains("no data"));
+        // Not just measured — decoded. A truncated or corrupted payload used to
+        // reach the provider and come back as an opaque transport error, which is
+        // exactly what this function exists to prevent.
+        for broken in ["not base64!!", "aGVsbG8", "####"] {
+            let err = validate_images(&[png(broken)]).unwrap_err();
+            assert!(err.contains("could not be read"), "{broken}: {err}");
+        }
+        // ~6 MB decoded, over the 5 MB cap.
+        let huge = "A".repeat(8 * 1024 * 1024);
+        assert!(validate_images(&[png(&huge)]).unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn a_user_turn_stays_plain_text_until_an_image_is_attached() {
+        use crate::ai::{anthropic_user_content, gemini_user_parts, openai_user_content};
+        assert_eq!(openai_user_content("hi", &[]), serde_json::json!("hi"));
+        assert_eq!(anthropic_user_content("hi", &[]), serde_json::json!("hi"));
+        assert_eq!(gemini_user_parts("hi", &[]), vec![serde_json::json!({"text":"hi"})]);
+    }
+
+    #[test]
+    fn each_wire_format_carries_the_image_its_own_way() {
+        use crate::ai::{anthropic_user_content, gemini_user_parts, openai_user_content};
+        let img = [png("QUJD")];
+
+        let o = openai_user_content("what is this", &img);
+        assert_eq!(o[0]["type"], "text");
+        assert_eq!(o[1]["type"], "image_url");
+        assert_eq!(o[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+
+        let a = anthropic_user_content("what is this", &img);
+        assert_eq!(a[0]["type"], "image", "Anthropic puts the image first");
+        assert_eq!(a[0]["source"]["media_type"], "image/png");
+        assert_eq!(a[0]["source"]["data"], "QUJD");
+        assert_eq!(a[1]["type"], "text");
+
+        let g = gemini_user_parts("what is this", &img);
+        assert_eq!(g[0]["inline_data"]["mime_type"], "image/png");
+        assert_eq!(g[1]["text"], "what is this");
+    }
+
+    #[test]
+    fn images_ride_in_the_last_user_message_only() {
+        use crate::ai::{build_openai_request, ChatTurn};
+        let history = vec![ChatTurn { role: "user".into(), content: "earlier".into() }];
+        let req = build_openai_request("m", "sys", &history, "now", &[png("QUJD")]);
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["content"], "earlier", "history turns stay text");
+        assert!(msgs[2]["content"].is_array(), "the new turn carries the image");
+    }
+
+    #[test]
+    fn reasoning_is_read_from_each_format_and_absent_when_not_emitted() {
+        use crate::ai::{extract_anthropic_thinking, extract_gemini_thoughts, extract_openai_reasoning};
+        let ds = serde_json::json!({"choices":[{"message":{"content":"{}","reasoning_content":" thinking… "}}]});
+        assert_eq!(extract_openai_reasoning(&ds).as_deref(), Some("thinking…"));
+        let relay = serde_json::json!({"choices":[{"message":{"content":"{}","reasoning":"via gateway"}}]});
+        assert_eq!(extract_openai_reasoning(&relay).as_deref(), Some("via gateway"));
+        let plain = serde_json::json!({"choices":[{"message":{"content":"{}"}}]});
+        assert!(extract_openai_reasoning(&plain).is_none());
+
+        let a = serde_json::json!({"content":[
+            {"type":"thinking","thinking":"step one"},
+            {"type":"thinking","thinking":"step two"},
+            {"type":"text","text":"{}"}]});
+        assert_eq!(extract_anthropic_thinking(&a).as_deref(), Some("step one\nstep two"));
+        assert!(extract_anthropic_thinking(&serde_json::json!({"content":[{"type":"text","text":"{}"}]})).is_none());
+
+        let g = serde_json::json!({"candidates":[{"content":{"parts":[
+            {"text":"hmm","thought":true},{"text":"{}"}]}}]});
+        assert_eq!(extract_gemini_thoughts(&g).as_deref(), Some("hmm"));
+        assert!(extract_gemini_thoughts(&serde_json::json!({"candidates":[{"content":{"parts":[{"text":"{}"}]}}]})).is_none());
+    }
+
+    #[test]
+    fn gemini_reasoning_is_not_also_returned_as_notes() {
+        // Both readers walk the same parts array; without filtering, a thought
+        // part landed in the answer text too and the panel printed it twice.
+        use crate::ai::{extract_gemini_text, extract_gemini_thoughts};
+        let resp = serde_json::json!({"candidates":[{"content":{"parts":[
+            {"text":"weighing an index scan","thought":true},
+            {"text":"{\"queryType\":\"find\",\"filter\":{}}"}]}}]});
+        assert_eq!(extract_gemini_thoughts(&resp).as_deref(), Some("weighing an index scan"));
+        let answer = extract_gemini_text(&resp);
+        assert!(!answer.contains("weighing"), "reasoning leaked into the answer: {answer}");
+        let (json, notes) = crate::ai::split_json_object(&answer).unwrap();
+        assert_eq!(json, "{\"queryType\":\"find\",\"filter\":{}}");
+        assert!(notes.is_none(), "notes should be empty, got {notes:?}");
+    }
+
+    #[test]
+    fn a_reply_omits_what_it_does_not_have() {
+        // The frontend treats a missing key and null the same, but the JSON the
+        // panel stores should not carry `"thoughts": null` for every message.
+        let r = crate::ai::AiReply { query: "{}".into(), thoughts: None, notes: None, tool_calls: Vec::new() };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"query":"{}"}"#);
+        let r = crate::ai::AiReply { query: "{}".into(), thoughts: Some("t".into()), notes: None, tool_calls: Vec::new() };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"query":"{}","thoughts":"t"}"#);
+    }
+
+    #[test]
+    fn chat_records_round_trip_without_the_new_fields() {
+        // Chats saved before this change have neither field; they must load.
+        let old = r#"{"id":"m1","role":"user","text":"hi"}"#;
+        let m: crate::chats::ChatMessage = serde_json::from_str(old).unwrap();
+        assert!(m.thoughts.is_none() && m.attachments.is_none());
+        let with = crate::chats::ChatMessage {
+            thoughts: Some("why".into()),
+            attachments: Some(vec![crate::chats::AttachmentMeta { media_type: "image/png".into(), bytes: 1234 }]),
+            ..m.clone()
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""mediaType":"image/png""#), "{json}");
+        assert!(!json.contains("data"), "no image bytes are ever stored: {json}");
+    }
+
+    /// Resolution has to keep working for the settings already in people's
+    /// vaults: the three original providers store their keys in dedicated fields,
+    /// not in the new list, and a stored `ai_provider` must keep selecting them.
+    #[test]
+    fn resolve_ai_provider_keeps_the_built_ins_working() {
+        use crate::ai_providers::ProviderKind;
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "openai".into();
+        // A fresh install has no key; the old adapter refused before any request
+        // and the resolver must too, or the schema and prompt go to the cloud
+        // unauthenticated.
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("No OpenAI API key"), "{err}");
+        settings.ai_provider = "anthropic".into();
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("No Anthropic API key"), "{err}");
+        settings.anthropic_api_key = test_secret(&["sk-", "ant"]);
+        settings.ai_provider = "openai".into();
+        settings.openai_api_key = test_secret(&["sk-", "test"]);
+        let p = resolve_ai_provider(&settings).expect("openai resolves");
+        assert_eq!(p.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(p.endpoint().unwrap(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(p.api_key, settings.openai_api_key);
+        assert_eq!(p.model, "gpt-4o", "an empty stored model falls back");
+
+        settings.ai_provider = "anthropic".into();
+        settings.anthropic_model = "claude-3-5-sonnet".into();
+        let p = resolve_ai_provider(&settings).expect("anthropic resolves with a key");
+        assert_eq!(p.kind, ProviderKind::AnthropicCompatible);
+        assert_eq!(p.endpoint().unwrap(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(p.model, "claude-3-5-sonnet", "a stored model is respected");
+    }
+
+    #[test]
+    fn resolve_ai_provider_keeps_the_built_in_local_agents_working() {
+        use crate::ai_providers::ProviderKind;
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "claude-code".into();
+        let p = resolve_ai_provider(&settings).expect("claude-code resolves");
+        assert_eq!(p.kind, ProviderKind::LocalCli);
+        assert_eq!(p.command, "claude -p {prompt}", "the built-in default template");
+
+        settings
+            .local_commands
+            .insert("claude-code".into(), "claude --model opus -p {prompt}".into());
+        let p = resolve_ai_provider(&settings).expect("resolves");
+        assert_eq!(p.command, "claude --model opus -p {prompt}", "user override wins");
+    }
+
+    #[test]
+    fn resolve_ai_provider_finds_a_user_added_provider() {
+        use crate::ai_providers::{AiProvider, ProviderKind};
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_providers.push(AiProvider {
+            id: "my-deepseek".into(),
+            name: "DeepSeek".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.deepseek.com/v1".into(),
+            api_key: test_secret(&["ds-", "key"]),
+            model: "deepseek-chat".into(),
+            command: String::new(),
+            models_command: String::new(),
+        });
+        settings.ai_provider = "my-deepseek".into();
+
+        let p = resolve_ai_provider(&settings).expect("custom provider resolves");
+        assert_eq!(p.name, "DeepSeek");
+        assert_eq!(p.endpoint().unwrap(), "https://api.deepseek.com/v1/chat/completions");
+        p.validate().expect("valid");
+    }
+
+    /// Gemini is dispatched to its own adapter before the resolver runs. If a
+    /// future change routes it through here anyway, the error must say that —
+    /// not hand back a placeholder that fails validation for the wrong reason.
+    #[test]
+    fn resolve_ai_provider_refuses_gemini_with_the_real_reason() {
+        use crate::connections::{resolve_ai_provider, AppSettings};
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "gemini".into();
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("own adapter"), "must name the real cause: {err}");
+        assert!(!err.contains("endpoint"), "must not blame the config: {err}");
+    }
+
+    #[test]
+    fn resolve_ai_provider_names_the_provider_it_cannot_find() {
+        use crate::connections::{resolve_ai_provider, AppSettings};
+
+        let mut settings = AppSettings::default();
+        settings.ai_provider = "deleted-provider".into();
+        let err = resolve_ai_provider(&settings).unwrap_err();
+        assert!(err.contains("deleted-provider"), "{err}");
+        assert!(err.contains("Settings"), "should say where to fix it: {err}");
+    }
+
+    /// Settings written before this feature existed have no `ai_providers` key at
+    /// all; serde must read them rather than failing the whole vault load.
+    #[test]
+    fn settings_without_the_provider_list_still_deserialize() {
+        let json = r#"{"ai_provider":"openai","openai_api_key":"x","openai_model":"gpt-4o"}"#;
+        let settings: crate::connections::AppSettings =
+            serde_json::from_str(json).expect("older settings must still load");
+        assert_eq!(settings.ai_provider, "openai");
+        assert!(settings.ai_providers.is_empty());
+    }
+
     /// Build test-only passwords without hard-coded string literals for static analysis.
     fn test_secret(parts: &[&str]) -> String {
         parts.concat()
@@ -1746,6 +3015,115 @@ mod tests {
         );
     }
 
+    // ── mongosh output framing (shell reliability) ──────────────────────────
+    //
+    // mongosh writes its prompt with no newline after it. A line reader never
+    // saw the prompt as a line: it sat in the buffer until the next output and
+    // was glued to the front of it, and a prompt with nothing after it — the
+    // REPL waiting for input, which is what a stalled script looks like — was
+    // never delivered at all.
+    //
+    // A prompt-shaped tail is judged only by what comes next: a newline means
+    // it was output the pipe split, anything else means it was a prompt. Complete
+    // lines are never rewritten. Completion does not depend on prompt handling
+    // at all — markers are matched by suffix.
+
+    #[test]
+    fn a_prompt_is_dropped_once_the_next_output_shows_it_was_one() {
+        use crate::absorb_mongosh_chunk;
+        let mut pending = Vec::new();
+        assert_eq!(absorb_mongosh_chunk(&mut pending, b"hello\nrs0 [direct: primary] test> "), vec!["hello".to_string()]);
+        // Held, not decided: it could still be the front of an output line.
+        assert_eq!(pending, b"rs0 [direct: primary] test> ".to_vec());
+        // The next chunk starts with output, so the tail was a prompt.
+        assert_eq!(absorb_mongosh_chunk(&mut pending, b"world\n"), vec!["world".to_string()]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn output_split_right_before_its_newline_is_kept_whole() {
+        use crate::absorb_mongosh_chunk;
+        // `print("ready> ")` delivered as `ready> ` and then `\n`. Judged on its
+        // own the first part looks exactly like a prompt; the newline that
+        // follows is what says it was not.
+        let mut pending = Vec::new();
+        assert!(absorb_mongosh_chunk(&mut pending, b"ready> ").is_empty());
+        assert_eq!(absorb_mongosh_chunk(&mut pending, b"\n"), vec!["ready> ".to_string()]);
+    }
+
+    #[test]
+    fn output_split_before_its_crlf_is_kept_whole() {
+        use crate::absorb_mongosh_chunk;
+        // The same split, but the line ends in `\r\n` (mongosh on Windows) and
+        // the read boundary falls before the `\r`. A leading carriage return is
+        // a line ending arriving, not new output after a prompt.
+        let mut pending = Vec::new();
+        assert!(absorb_mongosh_chunk(&mut pending, b"ready> ").is_empty());
+        assert_eq!(absorb_mongosh_chunk(&mut pending, b"\r\n"), vec!["ready> ".to_string()]);
+        // And split again, between the `\r` and the `\n`.
+        assert!(absorb_mongosh_chunk(&mut pending, b"status> ").is_empty());
+        assert!(absorb_mongosh_chunk(&mut pending, b"\r").is_empty());
+        assert_eq!(absorb_mongosh_chunk(&mut pending, b"\n"), vec!["status> ".to_string()]);
+    }
+
+    #[test]
+    fn complete_lines_are_never_rewritten() {
+        use crate::absorb_mongosh_chunk;
+        // A script may print anything, including things shaped like a prompt,
+        // and a prompt the OS delivered in the same read as the output after it
+        // is left glued on rather than guessed at. Both are delivered verbatim.
+        let mut pending = Vec::new();
+        assert_eq!(
+            absorb_mongosh_chunk(&mut pending, b"ready> \ntest> hello\nstatus> ok\n"),
+            vec!["ready> ".to_string(), "test> hello".to_string(), "status> ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_partial_output_line_waits_for_its_newline() {
+        use crate::absorb_mongosh_chunk;
+        let mut pending = Vec::new();
+        assert!(absorb_mongosh_chunk(&mut pending, b"{ _id: 1, name: 'half").is_empty());
+        assert_eq!(pending, b"{ _id: 1, name: 'half".to_vec(), "not prompt-shaped, so it stays buffered");
+        assert_eq!(absorb_mongosh_chunk(&mut pending, b" typed' }\r\n"), vec!["{ _id: 1, name: 'half typed' }".to_string()]);
+    }
+
+    #[test]
+    fn the_marker_is_matched_by_suffix_so_a_glued_prompt_cannot_hide_it() {
+        use crate::{marker_line_kind, MongoshCommandEnd};
+        let marker = "__MQLENS_DONE_abc__";
+        // The REPL's echo of the marker expression: the command completed.
+        assert_eq!(marker_line_kind(marker, marker), Some(MongoshCommandEnd::Completed));
+        // With the previous prompt delivered in the same read — the case that
+        // would otherwise wait forever, now that a command has no ceiling. It
+        // needs no prompt to have been seen first: the first prompt of a session
+        // can arrive coalesced with the marker of the `use` that starts it.
+        assert_eq!(
+            marker_line_kind("rs0 [direct: primary] test> __MQLENS_DONE_abc__", marker),
+            Some(MongoshCommandEnd::Completed)
+        );
+        assert_eq!(marker_line_kind("test> test> __MQLENS_DONE_abc__", marker), Some(MongoshCommandEnd::Completed));
+        // Quoted back inside a SyntaxError code frame: our line was swallowed
+        // into an unclosed statement that then failed to parse.
+        assert_eq!(marker_line_kind("> 2 | '__MQLENS_DONE_abc__'", marker), Some(MongoshCommandEnd::SyntaxError));
+        // Anything else is ordinary output.
+        assert_eq!(marker_line_kind("hello", marker), None);
+        assert_eq!(marker_line_kind("__MQLENS_DONE_other__", marker), None);
+    }
+
+    #[test]
+    fn only_the_previous_commands_own_markers_are_stale() {
+        use crate::is_stale_marker_line;
+        let stale = vec!["__MQLENS_DONE_old1__".to_string(), "__MQLENS_DONE_old2__".to_string()];
+        // Its echo arriving late, glued prompt or not.
+        assert!(is_stale_marker_line("__MQLENS_DONE_old1__", &stale));
+        assert!(is_stale_marker_line("test> __MQLENS_DONE_old2__", &stale));
+        // Output that merely contains the reserved-looking text is output.
+        assert!(!is_stale_marker_line("{ status: \"__MQLENS_DONE_pending\" }", &stale));
+        assert!(!is_stale_marker_line("__MQLENS_DONE_old1__ was printed", &stale));
+        assert!(!is_stale_marker_line("hello", &stale));
+    }
+
     #[tokio::test]
     async fn test_mongosh_session_not_found() {
         use crate::{run_mongosh_command_impl, stop_mongosh_session_impl};
@@ -2323,7 +3701,7 @@ mod tests {
     #[test]
     fn test_build_query_gen_request_shape() {
         use crate::ai::build_query_gen_request;
-        let body = build_query_gen_request("claude-opus-4-8", "SYS", &[], "users older than 30");
+        let body = build_query_gen_request("claude-opus-4-8", "SYS", &[], "users older than 30", &[]);
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["messages"][0]["role"], "user");
@@ -2682,6 +4060,24 @@ mod tests {
         assert_eq!(legacy.audit_level, "A");
         assert_eq!(legacy.audit_retention_days, 30);
         assert!(!legacy.audit_include_payloads);
+        // A settings file written before #350 has no MCP fields at all; it has
+        // to read as "server off, default port, nothing to restore" rather than
+        // failing to parse.
+        assert!(!legacy.mcp_enabled);
+        assert_eq!(legacy.mcp_port, crate::mcp::DEFAULT_PORT);
+        assert!(legacy.mcp_token.is_empty());
+
+        // And what the MCP panel stores survives a write/read cycle — the whole
+        // point of #350 is that the token outlives the process.
+        let mut with_mcp = AppSettings::default();
+        with_mcp.mcp_enabled = true;
+        with_mcp.mcp_port = 9123;
+        with_mcp.mcp_token = "token-clients-are-configured-with".to_string();
+        let reloaded: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&with_mcp).unwrap()).unwrap();
+        assert!(reloaded.mcp_enabled);
+        assert_eq!(reloaded.mcp_port, 9123);
+        assert_eq!(reloaded.mcp_token, "token-clients-are-configured-with");
 
         // resolve_local_command falls back to built-in defaults when unset.
         assert_eq!(
@@ -2781,7 +4177,7 @@ mod tests {
         ];
 
         // Anthropic: history messages precede the final user message.
-        let a = build_query_gen_request("claude-opus-4-8", "SYS", &history, "now sort by age");
+        let a = build_query_gen_request("claude-opus-4-8", "SYS", &history, "now sort by age", &[]);
         let msgs = a["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "user");
@@ -2789,14 +4185,14 @@ mod tests {
         assert_eq!(msgs[2]["content"], "now sort by age");
 
         // OpenAI: system first, then history, then final user.
-        let o = build_openai_request("gpt-4o", "SYS", &history, "now sort by age");
+        let o = build_openai_request("gpt-4o", "SYS", &history, "now sort by age", &[]);
         let omsgs = o["messages"].as_array().unwrap();
         assert_eq!(omsgs[0]["role"], "system");
         assert_eq!(omsgs.len(), 4);
         assert_eq!(omsgs[3]["content"], "now sort by age");
 
         // Gemini: assistant role maps to "model".
-        let g = build_gemini_request("SYS", &history, "now sort by age");
+        let g = build_gemini_request("SYS", &history, "now sort by age", &[]);
         let contents = g["contents"].as_array().unwrap();
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[1]["role"], "model");
@@ -2863,7 +4259,7 @@ mod tests {
     fn test_openai_request_and_extract() {
         use crate::ai::{build_openai_request, extract_openai_text};
 
-        let body = build_openai_request("gpt-4o", "SYS", &[], "users older than 30");
+        let body = build_openai_request("gpt-4o", "SYS", &[], "users older than 30", &[]);
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "SYS");
@@ -2888,7 +4284,7 @@ mod tests {
         // by logs, crash reports and proxies, and is echoed in transport errors.
         assert!(!url.contains("key="), "credential in URL: {url}");
 
-        let body = build_gemini_request("SYS", &[], "active users");
+        let body = build_gemini_request("SYS", &[], "active users", &[]);
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "SYS");
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][0]["parts"][0]["text"], "active users");
@@ -2906,7 +4302,7 @@ mod tests {
 
         // {prompt} becomes a single argv element, even with spaces/quotes/shell metachars.
         let (prog, args) =
-            parse_command_template("claude -p {prompt}", "find users; rm -rf / $(whoami)").unwrap();
+            parse_command_template("claude -p {prompt}", "find users; rm -rf / $(whoami)", "", None).unwrap();
         assert_eq!(prog, "claude");
         assert_eq!(
             args,
@@ -2917,12 +4313,12 @@ mod tests {
         );
 
         // No {prompt} placeholder -> append prompt as final arg.
-        let (prog, args) = parse_command_template("codex exec", "hi there").unwrap();
+        let (prog, args) = parse_command_template("codex exec", "hi there", "", None).unwrap();
         assert_eq!(prog, "codex");
         assert_eq!(args, vec!["exec".to_string(), "hi there".to_string()]);
 
         // Empty template is an error.
-        assert!(parse_command_template("   ", "x").is_err());
+        assert!(parse_command_template("   ", "x", "", None).is_err());
     }
 
     #[tokio::test]
@@ -2932,6 +4328,8 @@ mod tests {
         let res = generate_local(
             "definitely-not-a-real-binary-xyz -p {prompt}",
             "find active users",
+            "", // no {model} in this template
+            None,
         )
         .await;
         assert!(res.is_err());
@@ -2945,7 +4343,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_anthropic_requires_api_key() {
         use crate::ai::generate_anthropic;
-        let res = generate_anthropic("", "claude-opus-4-8", "SYS", &[], "active users").await;
+        let res = generate_anthropic("", "claude-opus-4-8", "SYS", &[], "active users", &[]).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("API key"));
     }
@@ -4209,6 +5607,7 @@ mod shell_tab_state_tests {
         AppState::new()
     }
 
+
     #[test]
     fn a_closed_window_is_remembered_so_a_pending_start_can_abandon_itself() {
         // Closing a window destroys the renderer that would have cancelled a
@@ -4611,6 +6010,68 @@ mod shell_tab_state_tests {
 }
 
 
+/// Which conversation a live local-agent run belongs to, so a write the agent
+/// asks for can be put to whichever window is showing that chat.
+mod requester_tests {
+    use crate::state::AppState;
+
+    #[test]
+    fn a_live_run_is_recorded_under_the_conversation_that_asked() {
+        // The conversation is the address a write is put to. A run id is only
+        // meaningful to the webview that minted it, and a tab can be moved or
+        // detached to another window mid-run — so the destination panel could not
+        // recognise it, the source no longer mounted the tab, and the write timed
+        // out with nobody able to approve it.
+        let st = AppState::new();
+        {
+            let _run =
+                crate::RequesterGuard::set(&st, Some("run-1".into()), Some("chat-42".into()));
+            let live = st.mcp_helper_requesters.lock().unwrap();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].run, "run-1");
+            assert_eq!(live[0].conversation, "chat-42");
+        }
+        assert!(
+            st.mcp_helper_requesters.lock().unwrap().is_empty(),
+            "the guard retires its own entry however the run ends"
+        );
+    }
+
+    #[test]
+    fn two_runs_in_one_conversation_retire_independently() {
+        // Tracking by conversation instead of by run would strand a live run:
+        // whichever guard dropped would retire the *first* entry for that chat,
+        // not its own. The second guard is the one dropped here for exactly that
+        // reason — dropping the first cannot tell the two apart, since removing
+        // either the first-matching or its own entry leaves the same list.
+        let st = AppState::new();
+        let _first = crate::RequesterGuard::set(&st, Some("run-a".into()), Some("chat-42".into()));
+        let second = crate::RequesterGuard::set(&st, Some("run-b".into()), Some("chat-42".into()));
+        assert_eq!(st.mcp_helper_requesters.lock().unwrap().len(), 2);
+        drop(second);
+        let live = st.mcp_helper_requesters.lock().unwrap();
+        assert_eq!(live.len(), 1, "only its own entry");
+        assert_eq!(
+            live[0].run, "run-a",
+            "the run still going must keep its entry"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_conversation_is_left_unaddressed() {
+        // Recording the run alone would make it the single live requester while
+        // giving `confirm_write` no address to emit. Leaving the list empty falls
+        // through to the unaddressed case, where any window may answer — the same
+        // place two concurrent runs land.
+        let st = AppState::new();
+        let _run = crate::RequesterGuard::set(&st, Some("run-1".into()), None);
+        assert!(
+            st.mcp_helper_requesters.lock().unwrap().is_empty(),
+            "a run that cannot be addressed must not claim to be the requester"
+        );
+    }
+}
+
 mod chat_claim_tests {
     use crate::chats::{claim_chat, release_chat, release_window_chats};
 
@@ -4703,6 +6164,8 @@ mod chat_store_tests {
             variant: "editor".to_string(),
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
+            provider_id: None,
+            model: None,
         }
     }
 
@@ -4756,6 +6219,9 @@ mod chat_store_tests {
                 text: format!("msg {i}"),
                 query: None,
                 error: None,
+                thoughts: None,
+                tool_calls: Vec::new(),
+                attachments: None,
             })
             .collect();
 
@@ -4778,6 +6244,9 @@ mod chat_store_tests {
             text: "x".to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            tool_calls: Vec::new(),
+            attachments: None,
         };
 
         assert_eq!(next_message_id(&[]), "m0");
@@ -4800,6 +6269,9 @@ mod chat_store_tests {
             text: id.to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            tool_calls: Vec::new(),
+            attachments: None,
         };
         let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
         stored.messages = vec![msg("m0"), msg("m1"), msg("m2")];
@@ -4823,6 +6295,9 @@ mod chat_store_tests {
             text: "x".to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            tool_calls: Vec::new(),
+            attachments: None,
         };
         let mut stored = chat("c1", "users", "2026-01-01T00:00:00Z");
         stored.messages = vec![msg("m0")];
@@ -4908,6 +6383,9 @@ mod chat_store_tests {
             text: "hello".to_string(),
             query: None,
             error: None,
+            thoughts: None,
+            tool_calls: Vec::new(),
+            attachments: None,
         }];
 
         let out = summaries(&[c], None);

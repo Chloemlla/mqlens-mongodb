@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { List, type RowComponentProps } from 'react-window';
 import { useTranslation } from 'react-i18next';
+import { useTabVisible } from '../workspace/tabVisibility';
 import { Database, Layers, Pause, Play, Radio, Trash2, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -40,12 +41,12 @@ const VIEW_CAP = 1_000;
  * the strongest signals (green and red) and the edits sit between them.
  */
 const OPERATION_STYLES: Record<string, { badge: string; rail: string }> = {
-  insert: { badge: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400', rail: 'bg-emerald-500' },
-  update: { badge: 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400', rail: 'bg-amber-500' },
-  replace: { badge: 'border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400', rail: 'bg-sky-500' },
-  delete: { badge: 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400', rail: 'bg-rose-500' },
-  drop: { badge: 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400', rail: 'bg-rose-500' },
-  rename: { badge: 'border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-400', rail: 'bg-violet-500' },
+  insert: { badge: 'border-success/40 bg-success/10 text-success', rail: 'bg-success' },
+  update: { badge: 'border-warning/40 bg-warning/10 text-warning', rail: 'bg-warning' },
+  replace: { badge: 'border-chart-1/40 bg-chart-1/10 text-chart-1', rail: 'bg-chart-1' },
+  delete: { badge: 'border-destructive/40 bg-destructive/10 text-destructive', rail: 'bg-destructive' },
+  drop: { badge: 'border-destructive/40 bg-destructive/10 text-destructive', rail: 'bg-destructive' },
+  rename: { badge: 'border-chart-4/40 bg-chart-4/10 text-chart-4', rail: 'bg-chart-4' },
   invalidate: { badge: 'border-muted-foreground/40 bg-muted text-muted-foreground', rail: 'bg-muted-foreground' },
 };
 
@@ -237,6 +238,16 @@ export const WatchPanel: React.FC<WatchPanelProps> = ({
   // tearing the cursor down here would drop its resume token and silently miss
   // every change until the user came back. The tab's close path stops it, the
   // same way a shell session is ended.
+  // Kept-alive tabs stay mounted while hidden (#240). A hidden Watch tab polls
+  // nothing: the backend keeps buffering for it — evicting the oldest past its
+  // cap and reporting how many it dropped, exactly as for any slow consumer —
+  // and the first tick after the tab is shown again drains what accumulated.
+  const tabVisible = useTabVisible();
+  const tabVisibleRef = useRef(tabVisible);
+  useEffect(() => {
+    tabVisibleRef.current = tabVisible;
+  }, [tabVisible]);
+
   useEffect(() => {
     // Nothing may start before the filter has been reconciled above, or the
     // first start would be the unfiltered one this is here to avoid.
@@ -327,8 +338,11 @@ export const WatchPanel: React.FC<WatchPanelProps> = ({
         polling = false;
       }
     };
-    const timer = setInterval(() => void tick(), POLL_MS);
-    void tick();
+    const run = () => {
+      if (tabVisibleRef.current) void tick();
+    };
+    const timer = setInterval(run, POLL_MS);
+    run();
 
     return () => {
       alive = false;

@@ -6,17 +6,36 @@
       "insert": "插入",
       "insertAndRun": "插入并运行"
     },
+    "attachments": {
+      "image": "图片，{{size}}",
+      "remove": "移除图片"
+    },
     "composer": {
       "placeholder": "用自然语言描述查询…（Enter 发送，Shift+Enter 换行）",
-      "send": "发送"
+      "send": "发送",
+      "noImagesForCli": "该提供方是本地命令，无法接收图片。若要询问图片相关内容，请选择 HTTP 提供方。",
+      "imageTooMany": "每条消息最多 {{max}} 张图片。",
+      "imageUnreadable": "部分图片无法读取，已略过。",
+      "attach": "附加图片",
+      "imageUnsupported": "仅支持发送 PNG、JPEG、WebP 和 GIF 图片。",
+      "imageTooLarge": "图片必须小于 {{limit}} MB。"
     },
     "empty": {
       "body": "用日常语言描述你要的查询 —— 例如 <i>“年龄大于 30 的活跃用户，按年龄排序”</i> 或<i> “每位客户的平均订单金额”</i>。我会说明处理思路，你可以直接插入结果。"
     },
+    "errors": {
+      "noQuery": "模型未返回查询。请换一种说法，或选择其他模型。"
+    },
     "fallbackExplanation": "这是一个查询。",
     "header": {
       "closeTitle": "关闭 AI 助手",
-      "title": "AI 查询助手"
+      "title": "AI 查询助手",
+      "provider": "提供方",
+      "loadModels": "加载模型",
+      "model": "模型",
+      "modelPlaceholder": "模型",
+      "modelsFailed": "无法加载模型，请直接输入名称。",
+      "typeModel": "输入模型名称…"
     },
     "history": {
       "clearAll": "删除全部对话",
@@ -41,7 +60,19 @@
       "assistant": "助手",
       "you": "你"
     },
-    "thinking": "正在思考…"
+    "thinking": "正在思考…",
+    "thoughts": "思考过程",
+    "toolCalls_other": "调用了 {{count}} 个工具",
+    "toolFailed": "失败",
+    "writeRequestAllow": "允许",
+    "writeRequestRefuse": "拒绝",
+    "writeRequestTitle": "助手想要修改数据"
+  },
+  "mcpWriteConfirm": {
+    "allow": "允许",
+    "description": "已连接到 MQLens 的 MCP 客户端请求修改数据。仅在这是您发起的操作时才允许。",
+    "refuse": "拒绝",
+    "title": "MCP 客户端请求修改数据"
   },
   "commandPalette": {
     "buckets": {
@@ -283,6 +314,9 @@
       "destructiveCancelled": "已取消该破坏性命令。",
       "resultToDataViewer_other": "{{count}} 个文档 -> 数据视图",
       "sessionAttached": "已接入 mongosh 会话",
+      "commandReattached": "重新打开此 Shell 时仍有命令在运行。其输出留在启动它的视图中；正在等待其完成，按“停止”可将其结束。",
+      "commandStopped": "命令已停止。",
+      "runningFor": "运行中… {{seconds}}秒",
       "sessionRestarting": "正在重启 mongosh 会话…",
       "sessionUnavailable": "mongosh 会话不可用：{{detail}}",
       "switchedToDb": "已切换到数据库 {{db}}"
@@ -290,6 +324,8 @@
     "toolbar": {
       "aiToggleLabel": "AI",
       "aiToggleTitle": "AI 助手",
+      "stop": "停止",
+      "stopTitle": "通过重启 mongosh 会话来停止正在运行的命令",
       "restartSession": "重启",
       "restartSessionTitle": "停止当前 mongosh 会话并启动新会话",
       "run": "运行"

@@ -5,6 +5,7 @@ const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: any[]) => mockInvoke(...a) }));
 
 import { MonitoringView } from '../MonitoringView';
+import { TabVisibleContext } from '../../workspace/tabVisibility';
 
 const STATUS = {
   host: 'h:27017', version: '7.0.0', uptimeSeconds: 3600,
@@ -48,6 +49,27 @@ beforeEach(() => {
 });
 
 describe('MonitoringView', () => {
+  it('does not poll while its tab is hidden, and fetches at once when it is shown again', async () => {
+    // A kept-alive tab stays mounted while another tab is on screen (#240).
+    const statusCalls = () => mockInvoke.mock.calls.filter((c) => c[0] === 'server_status').length;
+    const view = (visible: boolean) => (
+      <TabVisibleContext.Provider value={visible}>
+        <MonitoringView connectionId="c1" />
+      </TabVisibleContext.Provider>
+    );
+    const { rerender } = render(view(false));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(statusCalls()).toBe(0);
+
+    rerender(view(true));
+    await waitFor(() => expect(statusCalls()).toBe(1));
+
+    // Hidden again: the interval may fire, but it fetches nothing.
+    rerender(view(false));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(statusCalls()).toBe(1);
+  });
+
   it('renders server metrics and current operations', async () => {
     render(<MonitoringView connectionId="conn-1" />);
     expect(await screen.findByTestId('monitoring-view')).toBeInTheDocument();
@@ -172,11 +194,11 @@ describe('MonitoringView', () => {
     // Healthy secondary: sub-threshold lag, no warning class.
     const okLag = screen.getByTestId('cluster-lag-db2:27017');
     expect(okLag).toHaveTextContent('0.8s');
-    expect(okLag.className).not.toMatch(/amber|red/);
-    // Lagging secondary (42s >= 10s): amber warning.
+    expect(okLag.className).not.toMatch(/text-warning|text-destructive/);
+    // Lagging secondary (42s >= 10s): the theme's warning token.
     const warnLag = screen.getByTestId('cluster-lag-db3:27017');
     expect(warnLag).toHaveTextContent('42');
-    expect(warnLag.className).toMatch(/amber/);
+    expect(warnLag.className).toMatch(/text-warning/);
     // Down/unreachable member: unhealthy styling and no bogus lag.
     expect(screen.getByTestId('cluster-member-db4:27017').className).toMatch(/destructive/);
     expect(screen.getByTestId('cluster-lag-db4:27017')).toHaveTextContent('n/a');

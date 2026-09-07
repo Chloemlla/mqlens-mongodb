@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useDialogs } from './dialogs/DialogProvider';
+import { isNamespaceBusy, type PendingSave } from '../lib/namespaceBusy';
 import { confirmByTypedName } from '../lib/typedNameConfirm';
 import { fuzzyMatch } from '../lib/fuzzyMatch';
 import { type CollectionSelection, emptySelection, toggleCollection, selectionScope } from '@/lib/collectionSelection';
@@ -201,6 +202,10 @@ interface SidebarProps {
   onDatabaseDropped?: (connectionId: string, dbName: string) => void;
   onDatabaseRenamed?: (connectionId: string, oldName: string, newName: string) => void;
   onNamespaceMutated?: (connectionId?: string) => void;
+  /** Document writes this window has sent and not yet seen answered, so a
+   *  rename or a drop can refuse before it starts. Advisory: the backend makes
+   *  the same check across every window and is the one that decides. */
+  pendingSaves?: readonly PendingSave[];
   onFilterQueryChange?: (query: string) => void;
   indexMutationTrigger?: number;
   collectionMutationTrigger?: number;
@@ -328,6 +333,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onDatabaseDropped,
   onDatabaseRenamed,
   onNamespaceMutated,
+  pendingSaves,
   onFilterQueryChange,
   indexMutationTrigger,
   collectionMutationTrigger,
@@ -639,17 +645,31 @@ export const Sidebar: React.FC<SidebarProps> = ({
     setExpandedConnections((prev) => ({ ...prev, [connId]: true }));
   };
 
+  /**
+   * Load a database's collections into the tree, and say so when it cannot.
+   *
+   * The silence was half of #327. A server whose `listCollections` reply the
+   * driver could not read left the tree empty with nothing but a console line —
+   * indistinguishable from a database that genuinely has no collections, and
+   * flatly contradicted by the database's own popover, which asks `dbStats` and
+   * reported the real count. An empty tree should never be how the app says
+   * something failed.
+   */
+  const loadCollectionsInto = async (connectionId: string, dbName: string) => {
+    const key = `${connectionId}/${dbName}`;
+    try {
+      const colls = await invoke<CollectionInfo[]>('list_collections', { id: connectionId, db: dbName });
+      setCollections((prev) => ({ ...prev, [key]: colls }));
+    } catch (err) {
+      console.error(`Failed to load collections for database ${dbName}`, err);
+      toast(t('toasts.loadCollectionsFailed', { db: dbName, error: `${err}` }), 'error');
+    }
+  };
+
   const ensureDbExpanded = async (connId: string, dbName: string) => {
     const key = `${connId}/${dbName}`;
     setExpandedDbs((prev) => ({ ...prev, [key]: true }));
-    if (!collections[key]) {
-      try {
-        const colls = await invoke<CollectionInfo[]>('list_collections', { id: connId, db: dbName });
-        setCollections((prev) => ({ ...prev, [key]: colls }));
-      } catch (err) {
-        console.error(`Failed to load collections for database ${dbName}`, err);
-      }
-    }
+    if (!collections[key]) await loadCollectionsInto(connId, dbName);
   };
 
   const navigateToPinned = async (item: PinnedItem) => {
@@ -838,14 +858,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     const isExpanding = !expandedDbs[key];
     setExpandedDbs((prev) => ({ ...prev, [key]: !prev[key] }));
 
-    if (isExpanding && !collections[key]) {
-      try {
-        const colls = await invoke<CollectionInfo[]>('list_collections', { id: connectionId, db: dbName });
-        setCollections((prev) => ({ ...prev, [key]: colls }));
-      } catch (err) {
-        console.error(`Failed to load collections for database ${dbName}`, err);
-      }
-    }
+    if (isExpanding && !collections[key]) await loadCollectionsInto(connectionId, dbName);
   };
 
   const toggleCollectionsFolder = async (connectionId: string, dbName: string) => {
@@ -855,12 +868,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
     const collsKey = `${connectionId}/${dbName}`;
     if (!isCurrentlyExpanded && !collections[collsKey]) {
-      try {
-        const colls = await invoke<CollectionInfo[]>('list_collections', { id: connectionId, db: dbName });
-        setCollections((prev) => ({ ...prev, [collsKey]: colls }));
-      } catch (err) {
-        console.error(`Failed to load collections for database ${dbName}`, err);
-      }
+      await loadCollectionsInto(connectionId, dbName);
     }
   };
 
@@ -888,13 +896,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleRefreshDb = async (connectionId: string, dbName: string) => {
-    const key = `${connectionId}/${dbName}`;
-    try {
-      const colls = await invoke<CollectionInfo[]>('list_collections', { id: connectionId, db: dbName });
-      setCollections((prev) => ({ ...prev, [key]: colls }));
-    } catch (err) {
-      console.error(err);
-    }
+    // Refresh especially: the user asked for this one, so a failure they cannot
+    // see is a refresh that looks like it emptied the database.
+    await loadCollectionsInto(connectionId, dbName);
   };
 
   const handleAddDatabase = async (connectionId: string) => {
@@ -978,6 +982,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleDropCollection = async (connectionId: string, dbName: string, collName: string) => {
+    // The same race as a rename, and worse: a drop that lands before a pending
+    // insert has the server recreate the collection for it, so the drop comes
+    // undone with one document sitting in it (#326 review). The backend refuses
+    // this too and its answer is the true one — it sees every window; this is
+    // here to refuse before the confirm dialog rather than after it.
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName, collName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const conn = activeConnections.find((c) => c.id === connectionId);
     // #188 security review Fix 5: block read-only BEFORE the confirm dialog
     // and, critically, before the `isMock` branch below — which mutates the
@@ -1049,6 +1062,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleRenameCollection = async (connectionId: string, dbName: string, collName: string) => {
+    // A document save already sent names this namespace. Renaming it now is a
+    // race MongoDB settles: if the rename lands first, the insert can recreate
+    // the old name and write into it, while the tab reports success against the
+    // new one (#326 review). The wait is brief; splitting a write across two
+    // collections is not recoverable.
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName, collName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const conn = activeConnections.find((c) => c.id === connectionId);
     // #188 Task 3: on a confirm_destructive connection, typing the current
     // collection name (the "already a prompt" precedent kept as-is below for
@@ -1134,6 +1156,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleDropDatabase = async (connectionId: string, dbName: string) => {
+    // Every collection under it goes, so any write below the database blocks.
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const conn = activeConnections.find((c) => c.id === connectionId);
     // #188 security review Fix 5: see handleDropCollection's comment on this
     // same pattern — blocks the `isMock` branch below from dropping a
@@ -1228,6 +1255,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const handleRenameDatabase = async (connectionId: string, dbName: string) => {
+    // Same race, one level up: every collection under this database moves, so
+    // a save running against any of them is enough to refuse (#326 review).
+    if (isNamespaceBusy(pendingSaves ?? [], connectionId, dbName)) {
+      toast(t('toasts.namespaceBusyWithSave'), 'error');
+      return;
+    }
     const newName = await prompt({
       title: t('dialogs.renameDatabase.promptTitle'),
       message: t('dialogs.enterNewDatabaseName'),
@@ -1765,7 +1798,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         </Badge>
                       )}
                       <span
-                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-success"
                         aria-label={t('connection.connectedAriaLabel')}
                       />
                     </div>
@@ -2592,13 +2625,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                     size={11}
                                     className={cn(
                                       'shrink-0',
-                                      isConnected ? 'text-emerald-500' : 'text-muted-foreground',
+                                      isConnected ? 'text-success' : 'text-muted-foreground',
                                     )}
                                   />
                                   <span className="min-w-0 truncate">{profile.name}</span>
                                   {isConnected && (
                                     <span
-                                      className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                                      className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-success"
                                       aria-label={t('connection.connectedAriaLabel')}
                                     />
                                   )}
@@ -2624,7 +2657,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                             size={11}
                             className={cn(
                               'shrink-0',
-                              isConnected ? 'text-emerald-500' : 'text-muted-foreground',
+                              isConnected ? 'text-success' : 'text-muted-foreground',
                             )}
                           />
                           <span className="min-w-0 truncate">{profile.name}</span>

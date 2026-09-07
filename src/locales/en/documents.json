@@ -282,12 +282,16 @@
     "errors": {
       "invalidJsonSyntax": "Invalid JSON syntax: {{message}}",
       "invalidQuery": "Invalid query",
-      "queryMustBeObject": "The query must be an object"
+      "queryMustBeObject": "The query must be an object",
+      "unsupportedRegexFlag": "MongoDB does not support the regex flag {{flag}}."
     },
     "history": {
       "aggregateSummary_one": "aggregate · {{count}} stage",
       "aggregateSummary_other": "aggregate · {{count}} stages",
       "findSummary": "find · {{filter}}"
+    },
+    "notices": {
+      "regexFlagsIgnored": "Regex flag {{flags}} has no effect in MongoDB and was ignored."
     },
     "pipeline": {
       "stageCount_one": "{{count}} stage",
@@ -357,7 +361,7 @@
   },
   "findQueryBar": {
     "errors": {
-      "invalidJson": "Invalid JSON"
+      "invalidQuery": "Invalid query"
     },
     "labels": {
       "limit": "Limit",
@@ -366,6 +370,9 @@
       "query": "Query",
       "skip": "Skip",
       "sort": "Sort"
+    },
+    "notices": {
+      "flagIgnored": "Flag ignored"
     },
     "tooltips": {
       "clearFilter": "Clear Filter",

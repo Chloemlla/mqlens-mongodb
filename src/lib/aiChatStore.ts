@@ -25,6 +25,9 @@ export interface ChatScope {
 }
 
 export interface StoredChat extends ChatScope {
+  /** Provider chosen for this conversation in the panel; absent = settings default. */
+  providerId?: string;
+  model?: string;
   id: string;
   title: string;
   messages: ChatMessage[];
@@ -220,7 +223,13 @@ export async function deleteChat(id: string): Promise<void> {
  */
 export async function appendReplyToChat(
   chatId: string,
-  reply: { text: string; query?: unknown; error?: boolean }
+  reply: {
+    text: string;
+    query?: unknown;
+    error?: boolean;
+    thoughts?: string | null;
+    toolCalls?: { name: string; input?: string; output?: string; failed?: boolean }[];
+  }
 ): Promise<void> {
   await invoke('append_chat_message', {
     chatId,
@@ -228,6 +237,10 @@ export async function appendReplyToChat(
     text: reply.text,
     query: reply.query ?? null,
     error: reply.error ?? null,
+    // Carried through, or a reply parked by a closing tab reaches History
+    // without the reasoning it was shown with — and the same for what it ran.
+    thoughts: reply.thoughts ?? null,
+    toolCalls: reply.toolCalls ?? null,
     updatedAt: new Date().toISOString(),
   }).catch(() => undefined);
 }

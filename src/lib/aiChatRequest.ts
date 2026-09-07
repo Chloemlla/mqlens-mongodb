@@ -23,6 +23,10 @@ export interface PendingChatReply {
   text: string;
   query?: unknown;
   error?: boolean;
+  /** Reasoning or working notes the model produced alongside the answer. */
+  thoughts?: string;
+  /** What a local agent ran to produce the answer. */
+  toolCalls?: { name: string; input?: string; output?: string; failed?: boolean }[];
 }
 
 interface PendingChat {

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import React from 'react';
+import { render, screen, fireEvent, within, cleanup } from '@testing-library/react';
 
 // Monaco renders the Query Code panel; mock it as a plain textarea (same shape
 // as the other component tests) so assertions can read the generated code.
@@ -35,6 +36,7 @@ vi.mock('@/hooks/use-theme', () => ({
 }));
 
 import { DataGrid, getExplainTree } from '../DataGrid';
+import { TabVisibleContext } from '../../workspace/tabVisibility';
 import { resetResultsFindShortcutForTests } from '@/lib/resultsFindShortcut';
 
 // Collect every node name in the tree (depth-first) for assertions.
@@ -610,6 +612,98 @@ describe('DataGrid — Compare documents', () => {
     openMenuForRow('Bob');
     expect(screen.getByText('Compare with…')).toBeInTheDocument();
     expect(screen.queryByText('Compare with selected')).not.toBeInTheDocument();
+  });
+});
+
+
+// #268: re-running a query threw away every column width. The results pane
+// renders `{loading ? <spinner/> : <DataGrid/>}`, so the grid unmounts on every
+// run and its widths came back as {} — a column widened to read a field snapped
+// straight back to its default, after every single run.
+describe('DataGrid — column widths survive a run (#268)', () => {
+  const widen = (label: RegExp) => {
+    const handle = screen.getByRole('separator', { name: label });
+    fireEvent.keyDown(handle, { key: 'ArrowRight' });
+    return handle;
+  };
+
+  it('reports a resize to the caller that owns the widths', () => {
+    const onColumnWidthsChange = vi.fn();
+    render(
+      <DataGrid documents={mockDocuments} columnWidths={{}} onColumnWidthsChange={onColumnWidthsChange} />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    widen(/resize name column/i);
+
+    expect(onColumnWidthsChange).toHaveBeenCalledTimes(1);
+    // 180 default + one 16px step.
+    expect(onColumnWidthsChange.mock.calls[0][0]).toMatchObject({ name: 196 });
+  });
+
+  it('renders the width the caller gives it, so a remount keeps it', () => {
+    // The remount is the bug: this is what the grid comes back as after a run.
+    const { unmount } = render(<DataGrid documents={mockDocuments} columnWidths={{ name: 320 }} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(screen.getByTestId('table-header').textContent).toContain('name');
+    unmount();
+
+    render(<DataGrid documents={mockDocuments} columnWidths={{ name: 320 }} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    // Widened again from 320, not from the 180 default — which is only true if
+    // the width came from the caller rather than from remounted local state.
+    const onColumnWidthsChange = vi.fn();
+    cleanup();
+    render(
+      <DataGrid
+        documents={mockDocuments}
+        columnWidths={{ name: 320 }}
+        onColumnWidthsChange={onColumnWidthsChange}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    widen(/resize name column/i);
+    expect(onColumnWidthsChange.mock.calls[0][0]).toMatchObject({ name: 336 });
+  });
+
+  it('measures a resize made after a run from the width the run kept', () => {
+    // The whole scenario, in order: widen a column, run the query — which
+    // unmounts the grid — then widen again. The second drag has to start from
+    // the kept width, which is only true if the grid reads the caller's copy
+    // rather than the local one the remount just emptied.
+    const widths: Record<string, number> = {};
+    const onColumnWidthsChange = vi.fn((next: Record<string, number>) => {
+      Object.assign(widths, next);
+    });
+    const grid = () => (
+      <DataGrid
+        documents={mockDocuments}
+        columnWidths={{ ...widths }}
+        onColumnWidthsChange={onColumnWidthsChange}
+      />
+    );
+
+    render(grid());
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    widen(/resize name column/i);
+    expect(widths.name).toBe(196); // 180 + 16
+
+    // The run: spinner replaces the grid, then the grid comes back.
+    cleanup();
+    render(grid());
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    widen(/resize name column/i);
+
+    expect(widths.name).toBe(212); // 196 + 16, not 196 again
+  });
+
+  it('still manages its own widths when nobody owns them', () => {
+    // MongoShell renders the grid with nothing to persist to; it must keep
+    // working exactly as before.
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(() => widen(/resize name column/i)).not.toThrow();
   });
 });
 
@@ -1203,5 +1297,1148 @@ describe('find does not leak folds from a stale active index (#280 review round 
     expect(foldState('a')).toBe('open');
     // ...and c, which only the stale index pointed at, stays closed.
     expect(foldState('c')).toBe('closed');
+  });
+});
+
+// #311: the JSON view is virtualized, so dragging a selection downwards
+// unmounts the rows it started on. The browser's selection lives in the DOM, so
+// by the time Cmd+C runs only the last screenful is left — and it copies
+// silently, which is the worst part: the paste looks like a successful copy of
+// the wrong thing.
+describe('DataGrid — copying a JSON selection that scrolled (#311)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={mockDocuments} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** A selection anchored on one rendered row and focused on another. */
+  const selectionSpanning = (view: HTMLElement, from: number, to: number) =>
+    ({
+      isCollapsed: false,
+      anchorNode: view.querySelector(`[data-json-line="${from}"]`),
+      focusNode: view.querySelector(`[data-json-line="${to}"]`),
+    }) as unknown as Selection;
+
+  const copyFrom = (view: HTMLElement) => {
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    return setData;
+  };
+
+  it('rebuilds the full range from line data when rows were unmounted', () => {
+    const view = openJsonView();
+    expect(view.querySelectorAll('[data-json-line]').length).toBeGreaterThanOrEqual(4);
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    // The drag reached rows 0-3 while all of them were still mounted.
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 3));
+    document.dispatchEvent(new Event('selectionchange'));
+    // Scrolling has since dropped the top of that range; only 2-3 survive.
+    getSelection.mockReturnValue(selectionSpanning(view, 2, 3));
+
+    const setData = copyFrom(view);
+    expect(setData).toHaveBeenCalledTimes(1);
+    const [mime, text] = setData.mock.calls[0];
+    expect(mime).toBe('text/plain');
+    // All four lines, not just the two the DOM still had.
+    expect(text.split('\n')).toHaveLength(4);
+    expect(text).toContain('"Alice Smith"');
+    getSelection.mockRestore();
+  });
+
+  it('keeps extending after the anchor row is unmounted (#319 review)', () => {
+    // The sequence that actually happens, which the test below it originally
+    // skipped: the drag records a range, THEN scrolling unmounts the row the
+    // anchor sits on, and the drag continues. Resolving the two endpoints
+    // together discarded every update from that point on, so the range froze
+    // at the first screenful — the exact case this feature exists for.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+    // A node the browser is left holding once its row is gone.
+    const detached = document.createElement('span');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 1));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 0 has scrolled away; only the focus end still resolves.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: detached,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = copyFrom(view);
+    expect(setData).toHaveBeenCalledTimes(1);
+    // 0 through 3 — the far end was still picked up with the anchor gone.
+    expect(setData.mock.calls[0][1].split('\n')).toHaveLength(4);
+    getSelection.mockRestore();
+  });
+
+  it('lets the range contract when the drag reverses (#319 review)', () => {
+    // Dragging past a line and then back over it deselects it. A range that
+    // could only grow kept those lines and copied them anyway — silently
+    // adding text the user had explicitly removed, with every row mounted.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 3));
+    document.dispatchEvent(new Event('selectionchange'));
+    // Reversing: the anchor stays on row 0, the focus comes back to row 1.
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 1));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Nothing was lost, so the browser's own copy stands — and it is the
+    // contracted one.
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+  it('keeps the tracked range through a right-click (#319 review)', () => {
+    // Right-clicking opens a menu over an existing selection rather than
+    // replacing it. Resetting on any button threw the range away immediately
+    // before the copy that needed it, so the fix only worked for Cmd+C.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view, { button: 0 });
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 3));
+    document.dispatchEvent(new Event('selectionchange'));
+    getSelection.mockReturnValue(selectionSpanning(view, 2, 3));
+
+    fireEvent.mouseDown(view, { button: 2 });
+
+    const setData = copyFrom(view);
+    expect(setData).toHaveBeenCalledTimes(1);
+    expect(setData.mock.calls[0][1].split('\n')).toHaveLength(4);
+    getSelection.mockRestore();
+  });
+
+  it('leaves the browser alone when the whole selection is still mounted', () => {
+    // Whole-line rebuilding cannot honour a partial line at either end, so it
+    // must not take over a copy the browser can do exactly.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 1, 2));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+  it('starts a fresh extent on the next drag', () => {
+    // Without the mousedown reset the range would only ever grow, so an
+    // unrelated later selection would copy everything since the first one.
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 0, 4));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue(selectionSpanning(view, 3, 4));
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+  it('ignores a selection that is not in the JSON view', () => {
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+    const outside = document.createElement('div');
+    document.body.appendChild(outside);
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: outside,
+      focusNode: outside,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    expect(copyFrom(view)).not.toHaveBeenCalled();
+    outside.remove();
+    getSelection.mockRestore();
+  });
+});
+
+// #319 review: with only row indices recorded, the rebuild emitted whole
+// endpoint lines — so a drag starting mid-value and ending mid-value put the
+// leading key and trailing text of those lines on the clipboard too.
+describe('DataGrid — trimming partial endpoints of a rebuilt copy (#319 review)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={[{ _id: 1, name: 'Alice', city: 'Paris', n: 2 }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** An endpoint at a character offset inside a row's own text. */
+  const endpointIn = (view: HTMLElement, row: number, offset: number) => {
+    const el = view.querySelector(`[data-json-line="${row}"]`)!;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let seen = 0;
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const len = text.textContent?.length ?? 0;
+      if (seen + len >= offset) return { node: text, offset: offset - seen };
+      seen += len;
+    }
+    return { node: el, offset: 0 };
+  };
+
+  it('trims the first and last lines to what was actually selected', () => {
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+    const rowText = (i: number) =>
+      view.querySelector(`[data-json-line="${i}"]`)!.textContent ?? '';
+
+    // Start four characters into row 1 and stop four characters into row 3.
+    const from = endpointIn(view, 1, 4);
+    const to = endpointIn(view, 3, 4);
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: from.node,
+      anchorOffset: from.offset,
+      focusNode: to.node,
+      focusOffset: to.offset,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 1 has since scrolled away, so the rebuild takes over.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: view.querySelector('[data-json-line="3"]'),
+      anchorOffset: 0,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+
+    expect(lines).toHaveLength(3);
+    // The first line starts where the drag did, not at the key.
+    expect(lines[0]).toBe(rowText(1).slice(4));
+    expect(lines[0]).not.toBe(rowText(1));
+    // The last line stops where the drag did, not at the end of the value.
+    expect(lines[2]).toBe(rowText(3).slice(0, 4));
+    getSelection.mockRestore();
+  });
+
+  it('keeps whole lines, indentation included, when the ends are not partial', () => {
+    const view = openJsonView();
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    fireEvent.mouseDown(view);
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: view.querySelector('[data-json-line="0"]'),
+      anchorOffset: 0,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+      focusOffset: 0,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: view.querySelector('[data-json-line="3"]'),
+      anchorOffset: 0,
+      focusNode: view.querySelector('[data-json-line="3"]'),
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    const lines = setData.mock.calls[0][1].split('\n');
+    // Nested rows keep the indent that a whole-line copy should carry.
+    expect(lines[1].startsWith('  ')).toBe(true);
+    getSelection.mockRestore();
+  });
+});
+
+// #322 review: a selection boundary can land on an ELEMENT, in which case its
+// offset counts child nodes rather than characters — clicking in the padding
+// right of a row's text does exactly that. Hand-counting text nodes had to
+// guess there, and chose either the start or the end of the line.
+describe('DataGrid — element selection boundaries (#322 review)', () => {
+  const openJsonView = () => {
+    render(<DataGrid documents={[{ _id: 1, name: 'Alice', city: 'Paris', n: 2 }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  it('measures a boundary that sits past a row\'s last child', () => {
+    const view = openJsonView();
+    const rowText = (i: number) =>
+      view.querySelector(`[data-json-line="${i}"]`)!.textContent ?? '';
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    const startRow = view.querySelector('[data-json-line="1"]')!;
+    const endRow = view.querySelector('[data-json-line="3"]')!;
+
+    fireEvent.mouseDown(view);
+    // Both ends land on the row elements, offset counting children: 0 children
+    // in at the start, every child in at the end — i.e. the whole of row 3.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: startRow,
+      anchorOffset: 0,
+      focusNode: endRow,
+      focusOffset: endRow.childNodes.length,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Row 1 scrolls away, so the rebuild takes over.
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: endRow,
+      anchorOffset: 0,
+      focusNode: endRow,
+      focusOffset: 0,
+    } as unknown as Selection);
+
+    const setData = vi.fn();
+    fireEvent.copy(view, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+
+    // The end boundary is past every child of row 3, so that line is whole —
+    // previously the "descendant element" branch was the only one that gave a
+    // non-zero offset, and a boundary on the row itself collapsed to 0, which
+    // truncated the last line to nothing.
+    expect(lines).toHaveLength(3);
+    expect(lines[2].trim()).toBe(rowText(3));
+    getSelection.mockRestore();
+  });
+});
+// #320: a select-all puts its endpoints on <body>, outside the view, so no row
+// resolved, nothing was tracked, and the copy fell through to the browser —
+// which holds only the mounted rows. Same silent truncation as #311, on the
+// more natural way to copy a whole result set.
+describe('DataGrid — select-all copies every row (#320)', () => {
+  beforeEach(() => resetResultsFindShortcutForTests());
+
+  /**
+   * Select a pane the way a user does: a pointer press inside it.
+   *
+   * Deliberately on a toolbar control rather than on the rows, because that is
+   * the case the old code got wrong. Ownership was recorded from a `mousedown`
+   * on the JSON body alone, so clicking a pane's toolbar — switching it to JSON
+   * is itself such a click — selected that pane for every other purpose while a
+   * copy still went to the pane before it (#330 review).
+   */
+  const selectPane = (container: HTMLElement) => {
+    fireEvent.pointerDown(within(container).getAllByRole('button')[0]);
+  };
+
+  const manyDocs = Array.from({ length: 40 }, (_, i) => ({ _id: i, name: `n${i}` }));
+
+  const openJsonView = () => {
+    render(<DataGrid documents={manyDocs} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+    return screen.getByTestId('json-view');
+  };
+
+  /** A selection whose range encloses the whole document, as Cmd+A produces. */
+  const selectAll = () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.body);
+    return {
+      isCollapsed: false,
+      anchorNode: document.body,
+      anchorOffset: 0,
+      focusNode: document.body,
+      focusOffset: document.body.childNodes.length,
+      rangeCount: 1,
+      getRangeAt: () => range,
+    } as unknown as Selection;
+  };
+
+  // #328 root cause: the app sets `user-select: none` on `body`, and under that
+  // Chromium paints a select-all across the rows while reporting the selection
+  // to script as collapsed and empty. The browser had nothing to copy and
+  // neither did the rebuild, so the clipboard was left untouched.
+  //
+  // These use the real Selection API rather than a mocked one. That is the
+  // point: every earlier test mocked `getSelection()` to return a non-collapsed
+  // range over `document.body` — precisely the state the browser does not
+  // produce — so they passed while the app did nothing at all.
+  describe('the select-all shortcut makes a selection the page can see (#328)', () => {
+    const pressSelectAll = (target: EventTarget) => {
+      const event = new KeyboardEvent('keydown', {
+        key: 'a',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      target.dispatchEvent(event);
+      return event;
+    };
+
+    it('claims the key and selects the view, leaving a real range behind', () => {
+      const view = openJsonView();
+      document.getSelection()?.removeAllRanges();
+
+      const event = pressSelectAll(view);
+
+      expect(event.defaultPrevented).toBe(true);
+      const selection = document.getSelection()!;
+      expect(selection.rangeCount).toBe(1);
+      expect(selection.isCollapsed).toBe(false);
+      expect(view.contains(selection.anchorNode)).toBe(true);
+      expect(view.contains(selection.focusNode)).toBe(true);
+    });
+
+    it('rebuilds every row from that selection, including unmounted ones', () => {
+      const view = openJsonView();
+      const mounted = view.querySelectorAll('[data-json-line]').length;
+      document.getSelection()?.removeAllRanges();
+
+      pressSelectAll(view);
+      document.dispatchEvent(new Event('selectionchange'));
+
+      const setData = vi.fn();
+      fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+      expect(setData).toHaveBeenCalledTimes(1);
+      const lines = setData.mock.calls[0][1].split('\n');
+      expect(lines.length).toBeGreaterThan(mounted);
+      expect(lines[0]).toBe('{');
+    });
+
+    it('leaves the key to a text field or an editor', () => {
+      // Cmd/Ctrl+A in a query editor means "select this query". A pane that
+      // took it would be answering for something it does not own.
+      openJsonView();
+      const input = document.body.appendChild(document.createElement('input'));
+      expect(pressSelectAll(input).defaultPrevented).toBe(false);
+
+      const editor = document.body.appendChild(document.createElement('div'));
+      editor.className = 'monaco-editor';
+      const inner = editor.appendChild(document.createElement('span'));
+      expect(pressSelectAll(inner).defaultPrevented).toBe(false);
+    });
+
+    it('leaves the key to the results find bar, which is a text field like any other', () => {
+      // The find shortcut deliberately treats its own input as NOT an editor, so
+      // Ctrl+F with the caret already in it means 'search here again'. That
+      // exception is find's alone: select-all in that input means select the
+      // search text, and taking it would leave the user unable to (#328 review).
+      //
+      // The bar is mounted INSIDE the pane, where it really lives. Outside it the
+      // pane declines on ownership instead, and the test would pass without ever
+      // reaching the predicate it is about.
+      const container = document.body.appendChild(document.createElement('div'));
+      render(<DataGrid documents={manyDocs} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      const bar = container.firstElementChild!.appendChild(document.createElement('div'));
+      bar.setAttribute('data-results-find-input', '');
+      const input = bar.appendChild(document.createElement('input'));
+
+      expect(pressSelectAll(input).defaultPrevented).toBe(false);
+    });
+
+    it('leaves the key to a non-editor element in another part of the app', () => {
+      // A focused control elsewhere — a sidebar row, a button — is not nothing in
+      // particular, so the pane must not answer for it just because it was the
+      // last one pointed at. Reading focus alone let a single pane claim
+      // Ctrl/Cmd+A for the whole window (#328 review).
+      const view = openJsonView();
+      selectPane(view.closest('div')!.parentElement ?? view);
+      const elsewhere = document.body.appendChild(document.createElement('div'));
+      elsewhere.tabIndex = 0;
+      document.getSelection()?.removeAllRanges();
+
+      const event = pressSelectAll(elsewhere);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(document.getSelection()?.rangeCount ?? 0).toBe(0);
+    });
+
+
+    it('lets go of the key once the user clicks away from the pane', () => {
+      // The case the app showed and the test above missed. Most of the app is
+      // not focusable: clicking a sidebar row moves focus nowhere, so the next
+      // keypress targets <body> and reads as "from nothing in particular" —
+      // which the last-pointed fallback then answered with a pane the user had
+      // already left, selecting results they were not looking at (#328 review).
+      //
+      // The earlier test dispatched on a focusable element, so it took the
+      // target-is-in-another-region branch and never reached this one.
+      const container = document.body.appendChild(document.createElement('div'));
+      render(<DataGrid documents={manyDocs} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      selectPane(container);
+
+      const elsewhere = document.body.appendChild(document.createElement('div'));
+      fireEvent.pointerDown(elsewhere);
+      document.getSelection()?.removeAllRanges();
+
+      // Focus went nowhere, so the key arrives at the body.
+      const event = pressSelectAll(document.body);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(document.getSelection()?.rangeCount ?? 0).toBe(0);
+    });
+
+
+    it('leaves the key to whichever pane the user is working in', () => {
+      const mount = (docs: unknown[]) => {
+        const container = document.body.appendChild(document.createElement('div'));
+        render(<DataGrid documents={docs as any} />, { container });
+        fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+        return { container, view: within(container).getByTestId('json-view') };
+      };
+      const left = mount(manyDocs);
+      const right = mount(manyDocs);
+      // The user selects the right-hand pane.
+      selectPane(right.container);
+      document.getSelection()?.removeAllRanges();
+
+      // The key arrives at the document, not at either view.
+      pressSelectAll(document.body);
+
+      const selection = document.getSelection()!;
+      expect(selection.rangeCount).toBe(1);
+      expect(right.view.contains(selection.anchorNode)).toBe(true);
+      expect(left.view.contains(selection.anchorNode)).toBe(false);
+    });
+  });
+
+
+  it('rebuilds every line, not just the mounted ones', () => {
+    const view = openJsonView();
+    const mounted = view.querySelectorAll('[data-json-line]').length;
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    // Dispatched on <body>, because that is where the browser dispatches it.
+    // A copy event targets the element holding the selection's focus, and this
+    // selection's focus is <body> — an ancestor of the React root, so a
+    // handler on the view is never reached and nothing was copied at all
+    // (#328). Aiming this at `view` instead is what let the bug ship: it
+    // proved the rebuild works while stepping over the delivery it depends on.
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    const lines = setData.mock.calls[0][1].split('\n');
+    // 40 documents is far more than a screenful, so this only passes if the
+    // rebuild reached rows the DOM never held.
+    expect(lines.length).toBeGreaterThan(mounted);
+    expect(lines[0]).toBe('{');
+    getSelection.mockRestore();
+  });
+
+  /** Two DataGrids side by side, each in its own container, as a split shows them. */
+  const openTwoJsonPanes = () => {
+    const mount = (docs: unknown[]) => {
+      const container = document.body.appendChild(document.createElement('div'));
+      const result = render(<DataGrid documents={docs as any} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      return { result, container, view: within(container).getByTestId('json-view') };
+    };
+    // Both panes hold more than a screenful, so both need the rebuild — with a
+    // pane small enough to be fully mounted, the grid rightly stands aside and
+    // lets the browser copy, which would prove nothing about ownership.
+    const rightDocs = Array.from({ length: 40 }, (_, i) => ({ _id: i, name: `only-in-right-${i}` }));
+    return { left: mount(manyDocs), right: mount(rightDocs) };
+  };
+
+  it('has exactly one of two open JSON panes answer a select-all', () => {
+    // #330 review: a split workspace shows two JSON views, each listening on the
+    // document because that is where a select-all is dispatched. Both saw the
+    // enclosing selection, both wrote to the clipboard, and the second silently
+    // replaced the first — so Cmd+C copied whichever grid mounted last rather
+    // than the pane the user was working in.
+    const { right } = openTwoJsonPanes();
+
+    // The user is working in the right-hand pane.
+    selectPane(right.container);
+
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    // One writer, and it is the pane that was clicked — not the last to mount.
+    expect(setData).toHaveBeenCalledTimes(1);
+    expect(setData.mock.calls[0][1]).toContain('only-in-right-0');
+    getSelection.mockRestore();
+  });
+
+  it('rebuilds for the owning pane even when every row is mounted', () => {
+    // #330 review: with both panes small enough to be fully mounted, the owner
+    // took the "let the browser do it" path — and the browser serializes the
+    // whole enclosing selection, so the copy came back with both panes' text.
+    // Standing aside only makes sense when the selection lives inside the view;
+    // an enclosing one covers the page.
+    //
+    // The earlier split tests used 40 documents each, which forced the rebuild
+    // and stepped straight over this path.
+    const mount = (docs: unknown[]) => {
+      const container = document.body.appendChild(document.createElement('div'));
+      const result = render(<DataGrid documents={docs as any} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      return { result, container, view: within(container).getByTestId('json-view') };
+    };
+    const left = mount([{ _id: 'left-doc' }]);
+    const right = mount([{ _id: 'right-doc' }]);
+    // Precondition: both panes really are fully mounted, or this proves nothing.
+    expect(left.view.querySelectorAll('[data-json-line]').length).toBeGreaterThan(0);
+    expect(right.view.querySelectorAll('[data-json-line]').length).toBeGreaterThan(0);
+
+    selectPane(right.container);
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    const copied = setData.mock.calls[0][1];
+    expect(copied).toContain('right-doc');
+    expect(copied).not.toContain('left-doc');
+    getSelection.mockRestore();
+  });
+
+
+  it('leaves a copy alone when the user is in a pane showing explain', () => {
+    // #330 review: registration used to be scoped to the results tab, so a pane
+    // showing explain vanished from the registry. Clicking it selected no pane,
+    // the fallback handed ownership to the other, still-registered pane, and a
+    // select-all over the explain output came back as that pane's rows instead.
+    const mountJson = () => {
+      const container = document.body.appendChild(document.createElement('div'));
+      render(<DataGrid documents={manyDocs} />, { container });
+      fireEvent.click(within(container).getByRole('button', { name: /json/i }));
+      return container;
+    };
+    const mountExplain = () => {
+      const container = document.body.appendChild(document.createElement('div'));
+      render(
+        <DataGrid documents={[{ _id: 1 }]} explainResult='{"queryPlanner": {}}' />,
+        { container }
+      );
+      fireEvent.click(within(container).getByRole('button', { name: /explain/i }));
+      return container;
+    };
+    mountJson();
+    const explainPane = mountExplain();
+
+    // The user is working in the explain pane.
+    selectPane(explainPane);
+
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    // Nobody rewrites the clipboard: the browser copies the explain text the
+    // user actually selected.
+    expect(setData).not.toHaveBeenCalled();
+    getSelection.mockRestore();
+  });
+
+
+  it('lets the surviving pane answer once the other one closes', () => {
+    // The pane holding ownership can be closed. It will never answer again, and
+    // the one still on screen must not go on deferring to it (#330 review).
+    const { right } = openTwoJsonPanes();
+    selectPane(right.container);
+    right.result.unmount();
+
+    const getSelection = vi.spyOn(document, 'getSelection');
+    getSelection.mockReturnValue(selectAll());
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(document.body, { clipboardData: { setData, getData: () => '' } });
+
+    expect(setData).toHaveBeenCalledTimes(1);
+    expect(setData.mock.calls[0][1]).not.toContain('only-in-right-0');
+    getSelection.mockRestore();
+  });
+  it('ignores a selection that does not enclose the view', () => {
+    // The trap in the obvious fix: treating any unresolvable endpoint as the
+    // view's bounds would claim rows for selections living elsewhere in the UI.
+    // Listening on the document makes this the load-bearing case rather than a
+    // hypothetical one — every copy in the app now reaches this handler, so a
+    // copy from the query editor has to leave with the text it selected.
+    // Rendered, and deliberately not referenced again: the point is that the
+    // view is listening and still declines this copy.
+    openJsonView();
+    const elsewhere = document.createElement('div');
+    elsewhere.textContent = 'unrelated';
+    document.body.appendChild(elsewhere);
+    const range = document.createRange();
+    range.selectNodeContents(elsewhere);
+    const getSelection = vi.spyOn(document, 'getSelection');
+
+    getSelection.mockReturnValue({
+      isCollapsed: false,
+      anchorNode: elsewhere,
+      anchorOffset: 0,
+      focusNode: elsewhere,
+      focusOffset: 1,
+      rangeCount: 1,
+      getRangeAt: () => range,
+    } as unknown as Selection);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const setData = vi.fn();
+    fireEvent.copy(elsewhere, { clipboardData: { setData, getData: () => '' } });
+    expect(setData).not.toHaveBeenCalled();
+
+    elsewhere.remove();
+    getSelection.mockRestore();
+  });
+});
+
+// #329: the row's copy/edit/delete buttons sit inside its selectable text so
+// they stay next to the document they act on. They hold no text, so a copy that
+// ran over them serialised each one as an empty block and every document
+// arrived with three blank lines under its opening brace. jsdom does not
+// serialise a selection, so what is pinned here is the arrangement that decides
+// it: the controls opt out of selection, and nothing forces them back in.
+describe('DataGrid — row actions stay out of copied text (#329)', () => {
+  it('marks the row actions unselectable and leaves the text selectable', () => {
+    render(<DataGrid documents={mockDocuments} onEditDocument={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /json/i }));
+
+    const actions = screen.getAllByTestId('edit-doc-btn')[0].closest('span');
+    expect(actions).not.toBeNull();
+    expect(actions!.className).toContain('select-none');
+
+    // The text they live in still selects — the fix must not cost the view the
+    // selection it exists to allow, since `body` sets `user-select: none` for
+    // the whole app and this span is what opts back in.
+    const text = actions!.parentElement!;
+    expect(text.className).toContain('select-text');
+    // And it must not re-enable selection for its descendants wholesale: that
+    // blanket rule outranked the controls' `select-none` and was the bug.
+    expect(text.className).not.toContain('[&_*]:select-text');
+  });
+});
+
+// #281: after one visit to Explain, every subsequent run reopened it — the
+// Results tab had to be clicked again each time. The grid remounts on every run
+// (the pane renders `{loading ? <spinner/> : <DataGrid/>}`), a plan is not
+// cleared when a query re-runs, and the explain auto-switch had no mount guard,
+// so it fired on each remount while the results effect was already guarded.
+describe('DataGrid — the explain tab does not hijack later runs (#281)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  it('stays on results when the grid remounts with an existing plan', () => {
+    const { unmount } = render(
+      <DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />
+    );
+    unmount();
+    // The remount a re-run causes, with the plan still hanging around.
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />);
+    expect(screen.getByTestId('json-view')).toBeInTheDocument();
+  });
+
+  it('still opens explain when a plan actually arrives', () => {
+    // The guard must not cost the behaviour it guards: a plan showing up after
+    // mount is a real event and should switch.
+    const onActiveTabChange = vi.fn();
+    const { rerender } = render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={null}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    rerender(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+
+  it('reports the tab the user picks so it can outlive the grid', () => {
+    const onActiveTabChange = vi.fn();
+    render(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /explain/i }));
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+});
+
+// #325 review: the tab now outlives the loading remount, so a run started from
+// Explain would have kept showing the plan and hidden its own results — the
+// documents effect deliberately skips mount, so nothing would correct it.
+describe('DataGrid — a run started from Explain shows its results (#325 review)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  it('shows rows when the caller resets the tab for a run', () => {
+    // Sitting on Explain.
+    const { unmount } = render(
+      <DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />
+    );
+    expect(screen.getByTestId('explain-panel')).toBeInTheDocument();
+    // A run: the grid unmounts while loading, and App resets the tab because
+    // the user asked for rows.
+    unmount();
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="results" />);
+    expect(screen.getByTestId('json-view')).toBeInTheDocument();
+  });
+
+  it('would hide them if the caller kept the tab on explain', () => {
+    // Pins why the App-side reset is required rather than optional: the grid
+    // honours the tab it is given, and nothing here switches back.
+    render(<DataGrid documents={mockDocuments} explainResult={plan} activeTab="explain" />);
+    expect(screen.queryByTestId('json-view')).not.toBeInTheDocument();
+  });
+});
+
+// #325 review: StrictMode runs every effect twice on mount, and a one-shot
+// guard is spent by the first setup — so the replayed setup saw an already-gone
+// guard and fired anyway. The app mounts under StrictMode in development, so
+// the bug was fully back there.
+//
+// These assert on `onActiveTabChange` rather than on what is rendered. With a
+// controlled tab the rendered panel is unaffected by a stray switch — the
+// controlled prop still wins that render — so the damage travels out through
+// the callback, which is what the caller persists and hands back next time.
+describe('DataGrid — tab guards survive StrictMode replay (#325 review)', () => {
+  const plan = JSON.stringify({ queryPlanner: { winningPlan: { stage: 'COLLSCAN' } } });
+
+  const renderStrict = (ui: React.ReactElement) =>
+    render(<React.StrictMode>{ui}</React.StrictMode>);
+
+  it('does not announce an explain switch when it merely remounts', () => {
+    const onActiveTabChange = vi.fn();
+    renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).not.toHaveBeenCalledWith('explain');
+  });
+
+  it('does not announce a results switch either', () => {
+    // The documents guard had the same shape, so its replay could have pushed
+    // the tab the other way and lost a deliberate Explain selection.
+    const onActiveTabChange = vi.fn();
+    renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={plan}
+        activeTab="explain"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    expect(onActiveTabChange).not.toHaveBeenCalledWith('results');
+  });
+
+  it('still opens explain when a plan genuinely arrives', () => {
+    const onActiveTabChange = vi.fn();
+    const { rerender } = renderStrict(
+      <DataGrid
+        documents={mockDocuments}
+        explainResult={null}
+        activeTab="results"
+        onActiveTabChange={onActiveTabChange}
+      />
+    );
+    rerender(
+      <React.StrictMode>
+        <DataGrid
+          documents={mockDocuments}
+          explainResult={plan}
+          activeTab="results"
+          onActiveTabChange={onActiveTabChange}
+        />
+      </React.StrictMode>
+    );
+    expect(onActiveTabChange).toHaveBeenCalledWith('explain');
+  });
+});
+
+describe('DataGrid — stays mounted across a run (#344)', () => {
+  const docs = () => [{ _id: '1', name: 'Alice Smith', address: { city: 'Oslo' } }];
+  const firstFold = () => screen.getAllByTestId('json-fold-btn')[0];
+
+  it('keeps a fold collapsed across a run that returns the same documents', () => {
+    // Re-running a query gives a fresh array of the same result. The fold ids
+    // are positional, and the positions have not moved.
+    const { rerender } = render(<DataGrid documents={docs()} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={docs()} loading />);
+    rerender(<DataGrid documents={docs()} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+  });
+
+  it('resets folds when a different result set arrives', () => {
+    const { rerender } = render(<DataGrid documents={docs()} />);
+    fireEvent.click(firstFold());
+
+    rerender(<DataGrid documents={[{ _id: '2', name: 'Bob', address: { city: 'Rome' } }]} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('resets folds for a result with the same ids and block count but a different structure', () => {
+    // Aggregation output may carry no _id at all; the structure of the folds
+    // is what tells one such result from another.
+    const { rerender } = render(<DataGrid documents={[{ _id: null, a: { x: 1 } }]} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={[{ _id: null, b: { y: 1 } }]} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('keeps the scroll position across a refresh, and starts a new page at its first row', () => {
+    const page = (from: number) =>
+      Array.from({ length: 40 }, (_, i) => ({ _id: String(from + i), name: `doc ${from + i}` }));
+    const { rerender } = render(<DataGrid documents={page(0)} />);
+    const list = within(screen.getByTestId('json-view')).getByRole('list');
+    // jsdom lays nothing out and scrolls nothing; record what the list is told.
+    Object.defineProperty(list, 'scrollTo', {
+      configurable: true,
+      value: ({ top }: { top: number }) => {
+        list.scrollTop = top;
+      },
+    });
+    list.scrollTop = 300;
+
+    // The same result again: the user's place is kept.
+    rerender(<DataGrid documents={page(0)} />);
+    expect(list.scrollTop).toBe(300);
+
+    // The next page: it starts at its first row.
+    rerender(<DataGrid documents={page(40)} />);
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it('starts the next page at its first row even when a projection hides every _id', () => {
+    // Projected out, the ids say nothing; the page asked for does.
+    const page = (skip: number) =>
+      Array.from({ length: 40 }, (_, i) => ({ name: `doc ${skip + i}` }));
+    const { rerender } = render(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    const list = within(screen.getByTestId('json-view')).getByRole('list');
+    Object.defineProperty(list, 'scrollTo', {
+      configurable: true,
+      value: ({ top }: { top: number }) => {
+        list.scrollTop = top;
+      },
+    });
+    list.scrollTop = 300;
+
+    rerender(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    expect(list.scrollTop).toBe(300);
+
+    rerender(<DataGrid documents={page(40)} skip={40} limit={40} />);
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it('keeps tree folds across a run that returns the same documents', () => {
+    const nested = () => [{ _id: '1', g: { a: { akey: 'one' } } }];
+    const foldState = (keyName: string): 'open' | 'closed' => {
+      const row = screen.getByTitle(keyName).closest('[data-doc-even]');
+      const button = row?.querySelector('[data-testid="tree-fold-btn"]');
+      const label = button?.getAttribute('aria-label') ?? '';
+      if (/expand/i.test(label)) return 'closed';
+      if (/collapse/i.test(label)) return 'open';
+      throw new Error(`no fold for ${keyName}: ${label}`);
+    };
+    const { rerender } = render(<DataGrid documents={nested()} />);
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+    // Depth >= 2 starts collapsed; the user opens it.
+    expect(foldState('a')).toBe('closed');
+    fireEvent.click(screen.getByTitle('a').closest('[data-doc-even]')!.querySelector('[data-testid="tree-fold-btn"]')!);
+    expect(foldState('a')).toBe('open');
+
+    rerender(<DataGrid documents={nested()} loading />);
+    rerender(<DataGrid documents={nested()} />);
+    expect(foldState('a')).toBe('open');
+
+    // A different result: back to the defaults.
+    rerender(<DataGrid documents={[{ _id: '2', g: { a: { akey: 'two' } } }]} />);
+    expect(foldState('a')).toBe('closed');
+  });
+
+  it('resets folds when an empty container shifts every fold id', () => {
+    // An empty object is not foldable in the JSON view, so it was left out of
+    // the identity — but the tree walker still gives it a fold id, and every
+    // id after it moves. Folds kept over that shift would point at other nodes.
+    const before = [{ _id: '1', g: { a: { akey: 'one' } } }];
+    const after = [{ _id: '1', g: { empty: {}, a: { akey: 'one' } } }];
+    const { rerender } = render(<DataGrid documents={before} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={after} />);
+
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('puts the grid out of reach while a run is in flight', () => {
+    // The overlay stops the pointer; the inert attribute stops the keyboard, so a stale
+    // row cannot be acted on by tabbing to its buttons.
+    const { container, rerender } = render(<DataGrid documents={docs()} />);
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.hasAttribute('inert')).toBe(false);
+
+    rerender(<DataGrid documents={docs()} loading />);
+    expect(root.hasAttribute('inert')).toBe(true);
+
+    rerender(<DataGrid documents={docs()} />);
+    expect(root.hasAttribute('inert')).toBe(false);
+  });
+
+  it('closes an open context menu when a run starts', () => {
+    // It is portaled out of the grid, above the overlay, so covering it is
+    // not enough — its actions would still run against the stale result.
+    const { rerender } = render(<DataGrid documents={docs()} onDeleteDocument={() => {}} />);
+    const line = screen.getByTestId('json-view').querySelector('[data-json-line]') as HTMLElement;
+    fireEvent.contextMenu(line, { clientX: 10, clientY: 10 });
+    expect(screen.getByTestId('context-menu')).toBeInTheDocument();
+
+    rerender(<DataGrid documents={docs()} onDeleteDocument={() => {}} loading />);
+
+    expect(screen.queryByTestId('context-menu')).toBeNull();
+  });
+
+  it('does not let a field name impersonate the result-identity delimiters', () => {
+    // Under an unescaped `/`-joined-then-`\u0001`-joined key, a single fold
+    // path could look like two, colliding two different structures. The key
+    // `x\u0001open/0/2/y` is exactly such a forgery of two nested paths.
+    const nested = [{ _id: '1', x: { y: { n: 1 } } }];
+    const crafted = [{ _id: '1', ['x\u0001open/0/2/y']: { n: 1 } }];
+    const { rerender } = render(<DataGrid documents={nested} />);
+    fireEvent.click(firstFold());
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/expand/i));
+
+    rerender(<DataGrid documents={crafted} />);
+
+    // Different structure, so the identity changed and folds reset to default.
+    expect(firstFold()).toHaveAttribute('aria-label', expect.stringMatching(/collapse/i));
+  });
+
+  it('opens a different result at the left edge, but keeps the scroll on a refresh', () => {
+    // scrollToRow only resets the vertical axis; a wide result left scrolled
+    // right would otherwise open with its first fields off-screen.
+    const page = (from: number) =>
+      Array.from({ length: 40 }, (_, i) => ({ _id: String(from + i), name: `doc ${from + i}` }));
+    const { rerender } = render(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    // The real horizontal scroller is the overflow-auto wrapper, not the list.
+    const scroller = screen.getByTestId('json-scroll');
+    scroller.scrollLeft = 120;
+
+    // Same result: the user's place is kept.
+    rerender(<DataGrid documents={page(0)} skip={0} limit={40} />);
+    expect(scroller.scrollLeft).toBe(120);
+
+    // A different page: back to the left edge.
+    rerender(<DataGrid documents={page(40)} skip={40} limit={40} />);
+    expect(scroller.scrollLeft).toBe(0);
+  });
+
+  it('announces a run in flight outside the inert subtree, so a screen reader hears it', () => {
+    // inert removes its whole subtree from the accessibility tree, so a status
+    // inside the inert root would be silent. It has to sit outside.
+    const { container, rerender } = render(<DataGrid documents={docs()} />);
+    expect(screen.queryByRole('status')).toBeNull();
+
+    rerender(<DataGrid documents={docs()} loading />);
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent(/\S/);
+    const paneRoot = container.querySelector('[aria-busy]') as HTMLElement;
+    expect(paneRoot.hasAttribute('inert')).toBe(true);
+    expect(paneRoot.contains(status)).toBe(false);
+  });
+
+  it('shows a run in flight over the previous results, not in their place', () => {
+    const { rerender } = render(<DataGrid documents={docs()} />);
+    expect(screen.queryByTestId('results-loading')).toBeNull();
+
+    rerender(<DataGrid documents={docs()} loading />);
+    expect(screen.getByTestId('results-loading')).toBeInTheDocument();
+    expect(screen.getByText(/"Alice Smith"/)).toBeInTheDocument();
+
+    rerender(<DataGrid documents={docs()} />);
+    expect(screen.queryByTestId('results-loading')).toBeNull();
+  });
+});
+
+describe('DataGrid — a hidden tab does not answer the clipboard (#240)', () => {
+  const view = (visible: boolean) => (
+    <TabVisibleContext.Provider value={visible}>
+      <DataGrid documents={mockDocuments} />
+    </TabVisibleContext.Provider>
+  );
+
+  const pressSelectAll = (target: EventTarget) => {
+    const event = new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true, cancelable: true });
+    target.dispatchEvent(event);
+    return event;
+  };
+
+  it('leaves select-all alone once its tab is hidden', () => {
+    // The grid stays mounted (#240), so without this it would still claim the
+    // key pressed in the tab the user switched to.
+    const { rerender } = render(view(true));
+    const json = screen.getByTestId('json-view');
+    document.getSelection()?.removeAllRanges();
+    expect(pressSelectAll(json).defaultPrevented).toBe(true);
+
+    rerender(view(false));
+    expect(pressSelectAll(json).defaultPrevented).toBe(false);
+  });
+
+  it('leaves a copy alone once its tab is hidden', () => {
+    const { rerender } = render(view(true));
+    const json = screen.getByTestId('json-view');
+    document.getSelection()?.removeAllRanges();
+    pressSelectAll(json);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const shown = vi.fn();
+    fireEvent.copy(json, { clipboardData: { setData: shown, getData: () => '' } });
+    expect(shown).toHaveBeenCalled();
+
+    rerender(view(false));
+    const hidden = vi.fn();
+    fireEvent.copy(json, { clipboardData: { setData: hidden, getData: () => '' } });
+    expect(hidden).not.toHaveBeenCalled();
   });
 });

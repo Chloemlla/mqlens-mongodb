@@ -65,6 +65,7 @@ export interface PersistedTab {
   lastQuery?: unknown;
   lastAggregate?: unknown;
   builderState?: unknown;
+  documentEdit?: unknown;
 }
 
 export interface PersistedWindow {
@@ -92,6 +93,27 @@ export interface PersistableTab {
   indexName?: string;
   lastQuery?: unknown;
   lastAggregate?: unknown;
+  documentEdit?: unknown;
+}
+
+/** The part of an in-progress document edit that travels with its tab.
+ *
+ *  A tab moved to another window is rebuilt there from the persisted model, so
+ *  an edit that is not in the model is an edit the move throws away — the text
+ *  the user had typed and not yet saved (#326 review).
+ *
+ *  What is left behind is deliberate. `saving` belongs to the window that made
+ *  the request: it will settle there, and an arriving tab that claimed a save
+ *  was in flight would disable Save with nothing left to finish it. `error` is
+ *  the outcome of a request the destination never made, and stale by the time
+ *  it lands. The text is the part worth keeping.
+ */
+export function carriedDocumentEdit(edit: unknown): unknown {
+  if (!edit || typeof edit !== 'object') return undefined;
+  const { id, mode, initialJson, targetDoc, draft } = edit as Record<string, unknown>;
+  // `id` travels so the arriving edit keeps the identity its completions are
+  // matched against; the rest is the text itself.
+  return { id, mode, initialJson, targetDoc: targetDoc ?? null, draft };
 }
 
 export interface PersistableConnection {
@@ -116,6 +138,7 @@ export interface RestoredTab {
   explainResult: string | null;
   lastQuery?: unknown;
   lastAggregate?: unknown;
+  documentEdit?: unknown;
 }
 
 // export/import tabs reference in-flight task state that no longer exists
@@ -190,6 +213,7 @@ export function toPersistedTab(
       lastQuery: tab.lastQuery,
       lastAggregate: tab.lastAggregate,
       builderState,
+      documentEdit: carriedDocumentEdit(tab.documentEdit),
     };
   }
 
@@ -207,6 +231,7 @@ export function toPersistedTab(
     lastQuery: tab.lastQuery,
     lastAggregate: tab.lastAggregate,
     builderState,
+    documentEdit: carriedDocumentEdit(tab.documentEdit),
   };
 }
 
@@ -259,6 +284,11 @@ export function toDisconnectedSnapshot(
     explainResult: null,
     lastQuery: t.lastQuery,
     lastAggregate: t.lastAggregate,
+    // The other way a tab reaches a new window. "Detach to New Window" boots
+    // the destination renderer through `workspace_get` and this function, not
+    // through `materializeArrivingTab` — so leaving it out here discarded the
+    // draft on exactly the path the transfer was added for (#326 review).
+    documentEdit: t.documentEdit,
   }));
 
   const builderStates = new Map<string, unknown>();
@@ -315,6 +345,9 @@ export function materializeArrivingTab(
       explainResult: null,
       lastQuery: tab.lastQuery,
       lastAggregate: tab.lastAggregate,
+      // Carried through so a moved tab arrives with the text the user was
+      // typing rather than an empty dialog (#326 review).
+      documentEdit: tab.documentEdit,
     },
   };
 }

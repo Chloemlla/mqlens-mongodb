@@ -4,13 +4,14 @@ use serde_json;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 pub mod limits;
 pub mod ai;
+pub mod ai_providers;
 pub mod audit;
 #[cfg(test)]
 mod command_coverage;
@@ -26,6 +27,7 @@ pub mod monitoring;
 pub mod path_env;
 pub mod queries;
 pub mod ssh_tunnel;
+mod namespace_guard;
 mod state;
 pub mod toolsetup;
 pub mod updater;
@@ -191,6 +193,11 @@ pub struct MongoshSession {
     output: AsyncMutex<mpsc::UnboundedReceiver<MongoshLine>>,
     child: AsyncMutex<Child>,
     command_lock: AsyncMutex<()>,
+    /// The markers of the command before this one. A line ending in one of
+    /// them is that command's echo arriving late — after its caller gave up
+    /// on it — and not this command's output. Matched exactly: a script that
+    /// prints something merely resembling a marker is printing output.
+    stale_markers: AsyncMutex<Vec<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -325,6 +332,92 @@ pub struct MongoshSessionInfo {
     pub stderr: Vec<String>,
 }
 
+/// Prefix of every completion marker this process has ever printed into a
+/// session. Any line carrying it that is not the marker being waited for was
+/// left behind by an earlier command and must not be shown as output.
+const MONGOSH_MARKER_PREFIX: &str = "__MQLENS_DONE_";
+
+/// Is this newline-less tail mongosh's prompt?
+///
+/// Asked only of a chunk's tail — bytes with no newline after them. That is
+/// the framing that identifies a prompt: mongosh writes it and then waits for
+/// input on the same line, so it is the one thing the process writes without
+/// a newline. A script's output is newline-terminated, so it never ends a
+/// chunk this way except mid-line, and the shape check below is only there to
+/// keep a half-received output line from being taken for a prompt.
+///
+/// Nothing else is ever judged by shape. A complete line is output, whatever
+/// it looks like: `print("ready> ")` and `print("test> hello")` both come
+/// through untouched. And a prompt the OS delivered in the same read as the
+/// output before it is left glued on — rare, cosmetic, and the only safe
+/// choice, since prompt bytes and identical script bytes cannot be told apart
+/// once they share a line. The completion protocol does not need them told
+/// apart: it matches its markers by suffix (see `marker_line_kind`).
+pub(crate) fn tail_is_mongosh_prompt(tail: &str) -> bool {
+    tail == "| " || (tail.len() <= 200 && tail.ends_with("> ") && tail.trim_end() != ">")
+}
+
+/// Take every complete output line out of `buf`.
+///
+/// A line reader on mongosh's stdout was subtly wrong: the REPL writes its
+/// prompt with no newline after it, so a `lines()` reader never saw the prompt
+/// as a line. It sat in the buffer until the NEXT output arrived and was glued
+/// to the front of it — the console showed `test> hello` — and a prompt with
+/// nothing after it, which is exactly what a REPL waiting for input produces,
+/// was never delivered at all.
+///
+/// Whatever is left in `buf` afterwards has no newline yet. It may be a prompt
+/// or the front of an output line the pipe split; `absorb_mongosh_chunk` is
+/// where that is decided, and only once the next bytes say which. `\r\n` is
+/// folded to `\n`; partial UTF-8 stays until the rest of it arrives.
+pub(crate) fn take_mongosh_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(end) = buf.iter().position(|&b| b == b'\n') {
+        let raw: Vec<u8> = buf.drain(..=end).collect();
+        let mut text = String::from_utf8_lossy(&raw[..raw.len() - 1]).into_owned();
+        if text.ends_with('\r') {
+            text.pop();
+        }
+        lines.push(text);
+    }
+    lines
+}
+
+/// Add a chunk from the pipe to `pending` and return the complete lines.
+///
+/// The decision about a prompt-shaped tail is made HERE, on the next chunk,
+/// and not when the tail arrives. `AsyncRead::read` returns whatever the pipe
+/// has, at any boundary; `print("ready> ")` can be delivered as `ready> ` and
+/// then `\n`, and judged on its own the first part is indistinguishable from a
+/// prompt. The next bytes settle it: if they begin with the newline, the tail
+/// was the front of an output line and is kept; if they begin with anything
+/// else, nothing continues a line that way except the REPL writing what comes
+/// after a prompt, so the tail was a prompt and is dropped.
+///
+/// What this cannot tell apart, stated plainly: an output line the pipe split
+/// immediately after a `> ` in the middle of it — `foo> ` then `bar\n`. That
+/// needs a boundary at exactly that point and text following it that is not a
+/// newline; it is strictly narrower than the case above, and there is no
+/// framing that resolves it, because the bytes are identical to a prompt
+/// followed by output. The completion protocol does not depend on either
+/// reading — markers are matched by suffix — so it costs a line of output in
+/// a rare case, never a hang.
+pub(crate) fn absorb_mongosh_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    // A chunk that opens with a line ending — `\n`, or the `\r` of a `\r\n` —
+    // is finishing the pending line, so what is pending was output, however
+    // prompt-shaped. Only output that starts something new proves the pending
+    // text was a prompt.
+    if !matches!(chunk.first(), Some(b'\n') | Some(b'\r')) {
+        if let Ok(tail) = std::str::from_utf8(pending) {
+            if tail_is_mongosh_prompt(tail) {
+                pending.clear();
+            }
+        }
+    }
+    pending.extend_from_slice(chunk);
+    take_mongosh_lines(pending)
+}
+
 fn spawn_mongosh_reader<R>(
     reader: R,
     stream: MongoshStream,
@@ -333,27 +426,63 @@ fn spawn_mongosh_reader<R>(
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = sender.send(MongoshLine {
-                stream: stream.clone(),
-                text: line,
-            });
+        let mut reader = reader;
+        let mut pending = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for text in absorb_mongosh_chunk(&mut pending, &chunk[..read]) {
+                let _ = sender.send(MongoshLine {
+                    stream: stream.clone(),
+                    text,
+                });
+            }
+        }
+        // Whatever the process wrote last without a newline still belongs to
+        // someone — unless it is the prompt the REPL was showing when it died,
+        // which is nobody's output. The channel closing right after is what
+        // tells the reader the session ended.
+        let leftover = String::from_utf8_lossy(&pending).into_owned();
+        if !leftover.is_empty() && !tail_is_mongosh_prompt(&leftover) {
+            let _ = sender.send(MongoshLine { stream, text: leftover });
         }
     });
+}
+
+/// Does this line end in one of the previous command's markers?
+///
+/// Exact markers, matched by suffix — the same rule as for the live ones. A
+/// prefix match would have swallowed any output that happened to contain the
+/// reserved-looking text, `printjson({ status: "__MQLENS_DONE_pending" })`
+/// included; only the two UUID markers an earlier command actually sent can
+/// be its echo arriving late.
+pub(crate) fn is_stale_marker_line(line: &str, stale: &[String]) -> bool {
+    let text = line.trim_end();
+    stale.iter().any(|m| text.ends_with(m.as_str()))
 }
 
 async fn drain_mongosh_output(session: &MongoshSession) -> MongoshCommandOutput {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let stale = session.stale_markers.lock().await.clone();
     let mut output = session.output.lock().await;
 
     loop {
         match tokio::time::timeout(Duration::from_millis(25), output.recv()).await {
-            Ok(Some(line)) => match line.stream {
-                MongoshStream::Stdout => push_mongosh_line(&mut stdout, line.text),
-                MongoshStream::Stderr => push_mongosh_line(&mut stderr, line.text),
-            },
+            Ok(Some(line)) => {
+                // The previous command's markers are not output, here any more
+                // than during a command.
+                if is_stale_marker_line(&line.text, &stale) {
+                    continue;
+                }
+                match line.stream {
+                    MongoshStream::Stdout => push_mongosh_line(&mut stdout, line.text),
+                    MongoshStream::Stderr => push_mongosh_line(&mut stderr, line.text),
+                }
+            }
             _ => break,
         }
     }
@@ -361,64 +490,186 @@ async fn drain_mongosh_output(session: &MongoshSession) -> MongoshCommandOutput 
     MongoshCommandOutput { stdout, stderr }
 }
 
+/// How a command's turn at the REPL ended, read off the marker lines.
+///
+/// The three outcomes are distinguishable only because of what follows the
+/// command on stdin: its own marker, then `.break`, then a second marker.
+/// `.break` is the REPL's own command to abandon a half-typed statement — a
+/// no-op when nothing is open, so it costs nothing on the happy path — and the
+/// second marker prints in every case, which is what makes the first marker's
+/// absence meaningful rather than merely silence.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MongoshCommandEnd {
+    /// The marker printed: the script ran to the end, whatever it printed.
+    Completed,
+    /// The marker never printed and no error mentioned it: an unclosed brace or
+    /// bracket left the REPL reading our marker as more of the script, and
+    /// `.break` threw the whole thing away. Nothing ran.
+    Incomplete,
+    /// The marker was swallowed into a statement that then failed to parse. The
+    /// REPL reported the SyntaxError itself — it just never got to print.
+    SyntaxError,
+}
+
+/// Where a line that carries the marker came from: the REPL echoing the marker
+/// expression we sent, or a SyntaxError code frame quoting our line back.
+///
+/// Matched by suffix, not equality. The marker is unique and nothing but the
+/// REPL's echo of it ever ends a line with it, so whatever precedes it on the
+/// line is a prompt the OS delivered in the same read — `test> __MQLENS_DONE_…__`
+/// — and is irrelevant. This is what keeps completion detection from ever
+/// depending on prompt recognition, which is heuristic and can lag: the very
+/// first prompt of a session can arrive coalesced with the marker of the `use`
+/// that starts it, before anything has been seen at all.
+///
+/// A code frame quoting our line ends with `'`, not the marker:
+///
+///     > 2 | '__MQLENS_DONE_…__'
+///
+/// so it is a different kind. With the marker sent as a bare expression that
+/// is rare — a string is valid inside most open constructs, so the REPL keeps
+/// reading rather than failing — but the REPL can still produce it, and it
+/// means the same thing: our line was swallowed into an unclosed statement.
+pub(crate) fn marker_line_kind(line: &str, marker: &str) -> Option<MongoshCommandEnd> {
+    if !line.contains(marker) {
+        return None;
+    }
+    Some(if line.trim_end().ends_with(marker) {
+        MongoshCommandEnd::Completed
+    } else {
+        MongoshCommandEnd::SyntaxError
+    })
+}
+
 async fn run_mongosh_command_on_session(
     session: &MongoshSession,
     command: &str,
 ) -> Result<MongoshCommandOutput, String> {
     let _command_guard = session.command_lock.lock().await;
-    let marker = format!("__MQLENS_DONE_{}__", Uuid::new_v4().simple());
+    let marker = format!("{MONGOSH_MARKER_PREFIX}{}__", Uuid::new_v4().simple());
+    let recovered = format!("{MONGOSH_MARKER_PREFIX}{}__", Uuid::new_v4().simple());
 
+    // Whatever the previous command left behind is drained before this one
+    // starts; its markers stay known for the rest of this command, in case
+    // its echo arrives later still. Then this command's markers take over.
     let _ = drain_mongosh_output(session).await;
+    let stale = std::mem::replace(
+        &mut *session.stale_markers.lock().await,
+        vec![marker.clone(), recovered.clone()],
+    );
 
+    // Sent as one write, in this order, and the order is the whole mechanism.
+    //
+    // The REPL reads a line at a time and only evaluates once a statement is
+    // complete. Left open — an unclosed `{`, a `find(` with no `)` — it does not
+    // report anything; it reads the next line as more of the same statement,
+    // and the next, our marker included, and waits. Every later command the
+    // user sends lands in that same buffer. That is what a "timeout" looked
+    // like from the outside: twenty seconds of nothing, then an error, then a
+    // shell that no longer answers anything.
+    //
+    // `.break` after the marker is the REPL's own escape from that state. It
+    // sits in the pipe behind every line of the script and the marker, so it
+    // can only ever discard a statement those lines left open — never one that
+    // is merely slow, which is still evaluating and has not read it yet. And
+    // when nothing is open it does nothing at all. The second marker prints
+    // either way; it is the point at which we can say what happened.
+    //
+    // The markers are bare string expressions, not `print(...)` calls. The REPL
+    // echoes the value of every expression statement itself, and that is not
+    // something a script can reach: `print = () => {}` silences `print`, and
+    // would have silenced both markers with it, leaving a command that could
+    // only end by being stopped. The echo of a string is the bare text.
+    let mut script = command.replace("\r\n", "\n");
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+    script.push_str(&format!("'{marker}'\n.break\n'{recovered}'\n"));
     {
         let mut stdin = session.stdin.lock().await;
         stdin
-            .write_all(command.as_bytes())
+            .write_all(script.as_bytes())
             .await
             .map_err(|e| format!("Failed to write to mongosh: {}", e))?;
-        if !command.ends_with('\n') {
-            stdin
-                .write_all(b"\n")
-                .await
-                .map_err(|e| format!("Failed to write to mongosh: {}", e))?;
-        }
-        stdin
-            .write_all(format!("print('{}')\n", marker).as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write command marker to mongosh: {}", e))?;
         stdin
             .flush()
             .await
             .map_err(|e| format!("Failed to flush mongosh stdin: {}", e))?;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // No deadline. A script takes as long as it takes — an index build, an
+    // aggregation over a large collection, a `sleep` — and cutting it off after
+    // a fixed twenty seconds did not stop it: mongosh kept running, and its
+    // output, marker included, arrived during whatever the user ran next. The
+    // wait ends when the REPL says the turn is over, or when the session is
+    // gone, which is how the user stops a command they no longer want.
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut end = MongoshCommandEnd::Incomplete;
     let mut output = session.output.lock().await;
-
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err("mongosh command timed out".to_string());
+        let line = match output.recv().await {
+            Some(line) => line,
+            None => return Err("mongosh session closed".to_string()),
+        };
+        // Suffix, for the same reason `marker_line_kind` uses one: a prompt
+        // delivered in the same read sits in front of it.
+        if line.text.trim_end().ends_with(&recovered) {
+            break;
         }
-
-        match tokio::time::timeout(remaining, output.recv()).await {
-            Ok(Some(line)) => {
-                if line.text.contains(&marker) {
-                    break;
-                }
-                match line.stream {
-                    MongoshStream::Stdout => push_mongosh_line(&mut stdout, line.text),
-                    MongoshStream::Stderr => push_mongosh_line(&mut stderr, line.text),
-                }
+        match marker_line_kind(&line.text, &marker) {
+            Some(MongoshCommandEnd::Completed) => {
+                end = MongoshCommandEnd::Completed;
+                continue;
             }
-            Ok(None) => return Err("mongosh session closed".to_string()),
-            Err(_) => return Err("mongosh command timed out".to_string()),
+            Some(MongoshCommandEnd::SyntaxError) => {
+                // Keep reading: the rest of the error is still coming.
+                end = MongoshCommandEnd::SyntaxError;
+                continue;
+            }
+            _ => {}
+        }
+        if is_stale_marker_line(&line.text, &stale) {
+            // The previous command's echo arriving late — its caller gave up on
+            // it before the REPL finished. Not this command's output.
+            continue;
+        }
+        match line.stream {
+            MongoshStream::Stdout => push_mongosh_line(&mut stdout, line.text),
+            MongoshStream::Stderr => push_mongosh_line(&mut stderr, line.text),
         }
     }
 
-    Ok(MongoshCommandOutput { stdout, stderr })
+    match end {
+        MongoshCommandEnd::Completed => Ok(MongoshCommandOutput { stdout, stderr }),
+        MongoshCommandEnd::SyntaxError => {
+            // The REPL's own report, moved to stderr so it reads as the error it
+            // is. The code frame quoted our marker as if it were the script's
+            // last line; that line is ours, not the user's, and goes.
+            let at = stdout
+                .iter()
+                .position(|l| l.starts_with("Uncaught"))
+                .unwrap_or(stdout.len());
+            let error: Vec<String> = stdout.split_off(at);
+            stderr.extend(error.into_iter().filter(|l| !l.contains(&marker)));
+            Ok(MongoshCommandOutput { stdout, stderr })
+        }
+        MongoshCommandEnd::Incomplete => {
+            // Only the trailing open statement was discarded. The REPL evaluates
+            // each statement as soon as it is complete, so anything before it
+            // has already run — a script ending in a stray `{` after an insert
+            // has done the insert. Saying "nothing ran" would invite the user to
+            // run it again. The output that was produced is kept for the same
+            // reason: it is the record of what did happen.
+            stderr.push(
+                "The last statement is incomplete: an unclosed {, [ or ( left mongosh waiting \
+                 for more input, so that statement was discarded. Any complete statements \
+                 before it have already run."
+                    .to_string(),
+            );
+            Ok(MongoshCommandOutput { stdout, stderr })
+        }
+    }
 }
 
 fn push_mongosh_line(lines: &mut Vec<String>, text: String) {
@@ -675,6 +926,7 @@ pub async fn start_mongosh_session_impl(
         output: AsyncMutex::new(receiver),
         child: AsyncMutex::new(child),
         command_lock: AsyncMutex::new(()),
+        stale_markers: AsyncMutex::new(Vec::new()),
     });
 
     {
@@ -1134,6 +1386,145 @@ async fn get_resource_usage(state: tauri::State<'_, AppState>) -> Result<Resourc
     Ok(resource_usage_impl(&state))
 }
 
+/// The provider presets the settings form can prefill from.
+///
+/// Served from Rust rather than duplicated in TypeScript: the endpoints are also
+/// what the request adapters build URLs from, and two copies of a base URL is one
+/// copy too many.
+#[tauri::command]
+fn ai_provider_presets() -> Vec<serde_json::Value> {
+    ai_providers::PRESETS
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "kind": p.kind,
+                "baseUrl": p.base_url,
+                "model": p.model,
+                "command": p.command,
+                "modelsCommand": p.models_command,
+                "needsKey": p.needs_key,
+            })
+        })
+        .collect()
+}
+
+/// The instructions MQLens's MCP server gives an agent.
+///
+/// Exposed so Settings can show and copy them: a user pointing an external client
+/// (opencode, Claude Desktop, a local CLI) at MQLens gets the same guidance the
+/// embedded server sends, instead of having to write a system prompt themselves.
+#[tauri::command]
+fn mcp_agent_instructions() -> &'static str {
+    mcp::AGENT_INSTRUCTIONS
+}
+
+/// List a provider's models, refusing first to put its key on the wire in clear
+/// text.
+///
+/// Shared by both listing commands. The check lived in one of them and not the
+/// other, which is how a provider saved with a key and a non-loopback `http://`
+/// endpoint still reached the network — automatically, from the chat panel, before
+/// the user sent anything. A test pins the number of callers so a third cannot be
+/// added without coming through here.
+async fn list_models_for_provider(
+    provider: &ai_providers::AiProvider,
+) -> Result<Vec<String>, String> {
+    match provider.kind {
+        ai_providers::ProviderKind::LocalCli => ai::list_models_cli(&provider.models_command).await,
+        kind => {
+            // Before the request, not at Save: listing runs on its own 600 ms after
+            // a key is typed, and for a saved provider on merely opening the panel,
+            // so Save is far too late to be the first check.
+            provider.check_transport()?;
+            ai::list_models_http(
+                kind,
+                &provider.models_endpoint()?,
+                &provider.api_key,
+                &provider.name,
+            )
+            .await
+        }
+    }
+}
+
+/// The models a provider offers, for the settings form to pick from.
+///
+/// HTTP kinds are asked over `GET .../models` with the configured key; a CLI is
+/// asked by running its `models_command`. Either way a failure is reported with
+/// the provider named, and the form keeps the model field typeable, so this can
+/// only ever help.
+#[tauri::command]
+async fn list_ai_models(provider: ai_providers::AiProvider) -> Result<Vec<String>, String> {
+    list_models_for_provider(&provider).await
+}
+
+/// Check a provider's configuration without sending a prompt to it.
+#[tauri::command]
+fn validate_ai_provider(provider: ai_providers::AiProvider) -> Result<String, String> {
+    provider.validate()?;
+    match provider.kind {
+        ai_providers::ProviderKind::LocalCli => Ok(provider.command.clone()),
+        _ => provider.endpoint(),
+    }
+}
+
+/// Marks which conversation's agent is running, and clears it however the run
+/// ends.
+struct RequesterGuard<'a> {
+    state: &'a AppState,
+    entry: Option<String>,
+}
+
+impl<'a> RequesterGuard<'a> {
+    /// Records the run under the conversation that started it.
+    ///
+    /// Both or neither: with no conversation there is no address to put a write
+    /// to, and recording the run alone would make it the single live requester
+    /// while giving `confirm_write` nothing to emit. Leaving the list empty
+    /// instead falls through to the unaddressed case, where any window may
+    /// answer — the same place two concurrent runs land, and safe for the same
+    /// reason. In practice only the panel calls this and it sends both; a
+    /// frontend that sends neither simply gets unaddressed prompts.
+    fn set(
+        state: &'a AppState,
+        requester: Option<String>,
+        conversation: Option<String>,
+    ) -> Self {
+        let run = requester.filter(|r| !r.is_empty());
+        let conversation = conversation.filter(|c| !c.is_empty());
+        let entry = match (run, conversation) {
+            (Some(run), Some(conversation)) => {
+                if let Ok(mut live) = state.mcp_helper_requesters.lock() {
+                    live.push(crate::state::HelperRun {
+                        run: run.clone(),
+                        conversation,
+                    });
+                }
+                Some(run)
+            }
+            _ => None,
+        };
+        Self { state, entry }
+    }
+}
+
+impl Drop for RequesterGuard<'_> {
+    fn drop(&mut self) {
+        // Only this run's entry. Clearing the list would strand a panel whose run
+        // is still going, unable to confirm anything for the rest of its life.
+        let Some(id) = self.entry.as_ref() else { return };
+        // By run, not by conversation: two runs in one conversation would
+        // otherwise let the first to finish retire the other's entry.
+        if let Ok(mut live) = self.state.mcp_helper_requesters.lock() {
+            if let Some(pos) = live.iter().position(|r| &r.run == id) {
+                live.remove(pos);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn generate_mql_query(
     app_handle: tauri::AppHandle,
@@ -1141,16 +1532,43 @@ async fn generate_mql_query(
     prompt: String,
     collection: String,
     fields: Vec<String>,
+    // The tab's own namespace. An agent told to inspect the collection has to
+    // know *which* one: two connections can hold same-named collections, and
+    // sampling the wrong environment produces a query that looks right and was
+    // built from someone else's data.
+    database: Option<String>,
+    #[allow(non_snake_case)] connectionName: Option<String>,
+    // The id as well as the name: two profiles may share a display name, and the
+    // MCP tools take an id, so the agent can use this one directly.
+    #[allow(non_snake_case)] connectionId: Option<String>,
+    // Identifies this run, so its own entry can be retired when it ends.
+    #[allow(non_snake_case)] requesterId: Option<String>,
+    // The conversation that asked, which is what a write its agent requests is
+    // addressed to. Not the run: a tab can move to another window mid-run, and a
+    // run id means nothing to the webview it moves to.
+    #[allow(non_snake_case)] conversationId: Option<String>,
     #[allow(non_snake_case)] history: Option<Vec<ai::ChatTurn>>,
     target: Option<String>,
-) -> Result<String, String> {
-    let settings = {
+    images: Option<Vec<ai::ImageAttachment>>,
+    // Per-conversation override from the panel's picker; `None` uses the
+    // settings default. Only the id crosses from the frontend — the key is
+    // looked up here.
+    #[allow(non_snake_case)] providerId: Option<String>,
+    model: Option<String>,
+) -> Result<ai::AiReply, String> {
+    let mut settings = {
         let key = state.require_key()?;
         connections::load_settings_encrypted(
             &connections::get_settings_enc_path(&app_handle),
             &key,
         )?
     };
+    if let Some(id) = providerId.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        settings.ai_provider = id.to_string();
+    }
+    let model_override = model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let images = images.unwrap_or_default();
+    ai::validate_images(&images)?;
 
     if prompt.trim().is_empty() {
         return Err("Describe the query you want in plain language.".to_string());
@@ -1167,45 +1585,211 @@ async fn generate_mql_query(
     };
     let system = ai::apply_custom_instructions(&base_system, &settings.ai_custom_instructions);
 
-    match settings.ai_provider.as_str() {
-        "anthropic" => {
-            let model = if settings.anthropic_model.trim().is_empty() {
-                "claude-opus-4-8".to_string()
-            } else {
-                settings.anthropic_model.clone()
-            };
-            ai::generate_anthropic(
-                &settings.anthropic_api_key,
-                &model,
+    // Gemini keeps a dedicated arm: its request and response shapes are neither
+    // OpenAI's nor Anthropic's, so it is the one provider that cannot be
+    // described as "an endpoint speaking a known format".
+    if settings.ai_provider.trim() == "gemini" {
+        let model = model_override
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if settings.gemini_model.trim().is_empty() {
+                    "gemini-1.5-flash".to_string()
+                } else {
+                    settings.gemini_model.clone()
+                }
+            });
+        return ai::generate_gemini(&settings.gemini_api_key, &model, &system, &history, &prompt, &images)
+            .await;
+    }
+
+    // Everything else — the built-ins and anything the user added — is resolved
+    // to one shape and dispatched on its wire format.
+    let mut provider = connections::resolve_ai_provider(&settings)?;
+    if let Some(m) = model_override {
+        provider.model = m.to_string();
+    }
+    provider.validate()?;
+    match provider.kind {
+        ai_providers::ProviderKind::OpenAiCompatible => {
+            ai::generate_openai_compatible(
+                &provider.endpoint()?,
+                &provider.api_key,
+                &provider.model,
+                &provider.name,
                 &system,
                 &history,
                 &prompt,
+                &images,
             )
             .await
         }
-        "openai" => {
-            let model = if settings.openai_model.trim().is_empty() {
-                "gpt-4o".to_string()
-            } else {
-                settings.openai_model.clone()
-            };
-            ai::generate_openai(&settings.openai_api_key, &model, &system, &history, &prompt).await
+        ai_providers::ProviderKind::AnthropicCompatible => {
+            ai::generate_anthropic_compatible(
+                &provider.endpoint()?,
+                &provider.api_key,
+                &provider.model,
+                &provider.name,
+                &system,
+                &history,
+                &prompt,
+                &images,
+            )
+            .await
         }
-        "gemini" => {
-            let model = if settings.gemini_model.trim().is_empty() {
-                "gemini-1.5-flash".to_string()
+        ai_providers::ProviderKind::LocalCli => {
+            if !images.is_empty() {
+                // There is no standard way to hand an image to a command-line
+                // agent, and silently dropping it would answer a question the
+                // user did not ask.
+                return Err(format!(
+                    "{} is a local command and cannot receive images. Pick an HTTP provider for this question.",
+                    provider.name
+                ));
+            }
+            // Only a local agent can reach MQLens's own MCP server; an HTTP
+            // provider is asked for one completion and calls nothing.
+            // The helper token and path, never the ones an external client uses:
+            // a write asked for on this route has to be confirmed by the user.
+            let mcp = mcp::helper_access(&state).map(|(port, token)| ai::McpEndpoint {
+                port,
+                token,
+                path: mcp::helper_path().to_string(),
+            });
+            // Available means *reachable by this command*, not merely running. A
+            // command without {mcp_config} is handed no config, so telling its
+            // agent the tools are there invites it to imply it checked something
+            // it never could — which is the failure this note exists to prevent.
+            // Three states. "The server is off" and "I did not hand this command a
+            // config" are different facts, and a user who followed the
+            // `claude mcp add` flow in Settings has an agent that reaches `mqlens`
+            // without `{mcp_config}` — telling it the server is off would talk it
+            // out of an inspection it could actually do.
+            let reach = if mcp.is_none() {
+                ai::McpReach::Off
+            } else if provider.command.contains("{mcp_config}") {
+                ai::McpReach::Injected
             } else {
-                settings.gemini_model.clone()
+                ai::McpReach::Unknown
             };
-            ai::generate_gemini(&settings.gemini_api_key, &model, &system, &history, &prompt).await
-        }
-        agent @ ("claude-code" | "codex" | "cursor" | "antigravity") => {
-            let template = connections::resolve_local_command(&settings, agent);
+            let system = format!(
+                "{}{}",
+                system,
+                ai::mcp_availability_note(
+                    reach,
+                    connectionName.as_deref(),
+                    connectionId.as_deref(),
+                    database.as_deref(),
+                    &collection,
+                )
+            );
             let one_prompt = ai::combined_prompt(&system, &history, &prompt);
-            ai::generate_local(&template, &one_prompt).await
+            // Set for the length of the run and cleared after, so a write arriving
+            // between runs is refused rather than offered to whoever is looking.
+            // A guard, not a plain assignment: an early return would otherwise
+            // leave a stale panel owning confirmations it never asked for.
+            let _requester =
+                RequesterGuard::set(&state, requesterId.clone(), conversationId.clone());
+            ai::generate_local(
+                &provider.command,
+                &one_prompt,
+                &provider.model,
+                mcp.as_ref(),
+            )
+            .await
         }
-        other => Err(format!("Unknown AI provider: {}", other)),
     }
+}
+
+/// The providers the chat panel can pick from, keys withheld.
+///
+/// Built-ins and user-added providers in one list, each with its kind so the
+/// panel can disable image paste for a local command, and with the settings
+/// default flagged so the picker starts on it.
+#[tauri::command]
+async fn ai_provider_options(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let settings = {
+        let key = state.require_key()?;
+        connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)?
+    };
+    let default_id = settings.ai_provider.trim().to_string();
+    // `usesModel` tells the panel whether a model choice reaches the request: an
+    // HTTP provider always sends one, a local command only if its template slots
+    // `{model}` in. Without it the panel would offer a model field that does
+    // nothing for the built-in agents.
+    // `canListModels` tells the panel whether asking for a model list can work at
+    // all. Without it the composer offered a "Load models" button for a CLI with
+    // no listing command — every built-in agent, whose `models_command` is always
+    // empty, and any custom CLI that left the documented-optional field blank. The
+    // click ran an empty command, failed, and said nothing.
+    let entry = |id: &str,
+                 name: &str,
+                 kind: &str,
+                 model: &str,
+                 uses_model: bool,
+                 can_list_models: bool| {
+        serde_json::json!({
+            "id": id, "name": name, "kind": kind, "model": model,
+            "isDefault": id == default_id, "usesModel": uses_model,
+            "canListModels": can_list_models
+        })
+    };
+    let agent_uses_model = |agent: &str| {
+        connections::resolve_local_command(&settings, agent).contains("{model}")
+    };
+    let mut out = vec![
+        entry("anthropic", "Anthropic (Claude)", "anthropic-compatible", &settings.anthropic_model, true, true),
+        entry("openai", "OpenAI (ChatGPT)", "openai-compatible", &settings.openai_model, true, true),
+        // Gemini is listed here for selection only: `list_ai_models_for` refuses it
+        // outright, so claiming otherwise would offer a button that cannot work.
+        entry("gemini", "Google Gemini", "gemini", &settings.gemini_model, true, false),
+    ];
+    for agent in ["claude-code", "codex", "cursor", "antigravity"] {
+        let label = match agent {
+            "claude-code" => "Claude Code (local)",
+            "codex" => "Codex (local)",
+            "cursor" => "Cursor (local)",
+            _ => "Antigravity (local)",
+        };
+        // A built-in agent's `models_command` is always empty (see
+        // `resolve_ai_provider`), so listing can never work for one.
+        out.push(entry(agent, label, "local-cli", "", agent_uses_model(agent), false));
+    }
+    for p in &settings.ai_providers {
+        let kind = serde_json::to_value(p.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let uses_model = p.kind != ai_providers::ProviderKind::LocalCli || p.command.contains("{model}");
+        let can_list_models = if p.kind == ai_providers::ProviderKind::LocalCli {
+            !p.models_command.trim().is_empty()
+        } else {
+            true
+        };
+        out.push(entry(&p.id, &p.name, &kind, &p.model, uses_model, can_list_models));
+    }
+    Ok(out)
+}
+
+/// Models for a provider named by id, resolved here so the key never leaves Rust.
+#[tauri::command]
+async fn list_ai_models_for(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    #[allow(non_snake_case)] providerId: String,
+) -> Result<Vec<String>, String> {
+    let mut settings = {
+        let key = state.require_key()?;
+        connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)?
+    };
+    if providerId.trim() == "gemini" {
+        return Err("Gemini's model list is not fetched here; type a model name.".to_string());
+    }
+    settings.ai_provider = providerId;
+    let provider = connections::resolve_ai_provider(&settings)?;
+    list_models_for_provider(&provider).await
 }
 
 #[tauri::command]
@@ -1247,6 +1831,24 @@ async fn run_mongosh_command(
     command: String,
 ) -> Result<MongoshCommandOutput, String> {
     run_mongosh_command_impl(&state, &session_id, &command).await
+}
+
+/// Resolves once `session_id` is not running a command.
+///
+/// A shell that reopens — a window refresh, a tab moved to another window —
+/// can find a command recorded as running whose caller is gone, and nothing
+/// else would ever tell it when that command ends. The command holds
+/// `command_lock` for as long as it runs, so waiting on that lock is the
+/// honest signal. Stopping the session ends the command and releases the lock,
+/// so this resolves then too.
+#[tauri::command]
+async fn await_mongosh_idle(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let session = get_mongosh_session(&state, &session_id)?;
+    let _idle = session.command_lock.lock().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2281,6 +2883,70 @@ async fn load_app_settings(
     connections::load_settings_encrypted(&connections::get_settings_enc_path(&app_handle), &key)
 }
 
+/// Whether a settings change is one a chat panel's provider picker would show.
+///
+/// Every successful patch used to broadcast, so changing the interface language or
+/// the theme made every open panel re-read its options — and the model-list effect
+/// that follows sends a *credentialed* request to the selected provider. An
+/// unrelated preference should not cause network traffic.
+///
+/// The fields `ai_provider_options` is built from, plus the built-in credentials.
+///
+/// The keys are not *in* the options payload, but they decide whether a picker can
+/// load its model list at all: a panel whose first listing failed for want of a
+/// key stayed stuck on an empty list until it remounted, however many times the
+/// key was corrected. A key change is an AI-settings change, which is the line
+/// this predicate is drawing — not "does the payload differ byte for byte".
+fn ai_options_changed(
+    before: &connections::AppSettings,
+    after: &connections::AppSettings,
+) -> bool {
+    before.ai_provider != after.ai_provider
+        || before.ai_providers != after.ai_providers
+        || before.anthropic_model != after.anthropic_model
+        || before.openai_model != after.openai_model
+        || before.gemini_model != after.gemini_model
+        || before.local_commands != after.local_commands
+        || before.anthropic_api_key != after.anthropic_api_key
+        || before.openai_api_key != after.openai_api_key
+        || before.gemini_api_key != after.gemini_api_key
+}
+
+/// Change only the named fields, under the settings write lock.
+///
+/// The load → merge → save happens here, on one side of the IPC boundary and
+/// inside one lock, so concurrent callers — the provider list, the locale, the
+/// theme, the shell path — serialize and each sees the other's write.
+#[tauri::command]
+async fn patch_app_settings(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    patch: serde_json::Value,
+) -> Result<connections::AppSettings, String> {
+    let key = state.require_key()?;
+    let path = connections::get_settings_enc_path(&app_handle);
+    let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
+    // The in-process mutex above orders this window's writers; this orders them
+    // against a second MQLens, which would otherwise merge into the same image
+    // and have one patch discarded by the other's rename.
+    let _file_lock = connections::lock_settings_for_write(&path)?;
+    let current = connections::load_settings_encrypted(&path, &key)?;
+    let merged = connections::merge_settings_patch(&current, &patch)?;
+    connections::save_settings_encrypted(&path, &key, &merged)?;
+    audit::refresh_policy_from_settings(&state, &merged);
+    // Every window keeps its own copy of the provider list; without this, a panel
+    // in another pane or window holds a stale one, and deleting the provider it
+    // has selected leaves that id selectable until the panel remounts.
+    // Best-effort, like `connections-changed`: a window that misses it re-reads
+    // the list on its next mount. Only when the picker would actually differ —
+    // see `ai_options_changed`.
+    if ai_options_changed(&current, &merged) {
+        use tauri::Emitter;
+        let _ = app_handle.emit("ai-providers-changed", ());
+    }
+    Ok(merged)
+}
+
 #[tauri::command]
 async fn save_app_settings(
     app_handle: tauri::AppHandle,
@@ -2288,12 +2954,28 @@ async fn save_app_settings(
     settings: connections::AppSettings,
 ) -> Result<(), String> {
     let key = state.require_key()?;
+    // Same locks as `patch_app_settings`, so a whole-object save cannot
+    // interleave with a field patch — in this process or another one.
+    let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
+    let settings_path = connections::get_settings_enc_path(&app_handle);
+    let _file_lock = connections::lock_settings_for_write(&settings_path)?;
+    // Read first, under the same locks, only to answer "would the pickers differ".
+    let before = connections::load_settings_encrypted(&settings_path, &key).ok();
     connections::save_settings_encrypted(
-        &connections::get_settings_enc_path(&app_handle),
+        &settings_path,
         &key,
         &settings,
     )?;
     audit::refresh_policy_from_settings(&state, &settings);
+    // Best-effort, like `connections-changed`: a window that misses it re-reads
+    // the list on its next mount. Only when the picker would actually differ —
+    // and when the previous image could not be read, assume it would, since a
+    // stale picker is worse than one needless refresh.
+    if before.as_ref().is_none_or(|b| ai_options_changed(b, &settings)) {
+        use tauri::Emitter;
+        let _ = app_handle.emit("ai-providers-changed", ());
+    }
+
     Ok(())
 }
 
@@ -2357,6 +3039,9 @@ async fn vault_unlock(
     let key = connections::unlock_key(&meta, &password)?;
     *state.vault_key.lock_safe()? = Some(key);
     let _ = audit::open_on_unlock(&app_handle, &state, key);
+    // The MCP server needs the key, so this is the first moment it can come
+    // back up. Best-effort by design — see `restore_on_unlock` (#350).
+    mcp::restore_on_unlock(&state, app_handle).await;
     Ok(connections::VaultStatus::Unlocked)
 }
 
@@ -2607,9 +3292,22 @@ async fn mcp_set_enabled(
     mcp::set_enabled_impl(&state, enabled, port, Some(app_handle)).await
 }
 
+/// The user's answer to a write MQLens's own agent asked to make.
 #[tauri::command]
-async fn mcp_regenerate_token(state: tauri::State<'_, AppState>) -> Result<mcp::McpStatusUi, String> {
-    mcp::regenerate_token_impl(&state)
+async fn mcp_resolve_write(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    approved: bool,
+) -> Result<(), String> {
+    mcp::resolve_write_impl(&state, &id, approved)
+}
+
+#[tauri::command]
+async fn mcp_regenerate_token(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<mcp::McpStatusUi, String> {
+    mcp::regenerate_token_impl(&state, Some(&app_handle))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2671,10 +3369,17 @@ pub fn run() {
             preview_restore_command,
             get_resource_usage,
             generate_mql_query,
+            ai_provider_presets,
+            mcp_agent_instructions,
+            validate_ai_provider,
+            list_ai_models,
+            ai_provider_options,
+            list_ai_models_for,
             detect_local_agents,
             get_mongodb_version,
             start_mongosh_session,
             run_mongosh_command,
+            await_mongosh_idle,
             stop_mongosh_session,
             get_shell_tab_state,
             set_shell_tab_state,
@@ -2742,6 +3447,7 @@ pub fn run() {
             mcp_get_status,
             mcp_set_enabled,
             mcp_regenerate_token,
+            mcp_resolve_write,
             biometric::biometric_status,
             biometric::biometric_enable,
             biometric::biometric_unlock,
@@ -2752,6 +3458,7 @@ pub fn run() {
             connections::test_connection_uri,
             load_app_settings,
             save_app_settings,
+            patch_app_settings,
             audit_list,
             audit_export,
             audit_open_folder,

@@ -62,17 +62,36 @@
       "insert": "Insert",
       "insertAndRun": "Insert & run"
     },
+    "attachments": {
+      "image": "Image, {{size}}",
+      "remove": "Remove image"
+    },
     "composer": {
+      "attach": "Attach image",
+      "imageTooLarge": "Images must be under {{limit}} MB.",
+      "imageTooMany": "Up to {{max}} images per message.",
+      "imageUnreadable": "Some images could not be read and were left out.",
+      "imageUnsupported": "Only PNG, JPEG, WebP and GIF images can be sent.",
+      "noImagesForCli": "This provider is a local command and cannot receive images. Pick an HTTP provider to ask about an image.",
       "placeholder": "Describe a query… (Enter to send, Shift+Enter for newline)",
       "send": "Send"
     },
     "empty": {
       "body": "Ask for a query in plain language — e.g. <i>“active users older than 30, sorted by age”</i> or<i> “average order total per customer”</i>. I’ll explain what I’m doing and you can insert the result."
     },
+    "errors": {
+      "noQuery": "The model returned no query. Try rephrasing, or pick a different model."
+    },
     "fallbackExplanation": "Here is a query.",
     "header": {
       "closeTitle": "Close AI Assistant",
-      "title": "AI Query Assistant"
+      "loadModels": "Load models",
+      "model": "Model",
+      "modelPlaceholder": "model",
+      "modelsFailed": "Could not load models. Type the name instead.",
+      "provider": "Provider",
+      "title": "AI Query Assistant",
+      "typeModel": "Type a model name…"
     },
     "history": {
       "clearAll": "Delete all conversations",
@@ -97,7 +116,14 @@
       "assistant": "Assistant",
       "you": "You"
     },
-    "thinking": "Thinking…"
+    "thinking": "Thinking…",
+    "thoughts": "Thinking",
+    "toolCalls_one": "Ran {{count}} tool",
+    "toolCalls_other": "Ran {{count}} tools",
+    "toolFailed": "failed",
+    "writeRequestAllow": "Allow",
+    "writeRequestRefuse": "Refuse",
+    "writeRequestTitle": "The assistant wants to change data"
   },
   "commandPalette": {
     "buckets": {
@@ -280,6 +306,12 @@
     "searchPlaceholder": "Search shortcuts…",
     "title": "Keyboard shortcuts"
   },
+  "mcpWriteConfirm": {
+    "allow": "Allow",
+    "description": "An MCP client connected to MQLens is asking to change data. Approve it only if you asked for this.",
+    "refuse": "Refuse",
+    "title": "An MCP client wants to change data"
+  },
   "mongoShell": {
     "console": {
       "cleared": "Console cleared - run a command above.",
@@ -338,9 +370,12 @@
       "useDb": "  use <db>                 switch current database"
     },
     "notes": {
+      "commandReattached": "A command was still running when this shell reopened here. Its output stayed with the view it started in; waiting for it to finish — Stop ends it.",
+      "commandStopped": "Command stopped.",
       "destructiveCancelled": "Destructive command cancelled.",
       "resultToDataViewer_one": "{{count}} document -> Data Viewer",
       "resultToDataViewer_other": "{{count}} documents -> Data Viewer",
+      "runningFor": "running… {{seconds}}s",
       "sessionAttached": "mongosh session attached",
       "sessionRestarting": "restarting mongosh session…",
       "sessionUnavailable": "mongosh session unavailable: {{detail}}",
@@ -351,7 +386,9 @@
       "aiToggleTitle": "AI assistant",
       "restartSession": "Restart",
       "restartSessionTitle": "Stop this mongosh session and start a new one",
-      "run": "Run"
+      "run": "Run",
+      "stop": "Stop",
+      "stopTitle": "Stop the running command by restarting the mongosh session"
     }
   },
   "quickStart": {

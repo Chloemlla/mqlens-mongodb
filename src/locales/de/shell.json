@@ -6,17 +6,36 @@
       "insert": "Einfügen",
       "insertAndRun": "Einfügen & ausführen"
     },
+    "attachments": {
+      "image": "Bild, {{size}}",
+      "remove": "Bild entfernen"
+    },
     "composer": {
       "placeholder": "Beschreibe eine Abfrage… (Enter zum Senden, Umschalt+Enter für Zeilenumbruch)",
-      "send": "Senden"
+      "send": "Senden",
+      "noImagesForCli": "Dieser Anbieter ist ein lokaler Befehl und kann keine Bilder empfangen. Wähle einen HTTP-Anbieter, um nach einem Bild zu fragen.",
+      "imageTooMany": "Höchstens {{max}} Bilder pro Nachricht.",
+      "imageUnreadable": "Einige Bilder konnten nicht gelesen werden und wurden ausgelassen.",
+      "attach": "Bild anhängen",
+      "imageUnsupported": "Es können nur PNG-, JPEG-, WebP- und GIF-Bilder gesendet werden.",
+      "imageTooLarge": "Bilder müssen kleiner als {{limit}} MB sein."
     },
     "empty": {
       "body": "Formuliere eine Abfrage in normaler Sprache — z. B. <i>„aktive Nutzer über 30, sortiert nach Alter“</i> oder<i> „durchschnittlicher Bestellwert pro Kunde“</i>. Ich erkläre, was ich tue, und du kannst das Ergebnis einfügen."
     },
+    "errors": {
+      "noQuery": "Das Modell hat keine Abfrage zurückgegeben. Formuliere um oder wähle ein anderes Modell."
+    },
     "fallbackExplanation": "Hier ist eine Abfrage.",
     "header": {
       "closeTitle": "KI-Assistent schließen",
-      "title": "KI-Abfrageassistent"
+      "title": "KI-Abfrageassistent",
+      "provider": "Anbieter",
+      "loadModels": "Modelle laden",
+      "model": "Modell",
+      "modelPlaceholder": "Modell",
+      "modelsFailed": "Modelle konnten nicht geladen werden. Namen stattdessen eintippen.",
+      "typeModel": "Modellnamen eintippen…"
     },
     "history": {
       "clearAll": "Alle Unterhaltungen löschen",
@@ -41,7 +60,20 @@
       "assistant": "Assistent",
       "you": "Du"
     },
-    "thinking": "Denke nach…"
+    "thinking": "Denke nach…",
+    "thoughts": "Überlegung",
+    "toolCalls_one": "{{count}} Tool ausgeführt",
+    "toolCalls_other": "{{count}} Tools ausgeführt",
+    "toolFailed": "fehlgeschlagen",
+    "writeRequestAllow": "Zulassen",
+    "writeRequestRefuse": "Ablehnen",
+    "writeRequestTitle": "Der Assistent möchte Daten ändern"
+  },
+  "mcpWriteConfirm": {
+    "allow": "Zulassen",
+    "description": "Ein mit MQLens verbundener MCP-Client möchte Daten ändern. Erlaube es nur, wenn du das angefordert hast.",
+    "refuse": "Ablehnen",
+    "title": "Ein MCP-Client möchte Daten ändern"
   },
   "commandPalette": {
     "buckets": {
@@ -286,6 +318,9 @@
       "resultToDataViewer_one": "{{count}} Dokument -> Datenansicht",
       "resultToDataViewer_other": "{{count}} Dokumente -> Datenansicht",
       "sessionAttached": "mongosh-Sitzung verbunden",
+      "commandReattached": "Beim erneuten Öffnen dieser Shell lief noch ein Befehl. Seine Ausgabe blieb in der Ansicht, in der er gestartet wurde; es wird auf sein Ende gewartet – Stopp beendet ihn.",
+      "commandStopped": "Befehl gestoppt.",
+      "runningFor": "läuft… {{seconds}}s",
       "sessionRestarting": "mongosh-Sitzung wird neu gestartet…",
       "sessionUnavailable": "mongosh-Sitzung nicht verfügbar: {{detail}}",
       "switchedToDb": "zur Datenbank {{db}} gewechselt"
@@ -293,6 +328,8 @@
     "toolbar": {
       "aiToggleLabel": "KI",
       "aiToggleTitle": "KI-Assistent",
+      "stop": "Stopp",
+      "stopTitle": "Laufenden Befehl stoppen, indem die mongosh-Sitzung neu gestartet wird",
       "restartSession": "Neu starten",
       "restartSessionTitle": "Diese mongosh-Sitzung beenden und eine neue starten",
       "run": "Ausführen"

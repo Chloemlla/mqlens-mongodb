@@ -139,6 +139,17 @@ const EXEMPT_HITS: Record<string, string[]> = {
     // <Trans> fallback children (transfer:restoreView.footer.backgroundNote).
     'jsx: Restores run in the background. Track their progress in the',
   ],
+  // AI provider form (#283). Example values a user would type, matching the
+  // service's own documentation, not instructional copy: a CLI invocation, a
+  // vendor base URL, and a model identifier.
+  'src/components/AiProviderManager.tsx': [
+    'placeholder="ollama run {model} {prompt}"',
+    'placeholder="ollama list"',
+    'placeholder="https://api.deepseek.com/v1"',
+    // Model-name placeholder, chosen per kind: a local model for a CLI, a
+    // vendor model id for HTTP.
+    "placeholder={isCli ? 'llama3' : 'deepseek-chat'}",
+  ],
   'src/components/CreateViewView.tsx': [
     // Example view name shown as a placeholder, not an instructional hint —
     // a plausible value the user might type, like ConnectionManager's examples.
@@ -246,7 +257,7 @@ const EXEMPT_HITS: Record<string, string[]> = {
     // KIND_STYLES' `label` property holds a Tailwind text-color className,
     // not a display label — an unlucky property-name collision with the
     // detector's `label:` heuristic, not translatable prose.
-    "label: 'text-emerald-700 dark:text-emerald-300'",
+    "label: 'text-success'",
     "label: 'text-destructive'",
     "label: 'text-primary'",
   ],
@@ -312,6 +323,15 @@ const EXEMPT_HITS: Record<string, string[]> = {
     'label: "Int32"',
     'label: "Double"',
     'label: "Binary"',
+  ],
+  'src/lib/shellDoc.ts': [
+    // ShellDocError messages are deliberately English: they are what lands in
+    // logs and stack traces, and the UI never shows them. Each error instead
+    // carries a stable `code` (plus interpolation params) that the query bar
+    // maps to a catalog key via shellDocErrorKey/shellDocErrorParams — see the
+    // ShellDocErrorCode doc comment. The catalog value is
+    // documents:documentViewer.errors.unsupportedRegexFlag.
+    'MongoDB does not support the regular expression flag [${unsafe}]',
   ],
   'src/lib/clusterHealth.ts': [
     // A backtick-quoted `new URL` inside a JSDoc comment, read as a template
