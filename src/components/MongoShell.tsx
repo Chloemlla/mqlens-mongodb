@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import Editor from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/core';
@@ -23,6 +23,14 @@ import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { attachMonaco } from '../lib/monacoAppTheme';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 import { windowLabel } from '../workspace/workspaceStore';
+import { cn } from '@/lib/utils';
+import { ResultsFindBar } from './ResultsFindBar';
+import {
+  isTextEntryContext,
+  registerResultsFindTarget,
+  resultsPaneElementForEvent,
+} from '../lib/resultsFindShortcut';
+import { findMatches, isMatchAt, stepMatch, type FindCell } from '../lib/resultsFind';
 import { useTabVisible } from '../workspace/tabVisibility';
 
 type ShellTab = 'console' | 'viewer';
@@ -199,8 +207,98 @@ const stringifyShellValue = (value: unknown, indent = 0): string => {
   return String(value);
 };
 
-const HighlightedValue: React.FC<{ value: unknown }> = ({ value }) => (
-  <pre className="m-0 whitespace-pre-wrap font-mono text-xs text-foreground">{stringifyShellValue(value)}</pre>
+/**
+ * A transcript entry as plain text — what the user sees, and what find searches.
+ *
+ * Every entry kind renders as text, so one flattening covers all of them and
+ * the console can reuse the results pane's find machinery rather than growing
+ * its own (#357).
+ */
+export const shellEntryText = (entry: ShellEntry): string => {
+  switch (entry.kind) {
+    case 'input':
+      // Exactly what the row renders: the prompt, a space, the command.
+      return `${entry.db}> ${entry.text}`;
+    case 'note':
+      return entry.text;
+    case 'error':
+      return entry.message;
+    case 'text':
+      return entry.lines.join('\n');
+    default:
+      return stringifyShellValue(entry.value);
+  }
+};
+
+/**
+ * `text` with every occurrence of `query` marked.
+ *
+ * Occurrences rather than one per entry: `findMatches` counts an entry once,
+ * because the entry is what stepping moves between, but a long line of output
+ * with the term three times should show all three.
+ */
+/**
+ * `haystack.indexOf(needle)`, case-insensitively, in the haystack's own offsets.
+ *
+ * Lowercasing the whole string first and reusing those offsets is wrong: for a
+ * character whose lowercase form is longer — `İ`.toLowerCase() is two code
+ * units — every offset after it is shifted, and the slice taken back out of the
+ * original marks the wrong characters. Comparing equal-length slices of the
+ * original keeps every offset valid in the string being sliced (#357 review).
+ *
+ * A run whose case folding changes length therefore does not match here, while
+ * `findMatches` (which lowercases whole strings) still counts it. The row
+ * highlight covers that gap: a counted match always shows on its row, even when
+ * no individual run can be marked.
+ */
+function caseInsensitiveIndexOf(haystack: string, needle: string, from: number): number {
+  const width = needle.length;
+  const folded = needle.toLowerCase();
+  for (let i = Math.max(0, from); i + width <= haystack.length; i++) {
+    if (haystack.slice(i, i + width).toLowerCase() === folded) return i;
+  }
+  return -1;
+}
+
+const MarkedText: React.FC<{ text: string; query: string; active: boolean }> = ({
+  text,
+  query,
+  active,
+}) => {
+  const needle = query.trim();
+  if (needle === '') return <>{text}</>;
+  const out: React.ReactNode[] = [];
+  let from = 0;
+  let key = 0;
+  for (;;) {
+    const at = caseInsensitiveIndexOf(text, needle, from);
+    if (at < 0) break;
+    if (at > from) out.push(text.slice(from, at));
+    out.push(
+      <mark
+        key={key++}
+        className={cn(
+          'rounded-sm bg-transparent p-0 text-inherit',
+          active ? 'bg-warning/40 ring-1 ring-inset ring-warning' : 'bg-warning/15'
+        )}
+      >
+        {text.slice(at, at + needle.length)}
+      </mark>
+    );
+    from = at + needle.length;
+  }
+  if (from < text.length) out.push(text.slice(from));
+  return <>{out}</>;
+};
+
+const HighlightedValue: React.FC<{ value: unknown; query: string; active: boolean }> = ({
+  value,
+  query,
+  active,
+}) => (
+  <pre className="m-0 whitespace-pre-wrap font-mono text-xs text-foreground">
+    <MarkedText text={stringifyShellValue(value)} query={query} active={active} />
+  </pre>
 );
 
 const createLogId = () => {
@@ -482,6 +580,146 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     // keeps the read fresh without re-triggering (the ref guard above).
   }, [reconnectSignal, sessionId]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // The console's own content: the find bar and the transcript, and nothing
+  // else. It has to reach past the transcript so a second Cmd/Ctrl+F with the
+  // caret already in the search box resolves this pane and refocuses the input
+  // rather than falling through to the browser — the one flow the find input's
+  // routing attribute exists to support.
+  //
+  // It deliberately stops short of the tab strip above. That is shared chrome:
+  // with it inside, a Cmd/Ctrl+F from the Data Viewer tab's trigger resolved to
+  // the console, which cannot open a find bar while the viewer is showing, and
+  // the router stopped there instead of reaching the DataGrid's own target.
+  // This element does not exist at all on the viewer tab, so the grid answers
+  // for it (#357 review).
+  const consolePaneRef = useRef<HTMLDivElement>(null);
+
+  // Find over the transcript (#357). The console renders every entry — it is
+  // not virtualized — so matching against the entry text is matching against
+  // exactly what is on screen, and the results pane's machinery carries over
+  // unchanged: one match per entry, because the entry is what stepping moves
+  // between.
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [activeFind, setActiveFind] = useState(-1);
+  const [findFocusToken, setFindFocusToken] = useState(0);
+  const activeMatchRef = useRef<HTMLDivElement>(null);
+
+  const findCells: FindCell[] = useMemo(
+    () => entries.map((entry, index) => ({ rowIndex: index, text: shellEntryText(entry) })),
+    [entries]
+  );
+  const findMatchList = useMemo(
+    () => (findOpen ? findMatches(findCells, findQuery) : []),
+    [findOpen, findCells, findQuery]
+  );
+  const activeFindMatch = activeFind >= 0 ? findMatchList[activeFind] : undefined;
+  const matchedRows = useMemo(
+    () => new Set(findMatchList.map((m) => m.rowIndex)),
+    [findMatchList]
+  );
+  // The same two states the results grid uses, so a match reads the same in
+  // both places — and so the count always corresponds to something visible even
+  // when the term straddles the prompt and the command, where no single marked
+  // run can carry it (#357 review).
+  const rowHighlightClass = (index: number): string | undefined => {
+    if (!matchedRows.has(index)) return undefined;
+    return isMatchAt(activeFindMatch, index)
+      ? 'bg-warning/40 ring-1 ring-inset ring-warning'
+      : 'bg-warning/15';
+  };
+
+  // A new query starts at its first match rather than keeping an index into a
+  // list that no longer exists. A longer list under the SAME query does not:
+  // output arriving mid-search that happens to contain the term used to snap
+  // the selection back to the first match, moving the user off the one they had
+  // stepped to (#357 review). Matches are in transcript order and new output is
+  // appended, so the indexes already held stay pointing at the same entries;
+  // only the tail is new, and the index is clamped in case entries were cleared.
+  const lastFindQuery = useRef(findQuery);
+  useEffect(() => {
+    const queryChanged = lastFindQuery.current !== findQuery;
+    lastFindQuery.current = findQuery;
+    if (queryChanged) {
+      setActiveFind(findMatchList.length > 0 ? 0 : -1);
+      return;
+    }
+    setActiveFind((current) => {
+      if (findMatchList.length === 0) return -1;
+      if (current < 0) return 0;
+      return Math.min(current, findMatchList.length - 1);
+    });
+  }, [findQuery, findMatchList.length]);
+
+  // The match the user stepped to has to be on screen to be of any use —
+  // including after output arrives underneath it and moves it.
+  useEffect(() => {
+    activeMatchRef.current?.scrollIntoView({ block: 'nearest' });
+    // `tab` too: leaving for the Data Viewer unmounts the console subtree, and
+    // coming back builds a fresh transcript scrolled to the top. Nothing else
+    // here changes across that, and bottom-pinning stands down while a search
+    // has matches, so the status kept naming a match that was off screen
+    // (#357 review).
+  }, [activeFind, findQuery, entries, tab]);
+
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    setActiveFind(-1);
+  }, []);
+
+  // Registered with the results pane's router so one Cmd/Ctrl+F reaches exactly
+  // one pane: a shell and a results grid can be split side by side, and without
+  // a shared notion of "which pane is the user in" both would answer.
+  useEffect(
+    () =>
+      registerResultsFindTarget({
+        element: () => consolePaneRef.current,
+        open: () => {
+          setFindOpen(true);
+          setFindFocusToken((n) => n + 1);
+        },
+        // Only the console has a transcript to search; the Data Viewer tab
+        // renders a DataGrid, which registers its own.
+        canOpenFind: () => tab === 'console',
+      }),
+    [tab]
+  );
+
+  // Cmd/Ctrl+A selects the transcript. The app disables selection globally
+  // (`user-select: none` on body), so the console opts back in below and this
+  // gives the shortcut something to select — without it the key selected
+  // nothing here at all (#357).
+  useEffect(() => {
+    if (tab !== 'console') return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key !== 'a' && event.key !== 'A') return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      // Inside the editor or the find box the key means "select what I am
+      // typing", which is not ours to answer.
+      if (isTextEntryContext(event.target)) return;
+      const transcript = scrollRef.current;
+      const pane = consolePaneRef.current;
+      if (!transcript || !pane) return;
+      // The same resolver, and the same element it was registered with, so the
+      // two can never disagree about which pane the user is in. The selection
+      // itself still covers the transcript alone — the toolbar and find bar are
+      // chrome, not output.
+      if (resultsPaneElementForEvent(event.target) !== pane) return;
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(transcript);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      event.preventDefault();
+    };
+    // Capture, like the find shortcut, so this runs before anything that would
+    // otherwise claim the key first.
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => document.removeEventListener('keydown', onKeyDown, true);
+  }, [tab]);
   const wrapRef = useRef<HTMLDivElement>(null);
   const runRef = useRef<() => void>(() => {});
   // Seeded from the tab's session: the opening command must run once per TAB,
@@ -775,9 +1013,14 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   const tabVisible = useTabVisible();
   useEffect(() => {
     if (!tabVisible) return;
+    // Not while a search has something selected: a command finishing — or
+    // another mounted instance of this shell appending output — would jump the
+    // view to the bottom and take the active match off screen, while the find
+    // status went on pointing at it (#357 review).
+    if (findOpen && findMatchList.length > 0) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [entries, tab, tabVisible]);
+  }, [entries, tab, tabVisible, findOpen, findMatchList.length]);
 
   // When the session failed to attach, probe for a usable mongosh (managed
   // install, PATH, well-known locations) so the gate can offer a one-click
@@ -905,6 +1148,27 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     return true;
   };
 
+  // A multi-line script runs as one non-interactive `mongosh --file` program
+  // rather than being fed to the REPL a line at a time. That is what makes a
+  // pasted diagnostic script reliable: it is parsed and run as a unit, so an
+  // unclosed brace is a single reported error rather than a hang, and a
+  // `quit()` inside it just ends the run instead of tearing down the session
+  // (#344 shell reliability). It is one-shot, so it does not need the warm
+  // session; the current database is passed so `db` still points at the tab's.
+  const runMongoshScriptOnce = async (script: string) => {
+    if (mongoshPath === null || !connectionUri) return false;
+    const output = await invoke<MongoshCommandOutput>('run_mongosh_script', {
+      connectionId,
+      uri: connectionUri,
+      database: currentDb,
+      mongoshPath,
+      script,
+    });
+    appendCommandOutput(output);
+    setTab('console');
+    return true;
+  };
+
   // The shell's current collection context for AI-generated commands.
   const aiCollection = collectionName ?? 'collection';
 
@@ -956,7 +1220,9 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         setTab('console');
         return;
       }
-      const ranExternally = await runExternalMongoshCommand(raw);
+      const ranExternally = raw.includes('\n')
+        ? await runMongoshScriptOnce(raw)
+        : await runExternalMongoshCommand(raw);
       // Whatever follows — a driver call for a recognised command, or nothing —
       // is not something Stop can end. Read live: Stop may have been pressed,
       // and `stopRequested` must not be lost by overwriting the record.
@@ -1388,8 +1654,25 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         </div>
 
         {tab === 'console' ? (
+          <div className="flex min-h-0 flex-1 flex-col" ref={consolePaneRef}>
+          {findOpen && (
+          <ResultsFindBar
+            query={findQuery}
+            onQueryChange={setFindQuery}
+            matchCount={findMatchList.length}
+            activeIndex={activeFind}
+            onNext={() => setActiveFind((i) => stepMatch(findMatchList.length, i, 1))}
+            onPrevious={() => setActiveFind((i) => stepMatch(findMatchList.length, i, -1))}
+            onClose={closeFind}
+            focusToken={findFocusToken}
+          />
+          )}
           <div
-            className="min-h-0 flex-1 overflow-y-auto p-2 font-mono text-xs"
+            // `select-text` re-enables selection against the app-wide
+            // `user-select: none`. Without it the console could not be selected
+            // with the mouse and Ctrl/Cmd+A had nothing to select, so output
+            // could be read but never copied (#357).
+            className="min-h-0 flex-1 select-text overflow-y-auto p-2 font-mono text-xs"
             ref={scrollRef}
             data-testid="shell-transcript"
           >
@@ -1397,39 +1680,78 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               <div className="py-4 text-center text-muted-foreground">{t('mongoShell.console.cleared')}</div>
             )}
             {entries.map((entry, index) => {
+              const isActive = isMatchAt(activeFindMatch, index);
+              // Only the active entry is scrolled to; the ref goes on it alone.
+              const rowRef = isActive ? activeMatchRef : undefined;
+              const mark = (text: string) => (
+                <MarkedText text={text} query={findOpen ? findQuery : ''} active={isActive} />
+              );
               if (entry.kind === 'input') {
                 return (
-                  <div className="flex gap-2 py-0.5 text-foreground" key={index}>
-                    <span className="text-success">{entry.db}&gt;</span>
-                    <span>{entry.text}</span>
+                  <div
+                    className={cn('py-0.5 text-foreground', rowHighlightClass(index))}
+                    key={index}
+                    ref={rowRef}
+                  >
+                    {/* The prompt is searched as part of this entry, so it is
+                        marked as well — otherwise a hit on the database name
+                        was counted and stepped to with nothing highlighted.
+
+                        The space between the two is a real text node, not a
+                        flex gap: a gap is CSS, and copying serializes the DOM,
+                        so `sales_db> db.stats()` on screen came out of the
+                        clipboard as `sales_db>db.stats()` — not a command that
+                        runs (#357 review). It also matches what
+                        `shellEntryText` searches, so find and copy agree. */}
+                    <span className="text-success">{mark(`${entry.db}>`)}</span>{' '}
+                    <span>{mark(entry.text)}</span>
                   </div>
                 );
               }
               if (entry.kind === 'note') {
                 return (
-                  <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground" key={index}>
+                  <div
+                    className={cn('flex items-center gap-1.5 py-0.5 text-muted-foreground', rowHighlightClass(index))}
+                    key={index}
+                    ref={rowRef}
+                  >
                     <CornerDownLeft size={12} />
-                    <span>{entry.text}</span>
+                    <span>{mark(entry.text)}</span>
                   </div>
                 );
               }
               if (entry.kind === 'error') {
                 return (
-                  <div className="flex items-center gap-1.5 py-0.5 text-destructive" key={index}>
+                  <div
+                    className={cn('flex items-center gap-1.5 py-0.5 text-destructive', rowHighlightClass(index))}
+                    key={index}
+                    ref={rowRef}
+                  >
                     <AlertCircle size={12} />
-                    <span>{entry.message}</span>
+                    <span>{mark(entry.message)}</span>
                   </div>
                 );
               }
               if (entry.kind === 'text') {
                 return (
-                  <pre className="m-0 whitespace-pre-wrap py-0.5 text-muted-foreground" key={index}>
-                    {entry.lines.join('\n')}
-                  </pre>
+                  <div key={index} ref={rowRef} className={rowHighlightClass(index)}>
+                    <pre className="m-0 whitespace-pre-wrap py-0.5 text-muted-foreground">
+                      {mark(entry.lines.join('\n'))}
+                    </pre>
+                  </div>
                 );
               }
-              return <HighlightedValue key={index} value={entry.value} />;
+              return (
+                <div key={index} ref={rowRef} className={rowHighlightClass(index)}>
+                  <HighlightedValue
+                    value={entry.value}
+                    query={findOpen ? findQuery : ''}
+                    active={isActive}
+                  />
+                </div>
+              );
             })}
+          </div>
           </div>
         ) : (
           viewer && <DataGrid documents={viewer.docs} density={density} />
