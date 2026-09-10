@@ -193,6 +193,25 @@ export function builderStateToQuery(state: BuilderState): GeneratedQuery {
 interface DocumentViewerProps {
   connectionId?: string;
   connectionName: string;
+  /**
+   * Namespace for this connection's saved queries, default query and history.
+   *
+   * Separate from `connectionName` because that is a label — editable, and not
+   * unique — while this is an identity. They are the same string for an
+   * ordinary saved connection; they differ for one the user never saved, so a
+   * trial session cannot read or write a saved profile's queries (#369 review).
+   */
+  queryStoreKey?: string;
+  /**
+   * True when this connection was never saved, so nothing keyed on it can
+   * outlive the session.
+   *
+   * Passed rather than derived from `queryStoreKey`: that key is the display
+   * name for an ordinary connection, and a display name beginning "ephemeral:"
+   * would otherwise lock a perfectly saved connection out of its own favourites
+   * (#369 review).
+   */
+  ephemeral?: boolean;
   /** Auth username parsed from the connection URI; empty when the connection has no credentials. */
   connectionUser?: string;
   databaseName: string;
@@ -547,6 +566,11 @@ export const DocumentViewerContext = React.createContext<DocumentViewerContextTy
 export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   connectionId,
   connectionName,
+  // Defaults to the display name, which is what these stores were keyed on
+  // before this prop existed — so a caller that has no opinion gets exactly the
+  // old behaviour rather than a silently different one.
+  queryStoreKey,
+  ephemeral = false,
   connectionUser,
   databaseName,
   collectionName,
@@ -616,15 +640,24 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const isQueryFavorited = (sq: SavedQuery): boolean =>
     isItemFavorited(favoriteItems, queryFavoriteEntry(sq));
 
+  // The stores were keyed on the display name before this prop existed, so a
+  // caller with no opinion keeps exactly the old behaviour.
+  const storeKey = queryStoreKey ?? connectionName;
+  // Favourites are keyed on the display name while the query itself lives under
+  // `storeKey`, so on a trial session the two never meet: the favourite is born
+  // pointing at nothing, reports the query as gone the moment it is followed,
+  // and could not survive a restart anyway (#369 review).
+  const canFavoriteQueries = !ephemeral;
+
   const refreshStoredQueries = React.useCallback(async () => {
     try {
-      const cq = await loadCollectionQueries(connectionName, databaseName, collectionName);
+      const cq = await loadCollectionQueries(storeKey, databaseName, collectionName);
       setSavedQueries(cq.saved ?? []);
       setQueryHistory(cq.history ?? []);
     } catch {
       // Best-effort: leave the lists as-is on failure.
     }
-  }, [connectionName, databaseName, collectionName]);
+  }, [storeKey, databaseName, collectionName]);
 
   useEffect(() => {
     refreshStoredQueries();
@@ -653,7 +686,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   // the per-collection store, which is what makes the panel come back open
   // after an app restart. The transcript itself is handled the same way inside
   // AIChatPanel; see its `historyKey` prop.
-  const aiOpenPrefKey = `mqlens-ai-open::editor::${connectionName}::${databaseName}::${collectionName}`;
+  const aiOpenPrefKey = `mqlens-ai-open::editor::${storeKey}::${databaseName}::${collectionName}`;
   const [isAIHelperOpen, setIsAIHelperOpenState] = useState(
     // `initialAIHelperOpen` is the TAB's answer and wins when it has one. On the
     // first mount after a restart the tab cache is empty and the prop is
@@ -1232,23 +1265,33 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     });
     if (!name?.trim()) return;
     try {
-      await saveQuery(connectionName, databaseName, collectionName, name.trim(), currentBuilderQuery());
+      await saveQuery(storeKey, databaseName, collectionName, name.trim(), currentBuilderQuery());
       await refreshStoredQueries();
-      if (alsoFavorite) {
-        const cq = await loadCollectionQueries(connectionName, databaseName, collectionName);
+      if (alsoFavorite && !canFavoriteQueries) {
+        notify('toast.favoriteNeedsSavedConnection', 'error');
+      } else if (alsoFavorite) {
+        const cq = await loadCollectionQueries(storeKey, databaseName, collectionName);
         const saved = (cq.saved ?? []).find((s) => s.name === name.trim());
         if (saved) {
           toggleFavoriteItem(favoriteItems, queryFavoriteEntry(saved));
           setFavoriteItems(loadFavoriteItems());
         }
       }
-      notify(alsoFavorite ? 'toast.querySavedAndFavorited' : 'toast.querySaved', 'success', { name: name.trim() });
+      notify(
+        alsoFavorite && canFavoriteQueries ? 'toast.querySavedAndFavorited' : 'toast.querySaved',
+        'success',
+        { name: name.trim() },
+      );
     } catch (e: any) {
       notify('toast.couldNotSaveQuery', 'error', { detail: e?.message || e });
     }
   };
 
   const handleToggleQueryFavorite = (sq: SavedQuery) => {
+    if (!canFavoriteQueries) {
+      notify('toast.favoriteNeedsSavedConnection', 'error');
+      return;
+    }
     setFavoriteItems((prev) => toggleFavoriteItem(prev, queryFavoriteEntry(sq)));
   };
 
@@ -1258,7 +1301,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   const handleDeleteSaved = async (id: string) => {
     try {
-      await deleteSavedQuery(connectionName, databaseName, collectionName, id);
+      await deleteSavedQuery(storeKey, databaseName, collectionName, id);
       await refreshStoredQueries();
       notify('toast.savedQueryDeleted', 'success');
     } catch (e: any) {
@@ -1268,7 +1311,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   const handleSetDefault = async () => {
     try {
-      await setDefaultQuery(connectionName, databaseName, collectionName, currentBuilderQuery());
+      await setDefaultQuery(storeKey, databaseName, collectionName, currentBuilderQuery());
       notify('toast.defaultQuerySet');
     } catch (e: any) {
       notify('toast.couldNotSetDefault', 'error', { detail: e?.message || e });
@@ -1277,7 +1320,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   const handleClearDefault = async () => {
     try {
-      await setDefaultQuery(connectionName, databaseName, collectionName, null);
+      await setDefaultQuery(storeKey, databaseName, collectionName, null);
       notify('toast.defaultQueryCleared');
     } catch (e: any) {
       notify('toast.couldNotClearDefault', 'error', { detail: e?.message || e });
@@ -2437,6 +2480,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 embedded
                 connectionId={connectionId}
                 connectionName={connectionName}
+                scopeKey={storeKey}
                 databaseName={databaseName}
                 collectionName={collectionName}
                 fields={availableFields}
