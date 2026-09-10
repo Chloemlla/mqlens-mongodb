@@ -38,7 +38,7 @@
 
 use crate::state::{AppState, LockExt};
 use base64::Engine as _;
-use rand::Rng;
+use rand::RngExt;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -171,7 +171,7 @@ fn now_ms() -> u64 {
 /// Fresh 32-byte bearer token, base64url-encoded without padding (spec:
 /// "fresh 32-byte base64url bearer token minted on every enable").
 fn new_token() -> String {
-    let bytes: [u8; 32] = rand::thread_rng().gen();
+    let bytes: [u8; 32] = rand::rng().random();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
