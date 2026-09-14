@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useId, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AIChatPanel, type ChatMessage } from './AIChatPanel';
 import { QueryEditor } from './QueryEditor';
@@ -1543,6 +1543,15 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     return ['document-main'];
   }, [workspaceRightPanel]);
 
+  // Each mounted DocumentViewer needs its own group id. Recently used tabs stay
+  // mounted (#345), and react-resizable-panels looks a group up by its id, so
+  // collection tabs sharing one id read and write each other's layout. Opening
+  // the AI helper in one tab while another showed only the document area threw
+  // "Invalid 2 panel layout: 100%", or left the helper as a sliver that could
+  // not be dragged wider (#392, #379). The saved-layout key below stays shared,
+  // so a width the user drags still carries over to other tabs.
+  const workspaceGroupId = `document-viewer-workspace-${useId()}`;
+
   const { defaultLayout: savedWorkspaceLayout, onLayoutChanged: saveWorkspaceLayout } =
     useDefaultLayout({
       id: 'document-viewer-workspace',
@@ -1884,7 +1893,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
       {/* 3. Main Workspace Split Area */}
       <ResizablePanelGroup
-        id="document-viewer-workspace"
+        id={workspaceGroupId}
         orientation="horizontal"
         defaultLayout={safeSavedLayout ?? workspaceDefaultLayout}
         onLayoutChanged={saveWorkspaceLayout}
