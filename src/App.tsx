@@ -658,8 +658,9 @@ function Workspace() {
   }
   const tabBuilderStateCache = useRef(new Map<string, BuilderState>());
   // Per-tab AI helper state (#221): transcript + whether the panel is open.
-  // Inactive collection tabs unmount DocumentViewer (and with it AIChatPanel),
-  // so both must live here — same pattern as `tabBuilderStateCache` (#120).
+  // A collection tab that falls out of its pane's keep-alive budget (#345)
+  // unmounts DocumentViewer (and with it AIChatPanel), so both must live here —
+  // same pattern as `tabBuilderStateCache` (#120).
   // Open state survives tab switches; only the panel close control (or opening
   // the query builder) turns it off.
   const tabChatCache = useRef(
