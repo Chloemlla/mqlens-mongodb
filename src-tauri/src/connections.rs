@@ -159,6 +159,19 @@ impl Default for AppearanceSettings {
     }
 }
 
+/// The appearance of a settings file written before appearance was saved.
+///
+/// Its empty `preset_id` tells ThemeProvider nothing was saved, so it keeps the
+/// theme it recovered locally (the appearance cache, or the legacy
+/// `mqlens-theme` keys) instead of replacing it with the defaults. A brand-new
+/// `AppSettings` has no such theme to keep and gets real defaults.
+fn unsaved_appearance() -> AppearanceSettings {
+    AppearanceSettings {
+        preset_id: String::new(),
+        ..AppearanceSettings::default()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppSettings {
     #[serde(default)]
@@ -215,7 +228,7 @@ pub struct AppSettings {
     #[serde(default = "default_update_channel")]
     pub update_channel: String,
     // UI appearance: theme preset, fonts, font size, spacing density.
-    #[serde(default)]
+    #[serde(default = "unsaved_appearance")]
     pub appearance: AppearanceSettings,
     /// Whether the embedded MCP server should be running (#350).
     ///
@@ -1143,14 +1156,27 @@ mod appearance_default_tests {
         assert!(appearance.overrides.is_empty());
     }
 
-    /// The two ways to get a default appearance — constructing one and reading a
-    /// settings file that lacks it — must not drift apart again.
+    /// Constructing a default appearance and reading one with no fields set must
+    /// not drift apart again.
     #[test]
     fn default_matches_deserializing_an_empty_appearance() {
         let from_empty: AppearanceSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty, AppearanceSettings::default());
-        let settings: AppSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(settings.appearance, AppearanceSettings::default());
+    }
+
+    /// A settings file from before appearance was saved must read as unsaved, or
+    /// ThemeProvider replaces the theme it recovered locally with the defaults.
+    /// Any later settings write must keep it that way.
+    #[test]
+    fn a_settings_file_without_an_appearance_reads_as_unsaved() {
+        let settings: AppSettings = serde_json::from_str(r#"{"locale":"en"}"#).unwrap();
+        assert_eq!(settings.appearance.preset_id, "");
+
+        let merged = merge_settings_patch(&settings, &serde_json::json!({ "locale": "de" })).unwrap();
+        let saved = serde_json::to_string(&merged).unwrap();
+        let reread: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reread.locale, "de");
+        assert_eq!(reread.appearance.preset_id, "");
     }
 }
 
