@@ -1,7 +1,7 @@
 {
   "name": "mqlens",
   "private": true,
-  "version": "0.20.0",
+  "version": "0.20.1",
   "description": "A native desktop GUI for MongoDB, built with Tauri and React.",
   "homepage": "https://mqlens.com",
   "author": "Devesh Kumar <vrshu112@gmail.com>",
@@ -15,6 +15,7 @@
     "test": "vitest run",
     "i18n:extract": "i18next-cli extract",
     "i18n:check": "i18next-cli extract --ci --dry-run",
+    "check:tauri-versions": "node scripts/check-tauri-versions.js",
     "coverage:frontend": "vitest run --coverage",
     "coverage:backend": "cargo llvm-cov --manifest-path src-tauri/Cargo.toml --summary-only --ignore-filename-regex 'src-tauri/src/(lib|main)\\.rs'",
     "coverage": "npm run coverage:frontend && npm run coverage:backend"
