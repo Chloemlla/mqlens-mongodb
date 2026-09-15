@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Editor, { type Monaco, type OnMount } from '@monaco-editor/react';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
 import type { Surface } from '../lib/mongoCompletions';
 import type { SchemaMap } from '../lib/useCollectionSchema';
 import { useMonacoTheme, useMonacoFontSize, useMonacoScale } from '../lib/useMonacoTheme';
+import { useMonacoValue } from '../lib/useMonacoValue';
 import { useThemeOptional } from '@/hooks/use-theme';
 import { attachMonaco } from '../lib/monacoAppTheme';
 import { cn } from '@/lib/utils';
@@ -155,33 +156,10 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   // rewrites text it was given — and never reports a reflowed copy back through
   // onChange, which the builder syncs its rules from.
   const shownValue = singleLine ? toSingleLine(value) : value;
-  const shownValueRef = useRef(shownValue); shownValueRef.current = shownValue;
-  // Set while a new `value` is written into the model, so that edit isn't
-  // reported back through onChange as if it were typed.
-  const pushingValueRef = useRef(false);
-  const pushValue = useCallback((ed: Parameters<OnMount>[0]) => {
-    const model = ed.getModel();
-    const next = shownValueRef.current;
-    if (!model || next === ed.getValue()) return;
-    pushingValueRef.current = true;
-    try {
-      ed.executeEdits('', [{ range: model.getFullModelRange(), text: next, forceMoveMarkers: true }]);
-      ed.pushUndoStop();
-    } finally {
-      pushingValueRef.current = false;
-    }
-  }, []);
-  // The parent's value goes into the model here, not through the library's
-  // `value` prop. The library compares it with the model from a passive effect,
-  // and Chromium delivers typing through EditContext events that React doesn't
-  // treat as discrete, so that effect can run after the next keystroke is
-  // already in the model. It then wrote the previous keystroke's text over it:
-  // characters vanished and the caret jumped to the end, so `{ tie` became
-  // `{ t}e` and completions had nothing to match. A layout effect runs in the
-  // same task as the render, before any further input can land.
-  useLayoutEffect(() => {
-    if (editorRef.current) pushValue(editorRef.current);
-  }, [shownValue, pushValue]);
+  // The parent's value goes into the model through this, not through the
+  // library's `value` prop, whose late write turned `{ tie` into `{ t}e` and
+  // left completions nothing to match.
+  const valueSync = useMonacoValue(shownValue, onChange);
 
   const editorHeight =
     height ?? (singleLine ? (growable ? (grownHeight ?? singleLineRowPx) : singleLineRowPx) : 120);
@@ -241,12 +219,8 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
       defaultLanguage="javascript"
       language="javascript"
       theme={theme}
-      // Only the text the model is created with. Later values are written by
-      // the layout effect above; see there for why not by the library.
-      defaultValue={shownValue}
-      onChange={(v) => {
-        if (!pushingValueRef.current) onChange(v ?? '');
-      }}
+      defaultValue={valueSync.defaultValue}
+      onChange={valueSync.onChange}
       wrapperProps={testid ? { 'data-testid': testid } : undefined}
       beforeMount={(monaco: Monaco) => {
         // Query text is mongosh-style, not strict JSON: unquoted keys, single
@@ -284,9 +258,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
         // sits in has to grow with wrapped content. The callback reads refs so
         // settings changed after mount cannot leave it using stale metrics.
         editorRef.current = ed;
-        // The model was created from the value of an earlier render; catch up
-        // with one that arrived before the editor was ready.
-        pushValue(ed);
+        valueSync.onMount(ed, monaco);
         const contentSizeSubscription = ed.onDidContentSizeChange(followGrowableContent);
         followGrowableContent();
 
