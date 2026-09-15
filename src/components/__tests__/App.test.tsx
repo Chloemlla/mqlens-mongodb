@@ -871,7 +871,7 @@ describe('App Component', () => {
       // keyed error could not tell from a new edit beginning.
       fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
       await screen.findByText(/"John Doe"/);
-      fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+      fireEvent.click(screen.getAllByTestId('edit-doc-btn').find((b) => !b.closest('[hidden]'))!);
       await screen.findByTestId('document-json-input');
 
       // Only now does the customers insert fail, with its own dialog off screen.
@@ -911,7 +911,7 @@ describe('App Component', () => {
       // A different tab's edit is savable while this one is still in flight.
       fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
       await screen.findByText(/"John Doe"/);
-      fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+      fireEvent.click(screen.getAllByTestId('edit-doc-btn').find((b) => !b.closest('[hidden]'))!);
       await screen.findByTestId('document-json-input');
       expect(screen.getByTestId('document-save-btn')).not.toBeDisabled();
 
