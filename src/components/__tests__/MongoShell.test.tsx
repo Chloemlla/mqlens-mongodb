@@ -575,6 +575,8 @@ describe('MongoShell Component', () => {
           { name: 'email_1', keys: '{"email":1}', unique: true, sparse: false },
           { name: 'city_1_age_-1', keys: '{"city":1,"age":-1}', unique: false, sparse: true },
           { name: 'loc_2dsphere', keys: '{"loc":"2dsphere"}', unique: false, sparse: false },
+          { name: 'profile.email_1', keys: '{"profile.email":1}', unique: false, sparse: false },
+          { name: '$**_1', keys: '{"$**":1}', unique: false, sparse: false },
         ]);
       }
       return defaultInvoke(cmd, args);
@@ -620,6 +622,19 @@ describe('MongoShell Component', () => {
       "      loc: '2dsphere'",
       '    },',
       "    name: 'loc_2dsphere'",
+      '  },',
+      // Non-identifier keys are quoted, as mongosh prints them.
+      '  {',
+      '    key: {',
+      "      'profile.email': 1",
+      '    },',
+      "    name: 'profile.email_1'",
+      '  },',
+      '  {',
+      '    key: {',
+      "      '$**': 1",
+      '    },',
+      "    name: '$**_1'",
       '  }',
       ']',
     ].join('\n');

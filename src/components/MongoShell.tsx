@@ -195,6 +195,11 @@ const firstArg = (argText: string) => {
   return argText;
 };
 
+// mongosh prints with util.inspect, which leaves identifier-like keys bare and
+// quotes the rest: `{ 'profile.email': 1 }`, `{ '$**': 1 }`.
+const shellKey = (key: string): string =>
+  /^[a-zA-Z_][a-zA-Z_0-9]*$/.test(key) ? key : `'${key.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+
 const stringifyShellValue = (value: unknown, indent = 0): string => {
   const pad = '  '.repeat(indent);
   const padNext = '  '.repeat(indent + 1);
@@ -210,7 +215,7 @@ const stringifyShellValue = (value: unknown, indent = 0): string => {
     const entries = Object.entries(value as Record<string, unknown>);
     if (entries.length === 0) return '{}';
     return `{\n${entries
-      .map(([key, val]) => `${padNext}${key}: ${stringifyShellValue(val, indent + 1)}`)
+      .map(([key, val]) => `${padNext}${shellKey(key)}: ${stringifyShellValue(val, indent + 1)}`)
       .join(',\n')}\n${pad}}`;
   }
   return String(value);
