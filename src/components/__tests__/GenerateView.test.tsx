@@ -24,18 +24,22 @@ vi.mock('../dialogs/DialogProvider', () => ({
 // Monaco does not render usable DOM under jsdom — mock with a plain textarea
 // that round-trips value/onChange, same pattern as DumpView/App tests.
 vi.mock('@monaco-editor/react', () => ({
+  // QueryEditor hands the library only `defaultValue` (it writes later values
+  // into the model itself), so show whichever one the editor was given.
   default: ({
     value,
+    defaultValue,
     onChange,
     wrapperProps,
   }: {
-    value: string;
+    value?: string;
+    defaultValue?: string;
     onChange?: (v: string) => void;
     wrapperProps?: Record<string, unknown>;
   }) => (
     <textarea
       data-testid={wrapperProps?.['data-testid'] as string | undefined}
-      value={value}
+      value={value ?? defaultValue}
       onChange={(e) => onChange?.(e.target.value)}
     />
   ),
