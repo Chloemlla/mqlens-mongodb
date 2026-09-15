@@ -1524,6 +1524,37 @@ pub fn parse_command_template(
     Ok((program, args))
 }
 
+/// How many times a spawn refused with ETXTBSY is retried before its error is
+/// reported. See [`spawn_waiting_out_busy`].
+const SPAWN_BUSY_RETRIES: u32 = 20;
+/// Upper bound on the (doubling) wait between ETXTBSY retries. With
+/// [`SPAWN_BUSY_RETRIES`] this caps the total wait at under a second.
+const SPAWN_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Spawn `command`, retrying while exec fails with ETXTBSY ("Text file busy").
+///
+/// Linux refuses to exec a file that anything holds open for writing. An agent
+/// CLI caught while it is being installed or updated hits that, and so does one
+/// written just before the spawn: a process forked by another thread while the
+/// writer's fd was open inherits the fd and keeps it until that child execs
+/// (`O_CLOEXEC` closes it only then). The state clears on its own within
+/// moments, and a refused exec ran nothing, so a retry cannot repeat a side
+/// effect. Every other spawn error (e.g. `NotFound`) returns immediately.
+async fn spawn_waiting_out_busy(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < SPAWN_BUSY_RETRIES => {
+                tokio::time::sleep(Duration::from_millis(1 << attempt.min(6)).min(SPAWN_BUSY_MAX_BACKOFF)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run a local agent CLI with the given prompt and extract the {filter, sort} JSON
 /// from its stdout. Uses the agent's own local auth; no API key involved.
 pub async fn generate_local(
@@ -1555,15 +1586,17 @@ pub async fn generate_local(
     // buffers the whole of stdout before any limit can be consulted, so a tool
     // returning a megabyte per call could exhaust the app before parsing began —
     // a cap applied afterwards bounds the transcript, not the memory.
-    let mut child = tokio::process::Command::new(&program)
+    let mut command = tokio::process::Command::new(&program);
+    command
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Tokio does not kill a child when the future is dropped; without this a
         // timed-out command keeps running after the UI has given up on it.
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    let mut child = spawn_waiting_out_busy(&mut command)
+        .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!("'{}' not found on PATH. Install it or fix the command in Settings.", program)
