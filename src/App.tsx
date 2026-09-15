@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useReducer } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useReducer } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { AppShell } from '@/components/layout/AppShell';
@@ -618,9 +618,10 @@ function Workspace() {
   // Foreign-event reconciliation (below) runs inside a `listen` callback
   // captured once at mount — it can never see a fresh `tabs` STATE value
   // from that closure, same staleness problem `activeConnectionsRef` exists
-  // to solve for `handleBuilderStateChange`. Mirrors `tabs` on every change.
+  // to solve for `handleBuilderStateChange`. Mirrors `tabs` on every change,
+  // in a layout effect for the reason given on `activeConnectionsRef` below.
   const tabsRef = useRef<QueryTab[]>(tabs);
-  useEffect(() => {
+  useLayoutEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
   const [layout, dispatchLayout] = useReducer(
@@ -704,8 +705,15 @@ function Workspace() {
   // fresh `activeConnections` STATE value from its closure — it would stay
   // pinned at mount's `[]` forever. A ref mirrors the state on every change
   // so the callback can read the current connections via `.current` instead.
+  //
+  // A layout effect, not a passive one: the `connections-changed` listener
+  // reads this ref too, and React runs passive effects in a task it schedules
+  // after the commit. A broadcast handled in between found a just-opened
+  // connection already on screen but missing here, so it skipped the
+  // self-heal re-announce for it. A layout effect runs inside the commit, so
+  // no event can see the DOM and this ref disagree.
   const activeConnectionsRef = useRef<ActiveConnection[]>(activeConnections);
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeConnectionsRef.current = activeConnections;
   }, [activeConnections]);
   // Every CONNECTION id this window has ever learned about from a

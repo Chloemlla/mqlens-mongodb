@@ -4322,6 +4322,50 @@ describe('App Component', () => {
       });
     });
 
+    it('(f1) the self-heal still fires for a broadcast that lands right after the sidebar row commits, before passive effects have flushed', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'load_connection_profiles') {
+          return Promise.resolve([{ id: 'p1', name: 'Prod Cluster', uri: 'mongodb://prod', ssh: null }]);
+        }
+        if (cmd === 'connect_db') return Promise.resolve('live-1');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+
+      const connectCard = await screen.findByTestId('conn-card-p1');
+      // Pins the timing (f) above only hits under load: a MutationObserver
+      // callback runs in the microtask right after the commit that inserts the
+      // row, before React's scheduled passive-effect flush. The listener reads
+      // `activeConnectionsRef`, so it must already hold 'live-1' by then.
+      let fired = false;
+      const observer = new MutationObserver(() => {
+        if (fired || !screen.queryByTestId('sidebar-conn-live-1')) return;
+        observer.disconnect();
+        fired = true;
+        calls.length = 0;
+        fireMockEvent('connections-changed', {
+          connections: [{ id: 'live-other', profileId: 'p-other', name: 'Other Cluster' }],
+        });
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      fireEvent.click(connectCard);
+      await waitFor(() => expect(fired).toBe(true));
+
+      expect(screen.getByTestId('sidebar-conn-live-1')).toBeInTheDocument();
+      expect(calls.some((c) => c.cmd === 'disconnect_db')).toBe(false);
+      await waitFor(() => {
+        expect(
+          calls.some(
+            (c) => c.cmd === 'set_connection_meta' && c.args?.id === 'live-1' && c.args?.profileId === 'p1',
+          ),
+        ).toBe(true);
+      });
+    });
+
     it('(f2) a self-heal re-announce for a read_only connection preserves read_only — does NOT reset to normal (#188 Task 5 regression)', async () => {
       const calls: any[] = [];
       mockInvoke.mockImplementation((cmd: string, args: any) => {
