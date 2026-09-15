@@ -16,6 +16,7 @@ import {
 } from '@/components/ui/dialog';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { AIChatPanel, type ChatMessage } from './AIChatPanel';
+import type { IndexInfo } from './Sidebar';
 import { buildRunnableCommand, guardScriptRun, type GeneratedQuery } from '../lib/mongoCommand';
 import { DataGrid } from './DataGrid';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
@@ -194,6 +195,11 @@ const firstArg = (argText: string) => {
   return argText;
 };
 
+// mongosh prints with util.inspect, which leaves identifier-like keys bare and
+// quotes the rest: `{ 'profile.email': 1 }`, `{ '$**': 1 }`.
+const shellKey = (key: string): string =>
+  /^[a-zA-Z_][a-zA-Z_0-9]*$/.test(key) ? key : `'${key.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+
 const stringifyShellValue = (value: unknown, indent = 0): string => {
   const pad = '  '.repeat(indent);
   const padNext = '  '.repeat(indent + 1);
@@ -209,11 +215,28 @@ const stringifyShellValue = (value: unknown, indent = 0): string => {
     const entries = Object.entries(value as Record<string, unknown>);
     if (entries.length === 0) return '{}';
     return `{\n${entries
-      .map(([key, val]) => `${padNext}${key}: ${stringifyShellValue(val, indent + 1)}`)
+      .map(([key, val]) => `${padNext}${shellKey(key)}: ${stringifyShellValue(val, indent + 1)}`)
       .join(',\n')}\n${pad}}`;
   }
   return String(value);
 };
+
+/**
+ * `list_indexes` rows in the shape mongosh prints for `getIndexes()`: `key`
+ * holds the parsed key pattern, and `unique`/`sparse` appear only when set.
+ * The backend has no index version, so there is no `v`. A key pattern that
+ * does not parse is shown as the raw string rather than hidden.
+ */
+export const toShellIndexes = (indexes: IndexInfo[]) =>
+  indexes.map(({ name, keys, unique, sparse }) => {
+    let key: unknown = keys;
+    try {
+      key = JSON.parse(keys);
+    } catch {
+      // Keep the raw string.
+    }
+    return { key, name, ...(unique && { unique }), ...(sparse && { sparse }) };
+  });
 
 /**
  * A transcript entry as plain text — what the user sees, and what find searches.
@@ -1319,8 +1342,8 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           appendEntries([{ kind: 'value', value: count }, { kind: 'note', text: `${Math.round((performance.now() - started) * 10) / 10} ms` }]);
           setTab('console');
         } else if (op === 'getIndexes') {
-          const indexes = await invoke<string[]>('list_indexes', { id: connectionId, db: currentDb, collection: collName });
-          appendEntries([{ kind: 'value', value: indexes.map((name) => ({ name })) }]);
+          const indexes = await invoke<IndexInfo[]>('list_indexes', { id: connectionId, db: currentDb, collection: collName });
+          appendEntries([{ kind: 'value', value: toShellIndexes(indexes) }]);
           setTab('console');
         }
         return;

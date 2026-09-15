@@ -566,6 +566,87 @@ describe('MongoShell Component', () => {
     expect(await screen.findByText('"Alice Smith"')).toBeInTheDocument();
   });
 
+  it('prints getIndexes() as the index specs list_indexes returns, like mongosh', async () => {
+    const defaultInvoke = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'list_indexes') {
+        return Promise.resolve([
+          { name: '_id_', keys: '{"_id":1}', unique: false, sparse: false },
+          { name: 'email_1', keys: '{"email":1}', unique: true, sparse: false },
+          { name: 'city_1_age_-1', keys: '{"city":1,"age":-1}', unique: false, sparse: true },
+          { name: 'loc_2dsphere', keys: '{"loc":"2dsphere"}', unique: false, sparse: false },
+          { name: 'profile.email_1', keys: '{"profile.email":1}', unique: false, sparse: false },
+          { name: '$**_1', keys: '{"$**":1}', unique: false, sparse: false },
+        ]);
+      }
+      return defaultInvoke(cmd, args);
+    });
+    render(
+      <MongoShell
+        connectionId="conn-1"
+        connectionName="mock"
+        connectionUri="mongodb://prod-replica-set"
+        databaseName="sales_db"
+      />
+    );
+    await screen.findByText(/mongosh session attached/);
+
+    fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: 'db.customers.getIndexes()' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+
+    const expected = [
+      '[',
+      '  {',
+      '    key: {',
+      '      _id: 1',
+      '    },',
+      "    name: '_id_'",
+      '  },',
+      '  {',
+      '    key: {',
+      '      email: 1',
+      '    },',
+      "    name: 'email_1',",
+      '    unique: true',
+      '  },',
+      '  {',
+      '    key: {',
+      '      city: 1,',
+      '      age: -1',
+      '    },',
+      "    name: 'city_1_age_-1',",
+      '    sparse: true',
+      '  },',
+      '  {',
+      '    key: {',
+      "      loc: '2dsphere'",
+      '    },',
+      "    name: 'loc_2dsphere'",
+      '  },',
+      // Non-identifier keys are quoted, as mongosh prints them.
+      '  {',
+      '    key: {',
+      "      'profile.email': 1",
+      '    },',
+      "    name: 'profile.email_1'",
+      '  },',
+      '  {',
+      '    key: {',
+      "      '$**': 1",
+      '    },',
+      "    name: '$**_1'",
+      '  }',
+      ']',
+    ].join('\n');
+    const transcript = screen.getByTestId('shell-transcript');
+    await waitFor(() => expect(transcript.textContent).toContain(expected));
+    expect(mockInvoke).toHaveBeenCalledWith('list_indexes', {
+      id: 'conn-1',
+      db: 'sales_db',
+      collection: 'customers',
+    });
+  });
+
   it('opens the AI panel; Insert fills the command box without running', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'get_mongodb_version') return Promise.resolve('7.0.5');
