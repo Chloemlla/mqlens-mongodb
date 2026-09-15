@@ -6,6 +6,9 @@ import type { E2EState } from '../state';
 import { recordTask } from '../tasks';
 
 /** The settings the AI provider options are built from, and the built-in keys (`ai_options_changed` in src-tauri/src/lib.rs). */
+/** The fields of an `AiProvider` that default to empty text when a stored one leaves them out. */
+const PROVIDER_DEFAULTS = { base_url: '', api_key: '', model: '', command: '', models_command: '' };
+
 const AI_OPTION_FIELDS = [
   'ai_provider', 'ai_providers', 'anthropic_model', 'openai_model', 'gemini_model', 'local_commands',
   'anthropic_api_key', 'openai_api_key', 'gemini_api_key',
@@ -94,7 +97,13 @@ export function registerAppHandlers(backend: Backend, state: E2EState): void {
     // Settings
     load_app_settings: () => {
       requireUnlocked();
-      return structuredClone(state.settings);
+      // Read back with serde's defaults, as `AppSettings` is: a provider stored
+      // without a key, a command or a model has each of them as empty text.
+      const settings = structuredClone(state.settings);
+      if (Array.isArray(settings.ai_providers)) {
+        settings.ai_providers = settings.ai_providers.map((provider) => ({ ...PROVIDER_DEFAULTS, ...(provider as object) }));
+      }
+      return settings;
     },
     patch_app_settings: async ({ patch }) => {
       requireUnlocked();

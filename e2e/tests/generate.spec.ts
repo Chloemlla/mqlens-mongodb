@@ -120,7 +120,8 @@ test.describe('Generate data', () => {
     await expect(view.getByTestId('generate-preview-error')).toContainText('unknown generator "$nope"');
 
     await setEditorText(page, editor, '{ "sku": ');
-    await expect(view.getByTestId('generate-preview-error')).toBeVisible();
+    // Its own message, so this isn't still the previous template's error.
+    await expect(view.getByTestId('generate-preview-error')).toContainText('Invalid JSON');
     await expect(view.getByTestId('generate-preview-doc')).toHaveCount(0);
 
     await setEditorText(page, editor, '{ "sku": "$uuid", "qty": { "$int": { "min": 1, "max": 1 } } }');
