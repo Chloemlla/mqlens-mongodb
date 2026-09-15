@@ -1438,6 +1438,9 @@ async fn connect_db(
     connect_db_impl(&state, &uri, ssh.as_ref()).await
 }
 
+/// Find mongodump/mongorestore: configured dir, managed install, then PATH.
+/// Probing spawns `--version` children and can wait out a briefly busy
+/// binary, so it runs off the async runtime.
 #[tauri::command]
 async fn detect_mongo_tools(
     app_handle: tauri::AppHandle,
@@ -1447,10 +1450,14 @@ async fn detect_mongo_tools(
     // app_data_dir() can fail in headless/test environments; treat that as
     // "no managed dir" rather than failing detection outright.
     let app_data_dir = app_handle.path().app_data_dir().ok();
-    let managed_dir = app_data_dir
-        .as_deref()
-        .and_then(|dir| toolsetup::find_pinned_tool("database-tools").ok().map(|tool| toolsetup::managed_bin_dir(dir, tool)));
-    Ok(db::mongotools::detect_mongo_tools(configured_dir.as_deref(), managed_dir.as_deref()))
+    tokio::task::spawn_blocking(move || {
+        let managed_dir = app_data_dir
+            .as_deref()
+            .and_then(|dir| toolsetup::find_pinned_tool("database-tools").ok().map(|tool| toolsetup::managed_bin_dir(dir, tool)));
+        db::mongotools::detect_mongo_tools(configured_dir.as_deref(), managed_dir.as_deref())
+    })
+    .await
+    .map_err(|e| format!("mongo tools detection failed: {}", e))
 }
 
 /// Find a working mongosh for the shell's guided-setup card: configured path,
