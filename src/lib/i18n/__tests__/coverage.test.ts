@@ -301,6 +301,12 @@ const EXEMPT_HITS: Record<string, string[]> = {
   'src/workspace/workspaceStore.ts': [
     "throw new Error('hydrate is frontend-only and must never be mirrored to workspace_apply'",
   ],
+  'src/App.tsx': [
+    // Written to the crash log (logFrontendError) when a window's event
+    // subscription is refused; never rendered. Kept English so bug reports
+    // stay searchable, like the console.* diagnostics beside it.
+    'listening for ${event} failed in window ${windowLabel()}: ${String(err)}',
+  ],
 
   // ── Detector false positives ─────────────────────────────────────────────
   // BSON type names shown in the tree view's Type column. Identifiers from the

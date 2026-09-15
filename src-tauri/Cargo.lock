@@ -6414,6 +6414,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures",
+ "glob",
  "mongodb",
  "rand 0.10.2",
  "reqwest 0.12.28",
