@@ -117,7 +117,7 @@ fn default_locale() -> String {
     "system".to_string()
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppearanceSettings {
     #[serde(default = "default_preset_id")]
     pub preset_id: String,
@@ -137,6 +137,26 @@ pub struct AppearanceSettings {
     pub ui_zoom: f32,
     #[serde(default = "default_query_bar_height")]
     pub query_bar_height: u8,
+}
+
+/// Written out rather than derived: a derived `Default` ignores the serde
+/// default functions above (they apply only when deserializing), so a fresh
+/// install's `AppSettings` carried an empty preset, mode and fonts and a zero
+/// font size.
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            preset_id: default_preset_id(),
+            mode: default_theme_mode(),
+            overrides: std::collections::HashMap::new(),
+            font_sans: default_font_sans(),
+            font_mono: default_font_mono(),
+            font_size: default_font_size(),
+            spacing_density: default_spacing_density(),
+            ui_zoom: default_ui_zoom(),
+            query_bar_height: default_query_bar_height(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1103,6 +1123,35 @@ pub async fn test_connection_uri(
         let _ = on_phase.send(update);
     };
     run_connection_test(&uri, ssh.as_ref(), &emit).await
+}
+
+#[cfg(test)]
+mod appearance_default_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_settings_carry_the_default_appearance() {
+        let appearance = AppSettings::default().appearance;
+        assert_eq!(appearance.preset_id, "mqlens-dark");
+        assert_eq!(appearance.mode, "dark");
+        assert_eq!(appearance.font_sans, "Inter");
+        assert_eq!(appearance.font_mono, "JetBrains Mono");
+        assert_eq!(appearance.font_size, 13);
+        assert_eq!(appearance.spacing_density, "cozy");
+        assert_eq!(appearance.ui_zoom, 1.0);
+        assert_eq!(appearance.query_bar_height, 29);
+        assert!(appearance.overrides.is_empty());
+    }
+
+    /// The two ways to get a default appearance — constructing one and reading a
+    /// settings file that lacks it — must not drift apart again.
+    #[test]
+    fn default_matches_deserializing_an_empty_appearance() {
+        let from_empty: AppearanceSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty, AppearanceSettings::default());
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.appearance, AppearanceSettings::default());
+    }
 }
 
 #[cfg(test)]
