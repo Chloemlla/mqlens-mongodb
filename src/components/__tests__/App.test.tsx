@@ -65,10 +65,12 @@ const mockInvoke = vi.fn();
 // that round-trips value/onChange — this keeps the existing stage tests, which
 // drive `pipeline-stage-N textarea`, working against the real component shape.
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, wrapperProps }: { value: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
+  // QueryEditor hands the library only `defaultValue` (it writes later values
+  // into the model itself), so show whichever one the editor was given.
+  default: ({ value, defaultValue, onChange, wrapperProps }: { value?: string; defaultValue?: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
     <textarea
       data-testid={wrapperProps?.['data-testid'] as string | undefined}
-      value={value}
+      value={value ?? defaultValue}
       onChange={(e) => onChange?.(e.target.value)}
     />
   ),
