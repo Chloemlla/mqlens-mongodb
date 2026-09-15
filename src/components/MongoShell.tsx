@@ -756,13 +756,13 @@ export const MongoShell: React.FC<MongoShellProps> = ({
 
     const updateStartupEntry = (mongodbVersion: string, mongoshVersion: string) => {
       if (cancelled) return;
-      setEntries((prev) => {
+      changeEntries((prev) => {
         if (prev.length === 0 || prev[0].kind !== 'text') return prev;
+        const lines = buildStartupLines(startupLogId, connectionTarget, mongodbVersion, mongoshVersion);
+        // Unchanged, as on a fresh mount: no write, so nothing to notify.
+        if (prev[0].lines.join('\n') === lines.join('\n')) return prev;
         const next = [...prev];
-        next[0] = {
-          kind: 'text',
-          lines: buildStartupLines(startupLogId, connectionTarget, mongodbVersion, mongoshVersion),
-        };
+        next[0] = { kind: 'text', lines };
         return next;
       });
     };
@@ -808,20 +808,19 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       mountedRef.current = false;
     };
   }, []);
-  const appendEntries = (added: ShellEntry[]) => {
-    if (added.length === 0) return;
+  const changeEntries = (update: (current: ShellEntry[]) => ShellEntry[]) => {
     if (!sessionKey) {
       // No tab identity: this instance's state is the only transcript there is.
       if (mountedRef.current) {
         setEntries((prev) => {
-          const next = [...prev, ...added];
+          const next = update(prev);
           entriesRef.current = next;
           return next;
         });
       }
       return;
     }
-    // Append against the REGISTRY, mounted or not. A slow command can still be
+    // Change the REGISTRY, mounted or not. A slow command can still be
     // running when the tab is switched away and back, leaving two MongoShell
     // instances alive with two independent `entriesRef`s. Basing either one on
     // its own snapshot means the later completion silently drops whatever the
@@ -829,14 +828,26 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     // command finishes after the remount, the mounted instance's next append
     // (and the mirror effect behind it) would overwrite the registry with a
     // `prev` that never saw that output.
+    //
+    // Every change goes this way, not only appends. One made with `setEntries`
+    // alone is not in the registry until the mirror effect runs, and any write
+    // landing before then notifies the watcher with the stored transcript,
+    // which replaces the change before it is ever saved: `cls` was undone by
+    // its own command's completion, and the banner kept saying "detecting...".
     const base = readShellSession(sessionKey)?.entries ?? entriesRef.current;
-    const next = [...base, ...added];
+    const next = update(base);
+    if (next === base) return;
     entriesRef.current = next;
     // Also show it here, so the visible console reflects everything the tab has
     // accumulated rather than only what this instance witnessed.
     if (mountedRef.current) setEntries(next);
     persistSession({ entries: next });
   };
+  const appendEntries = (added: ShellEntry[]) => {
+    if (added.length === 0) return;
+    changeEntries((current) => [...current, ...added]);
+  };
+  const clearTranscript = () => changeEntries(() => []);
 
   const appendCommandOutput = (output: MongoshCommandOutput) => {
     const nextEntries: ShellEntry[] = [];
@@ -1219,7 +1230,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     setActive(started);
     try {
       if (/^(cls|clear)$/i.test(raw)) {
-        setEntries([]);
+        clearTranscript();
         setTab('console');
         return;
       }
@@ -1650,7 +1661,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           </Tabs>
           <span className="flex-1" />
           {tab === 'console' ? (
-            <Button type="button" variant="ghost" size="icon" className="h-7 w-7" title={t('mongoShell.console.clearTitle')} onClick={() => setEntries([])}>
+            <Button type="button" variant="ghost" size="icon" className="h-7 w-7" title={t('mongoShell.console.clearTitle')} onClick={clearTranscript}>
               <Eraser size={12} />
             </Button>
           ) : (
