@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for every app window: the main window and the secondary `win-N` windows a tab is detached into. They all run the same frontend, so a permission missing here breaks that feature in a detached window — and a missing event permission leaves it deaf to connections-changed/workspace-changed.",
+  "windows": ["main", "win-*"],
   "permissions": [
     "core:default",
     "opener:default",
@@ -10,7 +10,6 @@
     "fs:default",
     "fs:allow-read-text-file",
     "fs:allow-write-text-file",
-    "updater:default",
     "process:allow-restart"
   ]
 }

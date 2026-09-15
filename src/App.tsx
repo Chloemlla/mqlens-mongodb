@@ -88,6 +88,7 @@ import {
   type ConnectionsChangedPayload,
   type ConnectionEntry,
 } from './workspace/workspaceStore';
+import { logFrontendError } from './lib/crashLog';
 import {
   toPersistedTab,
   isEphemeralProfileId,
@@ -3452,14 +3453,21 @@ function Workspace() {
   useEffect(() => {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
-    const own = (p: Promise<() => void>) => {
+    // A rejected subscription leaves this window deaf to `event` for its whole
+    // life — which is what a secondary window whose label no capability
+    // covered looked like: it never heard a disconnect. Log it, never swallow.
+    const own = (event: string, p: Promise<() => void>) => {
       p.then((unlisten) => {
         if (cancelled) unlisten();
         else unlistenFns.push(unlisten);
-      }).catch(() => {});
+      }).catch((err) => {
+        console.warn(`listening for ${event} failed`, err);
+        logFrontendError(`listening for ${event} failed in window ${windowLabel()}: ${String(err)}`);
+      });
     };
 
     own(
+      'workspace-changed',
       subscribeWorkspaceChanged((payload: WorkspaceChangedPayload) => {
         // Drop a replayed/out-of-order event — revisions only ever
         // increase, so anything at or below what's already applied adds
@@ -3677,6 +3685,7 @@ function Workspace() {
     );
 
     own(
+      'connections-changed',
       subscribeConnectionsChanged((payload: ConnectionsChangedPayload) => {
         // Connection-id keyed, NOT profileId keyed (final fix wave,
         // agent-connection visibility): a profile can now legitimately have
