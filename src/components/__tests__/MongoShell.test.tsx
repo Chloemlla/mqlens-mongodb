@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MongoShell } from '../MongoShell';
 import {
   readShellSession,
@@ -1273,6 +1273,79 @@ describe('MongoShell Component', () => {
       });
 
       expect(await screen.findByText('late arrival')).toBeInTheDocument();
+    });
+
+    it('cls leaves only an empty console once the command has finished', async () => {
+      // `cls` emptied this instance's state and nothing else. The command's own
+      // completion then wrote the tab's session, and the watcher put the stored
+      // transcript — still the full one, since the mirror effect had not run —
+      // straight back over the cleared console.
+      const first = render(<MongoShell {...shellProps} sessionKey="tab-shell-cls" />);
+      await screen.findByText(/mongosh session attached/);
+      const editor = screen.getByLabelText('mongosh editor');
+      fireEvent.change(editor, { target: { value: 'db.stats()' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+      await screen.findByText('mongosh result');
+
+      fireEvent.change(editor, { target: { value: 'cls' } });
+      fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+
+      await waitFor(() => expect(readShellSession('tab-shell-cls')?.activeCommand).toBeNull());
+      const transcript = screen.getByTestId('shell-transcript');
+      expect(within(transcript).getByText(/Console cleared/)).toBeInTheDocument();
+      expect(within(transcript).queryByText('mongosh result')).not.toBeInTheDocument();
+      expect(within(transcript).queryByText(/Current Mongosh Log ID/)).not.toBeInTheDocument();
+      expect(readShellSession('tab-shell-cls')?.entries).toEqual([]);
+
+      // And it stays cleared across a tab switch.
+      first.unmount();
+      render(<MongoShell {...shellProps} sessionKey="tab-shell-cls" />);
+      expect(screen.getByText(/Console cleared/)).toBeInTheDocument();
+    });
+
+    it('the Clear button survives a write that lands before it renders', async () => {
+      render(<MongoShell {...shellProps} sessionKey="tab-shell-eraser" />);
+      await screen.findByText(/mongosh session attached/);
+
+      act(() => {
+        screen.getByTitle('Clear console').click();
+        // Anything else writing the tab's session in the same moment.
+        writeShellSession('tab-shell-eraser', { aiOpen: false });
+      });
+
+      expect(screen.getByText(/Console cleared/)).toBeInTheDocument();
+      expect(readShellSession('tab-shell-eraser')?.entries).toEqual([]);
+    });
+
+    it('shows the detected versions in the banner', async () => {
+      // The version update was local-only as well, so a write that landed
+      // before it rendered — the session attaching, say — put the stored
+      // "detecting..." banner back, and nothing ever replaced it again.
+      let resolveMongosh: (version: string) => void = () => {};
+      const defaults = mockInvoke.getMockImplementation()!;
+      mockInvoke.mockImplementation((cmd: string, args: unknown) =>
+        cmd === 'test_mongosh_path'
+          ? new Promise((res) => { resolveMongosh = res; })
+          : defaults(cmd, args)
+      );
+      render(<MongoShell {...shellProps} sessionKey="tab-shell-banner" />);
+      await screen.findByText(/mongosh session attached/);
+      expect(screen.getByText(/Using Mongosh: detecting\.\.\./)).toBeInTheDocument();
+
+      await act(async () => {
+        resolveMongosh('2.1.1');
+        // Lets the version update queue without rendering it (act holds the
+        // render until this callback returns), then writes from elsewhere.
+        await new Promise((r) => setTimeout(r, 0));
+        writeShellSession('tab-shell-banner', { aiOpen: false });
+      });
+
+      expect(screen.getByText(/Using MongoDB: 7\.0\.5\s+Using Mongosh: 2\.1\.1/)).toBeInTheDocument();
+      const banner = readShellSession('tab-shell-banner')?.entries[0];
+      expect(banner).toMatchObject({
+        kind: 'text',
+        lines: expect.arrayContaining([expect.stringMatching(/Using Mongosh: 2\.1\.1/)]),
+      });
     });
 
     it('a remount around a pending start ends up attached to exactly one child', async () => {
