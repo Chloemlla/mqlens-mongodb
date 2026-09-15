@@ -21,6 +21,7 @@ import { buildRunnableCommand, guardScriptRun, type GeneratedQuery } from '../li
 import { DataGrid } from './DataGrid';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
 import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
+import { useMonacoValue } from '../lib/useMonacoValue';
 import { attachMonaco } from '../lib/monacoAppTheme';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 import { windowLabel } from '../workspace/workspaceStore';
@@ -394,6 +395,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     [collectionName, initialCommand]
   );
   const [command, setCommand] = useState(defaultCommand);
+  const commandEditor = useMonacoValue(command, setCommand);
   const monacoTheme = useMonacoTheme();
   const monacoFontSize = useMonacoFontSize(13);
   const [isAIOpen, setIsAIOpenState] = useState(storedSession?.aiOpen ?? false);
@@ -1572,8 +1574,10 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         </div>
         <div className="min-h-0 flex-1">
           <Editor
-            value={command}
-            onChange={(value) => setCommand(value || '')}
+            // Not `value`: the library's own write of it can land on the next
+            // keystroke (see useMonacoValue).
+            defaultValue={commandEditor.defaultValue}
+            onChange={commandEditor.onChange}
             defaultLanguage="javascript"
             theme={monacoTheme}
             options={{
@@ -1595,6 +1599,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               acceptSuggestionOnEnter: 'on',
             }}
             onMount={(editor, monaco) => {
+              commandEditor.onMount(editor, monaco);
               attachMonaco(monaco);
               monaco.editor.setTheme(monacoTheme);
               // Enter accepts an open suggestion, else newline. Ctrl/Cmd+Enter

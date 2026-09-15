@@ -89,6 +89,7 @@ function createFakeEditor(initialValue: string) {
       return { dispose: vi.fn() };
     },
     getContentHeight: () => mockContentHeight,
+    getOption: () => false,
     getValue: () => lines.join('\r\n'),
     setValue: (text: string) => replaceText(text),
     executeEdits: (_source: string, edits: Array<{ text: string }>) => {
@@ -142,7 +143,7 @@ vi.mock('@monaco-editor/react', async () => {
       options?: Record<string, unknown>;
       height?: number | string;
       wrapperProps?: Record<string, unknown>;
-      onMount?: (ed: unknown, monaco: { KeyCode: typeof KeyCode; editor: { defineTheme: () => void; setTheme: () => void } }) => void;
+      onMount?: (ed: unknown, monaco: { KeyCode: typeof KeyCode; editor: { defineTheme: () => void; setTheme: () => void; EditorOption: { readOnly: number } } }) => void;
     }) => {
       lastOptions = options;
       lastHeight = height;
@@ -155,7 +156,7 @@ vi.mock('@monaco-editor/react', async () => {
       React.useEffect(() => {
         const ed = editorRef.current!;
         lastEditor = ed;
-        onMount?.(ed, { KeyCode, editor: { defineTheme: vi.fn(), setTheme: vi.fn() } });
+        onMount?.(ed, { KeyCode, editor: { defineTheme: vi.fn(), setTheme: vi.fn(), EditorOption: { readOnly: 0 } } });
         ed.onDidChangeModelContent(() => {
           if (!pushingValue.current) onChangeRef.current?.(ed.getValue());
         });
