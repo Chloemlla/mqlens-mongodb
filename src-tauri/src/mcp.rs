@@ -127,6 +127,12 @@ pub struct McpControl {
     /// helper has to be confirmed by the user in the app first. The agent is
     /// handed this one and never the token an external client uses.
     pub helper_token: String,
+    /// Test-only: the next request to pass the bearer check takes this, reports
+    /// that it got through, and waits to be let go before it is served. It
+    /// gives a test a request that is provably accepted and still in flight
+    /// without guessing at timing. See `tests::hold_after_auth`.
+    #[cfg(test)]
+    pub(crate) hold_after_auth: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 impl McpControl {
@@ -139,6 +145,8 @@ impl McpControl {
             server: None,
             session_connections: std::collections::HashSet::new(),
             helper_token: String::new(),
+            #[cfg(test)]
+            hold_after_auth: None,
         }
     }
 }
@@ -1364,6 +1372,8 @@ async fn run_server(listener: TcpListener, mcp: Arc<StdMutex<McpControl>>, app_h
                     // or the agent could take the external one and escape them.
                     let helper_path = req.uri().path().starts_with(MCP_HELPER_PATH);
                     if bearer_token_matches(&mcp, req.headers(), helper_path) {
+                        #[cfg(test)]
+                        tests::hold_after_auth(&mcp).await;
                         next.run(req).await
                     } else {
                         unauthorized_response()
@@ -2233,6 +2243,17 @@ mod tests {
         }
     }
 
+    /// The serving half of `McpControl::hold_after_auth`, called by the auth
+    /// middleware once a token has matched. Taken rather than borrowed, so one
+    /// request is held however many arrive, and the guard is gone before the wait.
+    pub(super) async fn hold_after_auth(control: &StdMutex<McpControl>) {
+        let hold = control.lock().unwrap().hold_after_auth.take();
+        if let Some((passed, release)) = hold {
+            let _ = passed.send(());
+            let _ = release.await;
+        }
+    }
+
     #[tokio::test]
     async fn graceful_stop_lets_an_in_flight_request_finish_and_still_frees_the_port() {
         let state = AppState::new();
@@ -2242,17 +2263,39 @@ mod tests {
         let mut client = TestClient::new(status.port, &status.token);
         client.initialize().await;
 
-        // Fire a real request on its own task and give it a small head start
-        // to actually get *accepted* (axum's graceful shutdown only waits for
-        // connections already accepted at the moment the signal fires — a
-        // connection still mid-handshake when shutdown is signalled is fair
-        // game to be refused, so racing the two with zero head start would
-        // make this test flaky on scheduling order rather than proving
-        // anything about graceful shutdown). The mandate under test is: once
-        // accepted, an in-flight request finishes instead of being hard-cut.
-        let ping_task = tokio::spawn(async move { client.call(9, "tools/call", json!({"name": "ping", "arguments": {}})).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        stop_if_running(&state).await.unwrap();
+        // The mandate under test is: once accepted, an in-flight request
+        // finishes instead of being hard-cut. A request the server has not
+        // taken in yet when the stop begins is fair game to be refused, so the
+        // stop must not begin until this one is past the bearer check. A fixed
+        // 20ms head start could not promise that. Under load the server had not
+        // read the ping by then, so the stop won: either the token was already
+        // cleared when the ping reached the check (401), or its keep-alive
+        // connection was still idle and was closed. The request is instead held
+        // just past authentication, and let go only once the stop has cleared
+        // the token and signalled shutdown, so it is provably still in flight
+        // while the server shuts down.
+        let (passed_tx, passed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        state.mcp.lock().unwrap().hold_after_auth = Some((passed_tx, release_rx));
+
+        let mut ping_task = tokio::spawn(async move { client.call(9, "tools/call", json!({"name": "ping", "arguments": {}})).await });
+        tokio::select! {
+            passed = passed_rx => passed.expect("the hold must still be installed"),
+            // Otherwise a ping refused at the check would leave this waiting forever.
+            early = &mut ping_task => panic!("the ping ended without passing the bearer check: {early:?}"),
+        }
+
+        let (stopped, ()) = tokio::join!(stop_if_running(&state), async {
+            // `server` is taken under the same lock that clears the token, and
+            // the shutdown signal is sent before `stop_if_running` first yields,
+            // so once `server` is gone here both have happened.
+            while state.mcp.lock().unwrap().server.is_some() {
+                tokio::task::yield_now().await;
+            }
+            assert!(state.mcp.lock().unwrap().token.is_empty(), "the stop must have cleared the token");
+            release_tx.send(()).expect("the held request must still be waiting");
+        });
+        stopped.unwrap();
 
         let ping_result = ping_task.await.expect("ping task must not panic");
         let text = ping_result["result"]["content"][0]["text"].as_str().expect("in-flight ping must still complete");
