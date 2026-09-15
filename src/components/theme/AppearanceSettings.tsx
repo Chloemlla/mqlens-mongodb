@@ -28,6 +28,12 @@ import {
 } from "@/lib/themes/ui-scale";
 import { formatZoomShortcutHint } from "@/lib/shortcuts";
 
+// `a.click()` only starts the download; the browser reads the blob after this
+// handler returns. Whether the URL may be revoked in the same tick varies by
+// engine, so release it later. The theme file is a few KB, so holding it for a
+// minute costs nothing.
+const THEME_EXPORT_REVOKE_DELAY_MS = 60_000;
+
 export function AppearanceSettings() {
   const { t } = useTranslation("settings");
   const [importError, setImportError] = useState<string | null>(null);
@@ -56,7 +62,7 @@ export function AppearanceSettings() {
     a.href = url;
     a.download = "mqlens-theme.json";
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), THEME_EXPORT_REVOKE_DELAY_MS);
   };
 
   const handleImport = () => {
