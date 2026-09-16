@@ -65,10 +65,12 @@ const mockInvoke = vi.fn();
 // that round-trips value/onChange — this keeps the existing stage tests, which
 // drive `pipeline-stage-N textarea`, working against the real component shape.
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, wrapperProps }: { value: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
+  // QueryEditor hands the library only `defaultValue` (it writes later values
+  // into the model itself), so show whichever one the editor was given.
+  default: ({ value, defaultValue, onChange, wrapperProps }: { value?: string; defaultValue?: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
     <textarea
       data-testid={wrapperProps?.['data-testid'] as string | undefined}
-      value={value}
+      value={value ?? defaultValue}
       onChange={(e) => onChange?.(e.target.value)}
     />
   ),
@@ -869,7 +871,7 @@ describe('App Component', () => {
       // keyed error could not tell from a new edit beginning.
       fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
       await screen.findByText(/"John Doe"/);
-      fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+      fireEvent.click(screen.getAllByTestId('edit-doc-btn').find((b) => !b.closest('[hidden]'))!);
       await screen.findByTestId('document-json-input');
 
       // Only now does the customers insert fail, with its own dialog off screen.
@@ -909,7 +911,7 @@ describe('App Component', () => {
       // A different tab's edit is savable while this one is still in flight.
       fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
       await screen.findByText(/"John Doe"/);
-      fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+      fireEvent.click(screen.getAllByTestId('edit-doc-btn').find((b) => !b.closest('[hidden]'))!);
       await screen.findByTestId('document-json-input');
       expect(screen.getByTestId('document-save-btn')).not.toBeDisabled();
 
@@ -4313,6 +4315,50 @@ describe('App Component', () => {
       // Self-healing re-registration: re-announces this window's own live
       // connection so the backend's connection_meta map (and hence the next
       // broadcast) catches up.
+      await waitFor(() => {
+        expect(
+          calls.some(
+            (c) => c.cmd === 'set_connection_meta' && c.args?.id === 'live-1' && c.args?.profileId === 'p1',
+          ),
+        ).toBe(true);
+      });
+    });
+
+    it('(f1) the self-heal still fires for a broadcast that lands right after the sidebar row commits, before passive effects have flushed', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'load_connection_profiles') {
+          return Promise.resolve([{ id: 'p1', name: 'Prod Cluster', uri: 'mongodb://prod', ssh: null }]);
+        }
+        if (cmd === 'connect_db') return Promise.resolve('live-1');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+
+      const connectCard = await screen.findByTestId('conn-card-p1');
+      // Pins the timing (f) above only hits under load: a MutationObserver
+      // callback runs in the microtask right after the commit that inserts the
+      // row, before React's scheduled passive-effect flush. The listener reads
+      // `activeConnectionsRef`, so it must already hold 'live-1' by then.
+      let fired = false;
+      const observer = new MutationObserver(() => {
+        if (fired || !screen.queryByTestId('sidebar-conn-live-1')) return;
+        observer.disconnect();
+        fired = true;
+        calls.length = 0;
+        fireMockEvent('connections-changed', {
+          connections: [{ id: 'live-other', profileId: 'p-other', name: 'Other Cluster' }],
+        });
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      fireEvent.click(connectCard);
+      await waitFor(() => expect(fired).toBe(true));
+
+      expect(screen.getByTestId('sidebar-conn-live-1')).toBeInTheDocument();
+      expect(calls.some((c) => c.cmd === 'disconnect_db')).toBe(false);
       await waitFor(() => {
         expect(
           calls.some(

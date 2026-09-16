@@ -85,6 +85,14 @@ export function PaneView({
       ),
     [recency, pane.activeTabId, liveIds, tabs, keepAliveLimits]
   );
+  // Rendered in a fixed order, not in `mounted`'s recency order. Recency changes
+  // on every switch, and a reordered keyed list makes React move the kept tabs'
+  // DOM. In development StrictMode also re-runs every effect in a moved subtree
+  // without unmounting it: @monaco-editor/react disposes its editor in that
+  // cleanup, then calls setModel on it, and the hidden tab crashed with
+  // "InstantiationService has been disposed". Two ids always sort the same way,
+  // so showing, opening, reordering or evicting a tab moves no tab that stays.
+  const renderOrder = useMemo(() => [...mounted].sort(), [mounted]);
 
   const onDragOver = useCallback((e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes(TAB_DRAG_MIME)) return;
@@ -149,7 +157,7 @@ export function PaneView({
             A hidden tab is told so through `TabVisibleContext`. Views that poll
             on an interval — Monitoring, Watch — pause while hidden; otherwise
             every kept tab would keep its backend traffic going unseen. */}
-        {mounted.map((tabId) => (
+        {renderOrder.map((tabId) => (
           <div
             key={tabId}
             hidden={tabId !== pane.activeTabId}

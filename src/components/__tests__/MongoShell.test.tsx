@@ -24,14 +24,21 @@ vi.mock('@tauri-apps/plugin-opener', () => ({
   openUrl: (...args: any[]) => mockOpenUrl(...args),
 }));
 
+// The shell hands the library only `defaultValue` (useMonacoValue writes later
+// values into the model itself), so show whichever one the editor was given.
+let lastEditorProps: Record<string, unknown> | undefined;
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange }: any) => (
-    <textarea
-      aria-label="mongosh editor"
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-    />
-  ),
+  default: (props: any) => {
+    lastEditorProps = props;
+    const { value, defaultValue, onChange } = props;
+    return (
+      <textarea
+        aria-label="mongosh editor"
+        value={value ?? defaultValue}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    );
+  },
 }));
 
 describe('MongoShell Component', () => {
@@ -692,6 +699,10 @@ describe('MongoShell Component', () => {
     expect((screen.getByLabelText('mongosh editor') as HTMLTextAreaElement).value).toContain(
       'db.users.aggregate('
     );
+    // It gets there through useMonacoValue, not the library's `value` prop,
+    // whose late write landed on the next keystroke and erased it.
+    expect(lastEditorProps?.value).toBeUndefined();
+    expect(lastEditorProps?.defaultValue).toContain('db.users.aggregate(');
   });
 
   // Regression test: shell:mongoShell.toolbar.aiToggleLabel previously shipped

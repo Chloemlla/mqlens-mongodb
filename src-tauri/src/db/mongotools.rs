@@ -1162,17 +1162,48 @@ pub struct ToolsStatus {
     pub mongorestore: Option<ToolInfo>,
 }
 
+/// How many times [`run_version_probe`] retries a spawn that failed with
+/// ETXTBSY before giving up on the candidate.
+const PROBE_BUSY_RETRIES: u32 = 20;
+/// Upper bound on the (doubling) wait between ETXTBSY retries. With
+/// [`PROBE_BUSY_RETRIES`] this caps the total wait at under a second.
+const PROBE_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Spawn `<candidate> --version`, retrying while exec fails with ETXTBSY.
+///
+/// Why: Linux refuses to exec a file that anything holds open for writing.
+/// When a binary was only just written (a tool install, a test stub), a
+/// process forked by another thread while the writer's fd was open inherits
+/// that fd and keeps it until the child itself execs (`O_CLOEXEC` closes it
+/// only then). Until those children exec, spawning the new binary fails with
+/// "Text file busy" even though the file is complete and usable. The state
+/// clears on its own within moments, so a short bounded retry rides it out.
+/// Every other spawn error (e.g. `NotFound` while walking `PATH`) returns
+/// immediately.
+fn run_version_probe(candidate: &Path) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        let result = std::process::Command::new(candidate)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < PROBE_BUSY_RETRIES => {
+                std::thread::sleep(Duration::from_millis(1 << attempt.min(6)).min(PROBE_BUSY_MAX_BACKOFF));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run `<candidate> --version` and, if it succeeds, return the first line of
 /// stdout (trimmed) as the version string. Any spawn failure or non-zero-ish
 /// output is treated as "not this candidate" rather than an error.
 fn probe_tool(candidate: &std::path::Path) -> Option<ToolInfo> {
-    let output = std::process::Command::new(candidate)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    let output = run_version_probe(candidate).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1584,6 +1615,26 @@ mod tests {
             "a binary that prints a version line but exits non-zero must not be detected"
         );
         let _ = std::fs::remove_file(&tool);
+    }
+
+    /// A candidate that is still open for writing when first probed must be
+    /// detected once the writer lets go, not skipped for the next candidate.
+    /// The extra handle stands in for the write fd a concurrently forked child
+    /// inherits right after the tool is written (the ETXTBSY race).
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_waits_out_a_busy_binary() {
+        let tool = crate::db::mongotools::test_support::write_fake_tool("echo 'mongodump version: 1'\n");
+        let writer = std::fs::OpenOptions::new().write(true).open(&tool).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let info = probe_tool(&tool);
+        release.join().unwrap();
+        let _ = std::fs::remove_file(&tool);
+        let info = info.expect("a briefly busy binary must still be detected");
+        assert!(info.version.contains("version: 1"), "{:?}", info.version);
     }
 
     #[test]

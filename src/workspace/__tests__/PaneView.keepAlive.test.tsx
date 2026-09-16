@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useLayoutEffect, useReducer, useState } from 'react';
+import { StrictMode, useEffect, useLayoutEffect, useReducer, useState } from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { WorkspaceRoot } from '../WorkspaceRoot';
 import { createInitialLayout, workspaceReducer, type PaneNode } from '../model';
@@ -28,10 +28,15 @@ const mounts = new Map<string, number>();
 /** Whether tab a's content was in the document at each commit, as seen by tab c — the one
  *  tab that stays mounted through the switch back to a under a budget of two. */
 const aPresentAtCommit: boolean[] = [];
+/** Counts how many times each tab's mount effect has run, StrictMode re-runs included. */
+const effectRuns = new Map<string, number>();
 
 function Content({ tabId }: { tabId: string }) {
   const [typed, setTyped] = useState('');
   useState(() => mounts.set(tabId, (mounts.get(tabId) ?? 0) + 1));
+  useEffect(() => {
+    effectRuns.set(tabId, (effectRuns.get(tabId) ?? 0) + 1);
+  }, [tabId]);
   const tabVisible = useTabVisible();
   const [dialogOpen, setDialogOpen] = useState(false);
   useLayoutEffect(() => {
@@ -207,6 +212,35 @@ describe('PaneView — inactive tabs stay mounted (#240)', () => {
     expect(screen.queryByTestId('content-a')).toBeNull();
     expect(screen.getByTestId('content-b')).toBeInTheDocument();
     expect(screen.getByTestId('content-c')).toBeInTheDocument();
+  });
+
+  it('does not move or reconnect a kept tab when the active tab changes', () => {
+    // Kept tabs were rendered most-recent-first, so every switch reordered them
+    // and React moved the others' DOM. In development StrictMode also re-runs a
+    // moved subtree's effects: cleanup, then setup, with the component still
+    // mounted. @monaco-editor/react disposes its editor in that cleanup and
+    // then calls setModel on it — "InstantiationService has been disposed".
+    render(
+      <StrictMode>
+        <Harness tabIds={['a', 'b', 'c']} />
+      </StrictMode>
+    );
+    switchTo('b');
+    switchTo('c');
+    const container = screen.getByTestId('content-a').closest('[data-testid^="tab-content-"]')!.parentElement!;
+    const observer = new MutationObserver(() => {});
+    observer.observe(container, { childList: true });
+    const before = new Map(effectRuns);
+
+    switchTo('a');
+    switchTo('b');
+    switchTo('c');
+
+    // A move is a removal and an insertion; records are still queued here.
+    const moved = observer.takeRecords().flatMap((r) => Array.from(r.removedNodes));
+    observer.disconnect();
+    expect(moved).toEqual([]);
+    expect(effectRuns).toEqual(before);
   });
 
   it('budgets shells apart, so opening shells does not evict collection tabs', () => {

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, render } from '@testing-library/react';
+import { useEffect, useState } from 'react';
 
 type KeyDownHandler = (e: {
   keyCode: number;
@@ -88,6 +89,7 @@ function createFakeEditor(initialValue: string) {
       return { dispose: vi.fn() };
     },
     getContentHeight: () => mockContentHeight,
+    getOption: () => false,
     getValue: () => lines.join('\r\n'),
     setValue: (text: string) => replaceText(text),
     executeEdits: (_source: string, edits: Array<{ text: string }>) => {
@@ -107,6 +109,10 @@ function createFakeEditor(initialValue: string) {
       getFullModelRange: () => ({}),
     }),
     onDidDispose: vi.fn(),
+    /** A keystroke at the end of the line, where the caret is while typing. */
+    type(text: string) {
+      replaceText(lines.join('\r\n') + text);
+    },
     /** A user edit such as a paste: the new text, with the caret left after it. */
     paste(text: string) {
       replaceText(text);
@@ -124,23 +130,25 @@ vi.mock('@monaco-editor/react', async () => {
     // is pushed into the model as one edit while onChange is muted.
     default: ({
       value,
+      defaultValue,
       onChange,
       onMount,
       options,
       height,
       wrapperProps,
     }: {
-      value: string;
+      value?: string;
+      defaultValue?: string;
       onChange?: (v: string) => void;
       options?: Record<string, unknown>;
       height?: number | string;
       wrapperProps?: Record<string, unknown>;
-      onMount?: (ed: unknown, monaco: { KeyCode: typeof KeyCode; editor: { defineTheme: () => void; setTheme: () => void } }) => void;
+      onMount?: (ed: unknown, monaco: { KeyCode: typeof KeyCode; editor: { defineTheme: () => void; setTheme: () => void; EditorOption: { readOnly: number } } }) => void;
     }) => {
       lastOptions = options;
       lastHeight = height;
       const editorRef = React.useRef<FakeEditor | null>(null);
-      editorRef.current ??= createFakeEditor(value);
+      editorRef.current ??= createFakeEditor(value ?? defaultValue ?? '');
       const onChangeRef = React.useRef(onChange);
       onChangeRef.current = onChange;
       const pushingValue = React.useRef(false);
@@ -148,7 +156,7 @@ vi.mock('@monaco-editor/react', async () => {
       React.useEffect(() => {
         const ed = editorRef.current!;
         lastEditor = ed;
-        onMount?.(ed, { KeyCode, editor: { defineTheme: vi.fn(), setTheme: vi.fn() } });
+        onMount?.(ed, { KeyCode, editor: { defineTheme: vi.fn(), setTheme: vi.fn(), EditorOption: { readOnly: 0 } } });
         ed.onDidChangeModelContent(() => {
           if (!pushingValue.current) onChangeRef.current?.(ed.getValue());
         });
@@ -159,7 +167,7 @@ vi.mock('@monaco-editor/react', async () => {
           return;
         }
         const ed = editorRef.current!;
-        if (value === ed.getValue()) return;
+        if (value === undefined || value === ed.getValue()) return;
         pushingValue.current = true;
         try {
           ed.executeEdits('', [{ text: value }]);
@@ -171,7 +179,7 @@ vi.mock('@monaco-editor/react', async () => {
       return (
         <div
           data-testid={(wrapperProps?.['data-testid'] as string | undefined) ?? 'monaco'}
-          data-value={value}
+          data-value={value ?? defaultValue}
         />
       );
     },
@@ -438,5 +446,57 @@ describe('QueryEditor — multi-line text in a single-line field', () => {
     });
 
     expect(lastEditor!.getModel().getLineCount()).toBe(3);
+  });
+});
+
+describe('QueryEditor — typing ahead of React', () => {
+  beforeEach(() => {
+    lastEditor = undefined;
+  });
+
+  /**
+   * Types one key each time the parent commits new text, from a passive
+   * effect: the next keystroke reaching the model after React has rendered
+   * the previous one but before the rest of that render's passive effects
+   * have run. Chromium delivers Monaco's typing through EditContext events
+   * React doesn't treat as discrete, and on a slow CPU the E2E suite typed
+   * into exactly that gap. It sits before the editor so its effect runs first.
+   */
+  function NextKeystroke({ text, keys }: { text: string; keys: string[] }) {
+    useEffect(() => {
+      if (text !== '' && keys.length > 0) lastEditor!.type(keys.shift()!);
+    }, [text, keys]);
+    return null;
+  }
+
+  function TypedFilter({ keys }: { keys: string[] }) {
+    const [text, setText] = useState('');
+    return (
+      <>
+        <NextKeystroke text={text} keys={keys} />
+        <QueryEditor singleLine surface="filter" value={text} onChange={setText} fields={['tier']} />
+      </>
+    );
+  }
+
+  it('keeps every keystroke when the parent echoes each one back late', async () => {
+    const { getByTestId } = render(<TypedFilter keys={['i', 'e']} />);
+
+    await act(async () => {
+      lastEditor!.type('{ t');
+    });
+
+    // Written back from a passive effect, the echo of "{ t" replaced "{ ti"
+    // and the echo of "{ ti" replaced "{ te": the field ended up "{ te".
+    expect(lastEditor!.getValue()).toBe('{ tie');
+    expect(getByTestId('monaco').getAttribute('data-value')).toBe('{ tie');
+  });
+
+  it('still shows text the parent sets', () => {
+    const { rerender } = render(<QueryEditor singleLine surface="filter" value="{ a: 1 }" onChange={() => {}} fields={[]} />);
+    expect(lastEditor!.getValue()).toBe('{ a: 1 }');
+
+    rerender(<QueryEditor singleLine surface="filter" value="{ b: 2 }" onChange={() => {}} fields={[]} />);
+    expect(lastEditor!.getValue()).toBe('{ b: 2 }');
   });
 });

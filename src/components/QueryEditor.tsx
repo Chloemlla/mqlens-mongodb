@@ -4,6 +4,7 @@ import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '.
 import type { Surface } from '../lib/mongoCompletions';
 import type { SchemaMap } from '../lib/useCollectionSchema';
 import { useMonacoTheme, useMonacoFontSize, useMonacoScale } from '../lib/useMonacoTheme';
+import { useMonacoValue } from '../lib/useMonacoValue';
 import { useThemeOptional } from '@/hooks/use-theme';
 import { attachMonaco } from '../lib/monacoAppTheme';
 import { cn } from '@/lib/utils';
@@ -113,7 +114,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   // and the compact option rows beside it should not move when it does.
   const growable = singleLine && (large || growWithContent);
   const [grownHeight, setGrownHeight] = useState<number | null>(null);
-  const growthEditorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const growthMetricsRef = useRef({
     growable,
     lineHeight: singleLineLineHeight,
@@ -128,7 +129,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   };
   const followGrowableContent = useCallback(() => {
     const metrics = growthMetricsRef.current;
-    const ed = growthEditorRef.current;
+    const ed = editorRef.current;
     if (!metrics.growable || !ed) {
       setGrownHeight(null);
       return;
@@ -149,6 +150,16 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
   useEffect(() => {
     followGrowableContent();
   }, [followGrowableContent, growable, singleLineLineHeight, singleLinePadTop, singleLineRowPx]);
+
+  // Callers hand a single-line field pretty-printed JSON (the visual builder, a
+  // saved query, a history entry). Flattening it here means the editor never
+  // rewrites text it was given — and never reports a reflowed copy back through
+  // onChange, which the builder syncs its rules from.
+  const shownValue = singleLine ? toSingleLine(value) : value;
+  // The parent's value goes into the model through this, not through the
+  // library's `value` prop, whose late write turned `{ tie` into `{ t}e` and
+  // left completions nothing to match.
+  const valueSync = useMonacoValue(shownValue, onChange);
 
   const editorHeight =
     height ?? (singleLine ? (growable ? (grownHeight ?? singleLineRowPx) : singleLineRowPx) : 120);
@@ -208,12 +219,8 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
       defaultLanguage="javascript"
       language="javascript"
       theme={theme}
-      // Callers hand a single-line field pretty-printed JSON (the visual
-      // builder, a saved query, a history entry). Flattening it here means the
-      // editor never rewrites text it was given — and never reports a reflowed
-      // copy back through onChange, which the builder syncs its rules from.
-      value={singleLine ? toSingleLine(value) : value}
-      onChange={(v) => onChange(v ?? '')}
+      defaultValue={valueSync.defaultValue}
+      onChange={valueSync.onChange}
       wrapperProps={testid ? { 'data-testid': testid } : undefined}
       beforeMount={(monaco: Monaco) => {
         // Query text is mongosh-style, not strict JSON: unquoted keys, single
@@ -250,7 +257,8 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
         // `automaticLayout` handles width; height is ours, because the row it
         // sits in has to grow with wrapped content. The callback reads refs so
         // settings changed after mount cannot leave it using stale metrics.
-        growthEditorRef.current = ed;
+        editorRef.current = ed;
+        valueSync.onMount(ed, monaco);
         const contentSizeSubscription = ed.onDidContentSizeChange(followGrowableContent);
         followGrowableContent();
 
@@ -303,7 +311,7 @@ export const QueryEditor: React.FC<QueryEditorProps> = ({
         }
         ed.onDidDispose(() => {
           contentSizeSubscription.dispose();
-          if (growthEditorRef.current === ed) growthEditorRef.current = null;
+          if (editorRef.current === ed) editorRef.current = null;
           if (uriRef.current) clearModelMeta(uriRef.current);
         });
       }}

@@ -367,15 +367,45 @@ fn probe_version(path: &Path) -> Option<String> {
     probe_version_with_timeout(path, DETECT_PROBE_TIMEOUT)
 }
 
+/// How many times [`spawn_waiting_out_busy`] retries a spawn refused with
+/// ETXTBSY before its error is reported.
+const SPAWN_BUSY_RETRIES: u32 = 20;
+/// Upper bound on the (doubling) wait between ETXTBSY retries. With
+/// [`SPAWN_BUSY_RETRIES`] this caps the total wait at under a second.
+const SPAWN_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Spawn `command`, retrying while exec fails with ETXTBSY ("Text file busy").
+///
+/// Linux refuses to exec a file that anything holds open for writing. The
+/// probes here run binaries that were often only just written (an extracted
+/// install, a test stub), and a process forked by another thread while the
+/// writer's fd was open inherits that fd and keeps it until the child execs
+/// (`O_CLOEXEC` closes it only then). The state clears on its own within
+/// moments, and a refused exec ran nothing, so a retry cannot repeat a side
+/// effect. Every other spawn error (e.g. `NotFound`) returns immediately.
+fn spawn_waiting_out_busy(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < SPAWN_BUSY_RETRIES => {
+                std::thread::sleep(Duration::from_millis(1 << attempt.min(6)).min(SPAWN_BUSY_MAX_BACKOFF));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 fn probe_version_with_timeout(path: &Path, timeout: Duration) -> Option<String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = spawn_waiting_out_busy(
+        std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    )
+    .ok()?;
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -486,16 +516,19 @@ pub fn detect_mongosh(
 
 /// Runs `path --version`, treating any spawn failure or non-zero exit as
 /// "not usable" — the safety net after extraction, and the check
-/// `managed_tools_status` uses to decide `installed`.
+/// `managed_tools_status` uses to decide `installed`. A spawn refused with
+/// ETXTBSY is waited out first (see [`spawn_waiting_out_busy`]).
 fn probe_binary_ok(path: &Path) -> bool {
-    std::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    spawn_waiting_out_busy(
+        std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .and_then(|mut child| child.wait())
+    .map(|s| s.success())
+    .unwrap_or(false)
 }
 
 /// Time allowed for a `--version` probe during an install before it counts as
@@ -533,6 +566,10 @@ const PROBE_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 /// every attempt identically and this still returns `false` after
 /// `attempts` tries — no real failure is hidden, only transient ones are
 /// tolerated.
+///
+/// ETXTBSY is not one of these attempts: [`probe_binary_ok`] waits it out
+/// inside a single probe, so a binary that is briefly busy right after
+/// extraction still gets all `attempts` real runs.
 async fn probe_binary_ok_with_retries(path: &Path, attempts: u32) -> bool {
     for attempt in 1..=attempts {
         if probe_binary_ok_timeout(path).await {
@@ -1324,6 +1361,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Detection must still find a candidate that is briefly busy (ETXTBSY)
+    /// rather than skip it. The extra write handle stands in for the fd a
+    /// child forked by another thread inherits right after a binary is written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_version_waits_out_a_busy_binary() {
+        let base = test_app_data("probe-version-busy");
+        let path = write_fake_mongosh(&base, "2.9.9");
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+
+        let probed = probe_version(&path);
+        release.join().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(probed.as_deref(), Some("2.9.9"), "a briefly busy binary must still be detected");
+    }
+
+    /// Waiting out ETXTBSY must not spend one of the install probe's
+    /// attempts. The stub fails its first two runs and passes its third, so
+    /// the probe succeeds within [`PROBE_RETRY_ATTEMPTS`] only if the spawns
+    /// refused while the writer was open did not count.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn install_probe_waits_out_a_busy_binary_without_spending_an_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = test_app_data("probe-busy-attempts");
+        let counter = base.join("probe-attempts.txt");
+        let path = base.join("mongosh");
+        let script = format!(
+            "#!/bin/sh\nN=0\nif [ -f '{counter}' ]; then N=$(cat '{counter}'); fi\nN=$((N + 1))\necho \"$N\" > '{counter}'\nif [ \"$N\" -lt 3 ]; then exit 1; fi\necho tool version 9.9.9\n",
+            counter = counter.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+
+        let ok = probe_binary_ok_with_retries(&path, PROBE_RETRY_ATTEMPTS).await;
+        release.join().unwrap();
+        let runs = std::fs::read_to_string(&counter).ok();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(ok, "a briefly busy binary must pass once it runs; stub ran {runs:?} times");
+        assert_eq!(runs.as_deref().map(str::trim), Some("3"), "every attempt must be a real run");
     }
 
     /// Polls the task map until `task_id` leaves "running", returning its

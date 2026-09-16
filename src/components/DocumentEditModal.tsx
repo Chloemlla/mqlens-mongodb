@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { shellToEjson } from '../lib/shellDoc';
 import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
+import { useMonacoValue } from '../lib/useMonacoValue';
 import { DOC_LANGUAGE_ID, registerDocLanguage } from '../lib/monacoDocLanguage';
 import { attachMonaco } from '../lib/monacoAppTheme';
 import { useEscapeClose } from '../lib/useEscapeClose';
@@ -91,6 +92,7 @@ export const DocumentEditModal: React.FC<DocumentEditModalProps> = ({
   // Derived from the text on screen, so it needs no owner and no lifetime: it
   // is recomputed rather than remembered, and cannot outlive what it describes.
   const validationError = useMemo(() => validateDocument(json, t), [json, t]);
+  const editorValue = useMonacoValue(json, setJson);
   const theme = useMonacoTheme();
   const monacoRef = useRef<Parameters<
     NonNullable<React.ComponentProps<typeof Editor>['onMount']>
@@ -173,10 +175,13 @@ export const DocumentEditModal: React.FC<DocumentEditModalProps> = ({
               defaultLanguage={DOC_LANGUAGE_ID}
               language={DOC_LANGUAGE_ID}
               theme={theme}
-              value={json}
-              onChange={(v) => setJson(v ?? '')}
+              // Not `value`: the draft is App state, and the library's own
+              // write of it can land on the next keystroke (see useMonacoValue).
+              defaultValue={editorValue.defaultValue}
+              onChange={editorValue.onChange}
               wrapperProps={{ 'data-testid': 'document-json-input' }}
-              onMount={(_editor, monaco) => {
+              onMount={(editor, monaco) => {
+                editorValue.onMount(editor, monaco);
                 monacoRef.current = monaco;
                 registerDocLanguage(monaco);
                 // The theme's token colours come from the same design tokens the

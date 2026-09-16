@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useReducer } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useReducer } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { AppShell } from '@/components/layout/AppShell';
@@ -88,6 +88,7 @@ import {
   type ConnectionsChangedPayload,
   type ConnectionEntry,
 } from './workspace/workspaceStore';
+import { logFrontendError } from './lib/crashLog';
 import {
   toPersistedTab,
   isEphemeralProfileId,
@@ -618,9 +619,10 @@ function Workspace() {
   // Foreign-event reconciliation (below) runs inside a `listen` callback
   // captured once at mount — it can never see a fresh `tabs` STATE value
   // from that closure, same staleness problem `activeConnectionsRef` exists
-  // to solve for `handleBuilderStateChange`. Mirrors `tabs` on every change.
+  // to solve for `handleBuilderStateChange`. Mirrors `tabs` on every change,
+  // in a layout effect for the reason given on `activeConnectionsRef` below.
   const tabsRef = useRef<QueryTab[]>(tabs);
-  useEffect(() => {
+  useLayoutEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
   const [layout, dispatchLayout] = useReducer(
@@ -704,8 +706,15 @@ function Workspace() {
   // fresh `activeConnections` STATE value from its closure — it would stay
   // pinned at mount's `[]` forever. A ref mirrors the state on every change
   // so the callback can read the current connections via `.current` instead.
+  //
+  // A layout effect, not a passive one: the `connections-changed` listener
+  // reads this ref too, and React runs passive effects in a task it schedules
+  // after the commit. A broadcast handled in between found a just-opened
+  // connection already on screen but missing here, so it skipped the
+  // self-heal re-announce for it. A layout effect runs inside the commit, so
+  // no event can see the DOM and this ref disagree.
   const activeConnectionsRef = useRef<ActiveConnection[]>(activeConnections);
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeConnectionsRef.current = activeConnections;
   }, [activeConnections]);
   // Every CONNECTION id this window has ever learned about from a
@@ -3452,14 +3461,21 @@ function Workspace() {
   useEffect(() => {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
-    const own = (p: Promise<() => void>) => {
+    // A rejected subscription leaves this window deaf to `event` for its whole
+    // life — which is what a secondary window whose label no capability
+    // covered looked like: it never heard a disconnect. Log it, never swallow.
+    const own = (event: string, p: Promise<() => void>) => {
       p.then((unlisten) => {
         if (cancelled) unlisten();
         else unlistenFns.push(unlisten);
-      }).catch(() => {});
+      }).catch((err) => {
+        console.warn(`listening for ${event} failed`, err);
+        logFrontendError(`listening for ${event} failed in window ${windowLabel()}: ${String(err)}`);
+      });
     };
 
     own(
+      'workspace-changed',
       subscribeWorkspaceChanged((payload: WorkspaceChangedPayload) => {
         // Drop a replayed/out-of-order event — revisions only ever
         // increase, so anything at or below what's already applied adds
@@ -3677,6 +3693,7 @@ function Workspace() {
     );
 
     own(
+      'connections-changed',
       subscribeConnectionsChanged((payload: ConnectionsChangedPayload) => {
         // Connection-id keyed, NOT profileId keyed (final fix wave,
         // agent-connection visibility): a profile can now legitimately have

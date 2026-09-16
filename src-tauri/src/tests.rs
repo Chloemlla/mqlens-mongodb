@@ -1058,6 +1058,41 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_local_agent_still_open_for_writing_is_waited_for() {
+        // Linux refuses to exec a file that anything holds open for writing. The
+        // stubs above meet that under parallel load: a process forked by another
+        // test thread while `fs::write` had the file open keeps the fd until it
+        // execs. Holding the writer open here makes the first attempts fail with
+        // "Text file busy" every time rather than now and then, and the run must
+        // still succeed once the file is closed.
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("agent");
+        let mut writer = std::fs::File::create(&stub).unwrap();
+        writer
+            .write_all(b"#!/bin/sh\necho '{\"queryType\":\"find\",\"filter\":{}}'\n")
+            .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(writer);
+        });
+
+        let reply = crate::ai::generate_local(
+            &format!("{} {{prompt}}", stub.to_string_lossy()),
+            "anything",
+            "",
+            None,
+        )
+        .await
+        .expect("the stub answers once nothing holds it open");
+        release.await.unwrap();
+        assert!(reply.query.contains("find"), "{}", reply.query);
+    }
+
     #[test]
     fn images_are_validated_before_any_request() {
         use crate::ai::{validate_images, ImageAttachment, MAX_IMAGES};
