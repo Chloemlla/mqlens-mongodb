@@ -9,7 +9,13 @@ import type { CoverageReportOptions } from 'monocart-coverage-reports';
  * Both agree on statements, but they count lines differently: one run measured
  * 82.2% of 39,445 lines here and 84.7% of 11,414 in the JSON summary.
  */
-export const COVERAGE_GATE = { lines: 87, statements: 87 };
+export const COVERAGE_GATE = { lines: 89, statements: 89 };
+
+/**
+ * Set by the CI workflow on each shard, which runs part of the suite. A shard
+ * keeps its coverage raw for the merge job, which reports and gates the whole.
+ */
+export const IS_SHARD = process.env.E2E_SHARD === '1';
 
 /** `src/...` for any path or URL that points into the app's own source tree. */
 function toSourcePath(pathOrUrl: string): string {
@@ -37,7 +43,8 @@ function isAppSource(sourcePath: string): boolean {
 export const coverageOptions: CoverageReportOptions = {
   name: 'MQLens end-to-end coverage',
   outputDir: './coverage/e2e',
-  reports: ['console-summary', 'v8', 'json-summary', 'lcovonly'],
+  // A shard's raw data lands in coverage/e2e/raw, for merge-shards.ts to read.
+  reports: IS_SHARD ? ['raw'] : ['console-summary', 'v8', 'json-summary', 'lcovonly'],
 
   // The production build's bundled chunks. Their source maps (fetched from the
   // preview server) unpack them to the original modules, and only the app's own

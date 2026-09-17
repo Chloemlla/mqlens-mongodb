@@ -16,6 +16,7 @@
     "i18n:extract": "i18next-cli extract",
     "i18n:check": "i18next-cli extract --ci --dry-run",
     "test:e2e": "playwright test",
+    "test:e2e:merge-coverage": "esbuild e2e/coverage-setup/merge-shards.ts --bundle --platform=node --format=esm --packages=external --outfile=coverage/merge-shards.mjs --log-level=warning && node coverage/merge-shards.mjs",
     "check:tauri-versions": "node scripts/check-tauri-versions.js",
     "coverage:frontend": "vitest run --coverage",
     "coverage:backend": "cargo llvm-cov --manifest-path src-tauri/Cargo.toml --summary-only --ignore-filename-regex 'src-tauri/src/(lib|main)\\.rs'",
