@@ -30,9 +30,13 @@ export default defineConfig({
   // Every test loads the whole app, and with many workers loading it at once a
   // page can take a while to arrive, WebKit especially. A real hang still fails.
   timeout: 60_000,
-  reporter: process.env.CI
-    ? [['list'], ['github'], ['html', { open: 'never' }]]
-    : [['list'], ['html', { open: 'never' }]],
+  // A CI shard writes a blob report; the workflow merges every shard's into one HTML report.
+  reporter:
+    process.env.E2E_SHARD === '1'
+      ? [['list'], ['github'], ['blob']]
+      : process.env.CI
+        ? [['list'], ['github'], ['html', { open: 'never' }]]
+        : [['list'], ['html', { open: 'never' }]],
   globalSetup: './e2e/coverage-setup/global-setup.ts',
   globalTeardown: './e2e/coverage-setup/global-teardown.ts',
   use: {
