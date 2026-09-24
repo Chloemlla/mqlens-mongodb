@@ -37,6 +37,8 @@ mod windows;
 mod workspace;
 mod write_guard;
 pub mod biometric;
+pub mod oidc;
+pub mod oidc_login;
 pub use db::aggregate::{execute_aggregate_impl, explain_aggregate_query_impl};
 pub use db::ddl::{
     create_collection_impl, create_view_impl, drop_collection_impl, drop_database_impl,
@@ -748,10 +750,42 @@ fn get_mongosh_session(state: &AppState, session_id: &str) -> Result<Arc<Mongosh
         .ok_or_else(|| "mongosh session not found".to_string())
 }
 
+/// Connect with no human watching — every caller except the `connect_db`
+/// command, the MCP connect tool among them. An OIDC login reached here gets
+/// an opener that never opens a browser.
 pub async fn connect_db_impl(
     state: &AppState,
     uri: &str,
     ssh: Option<&ssh_tunnel::SshConfig>,
+) -> Result<String, String> {
+    connect_db_with_oidc_impl(state, uri, ssh, None, None, oidc_login::no_browser_opener()).await
+}
+
+/// Connect, running a human MONGODB-OIDC login if the URI asks for one.
+///
+/// `login_id` is minted by the frontend before it invokes, so it can cancel
+/// or reopen the login while this call is still in flight (the connection id
+/// is only minted in here, too late for that). Connect streams no phase
+/// events: the browser opening is the visible signal. `oidc` carries the
+/// profile's allowed hosts, which never go in the URI.
+pub async fn connect_db_with_oidc_impl(
+    state: &AppState,
+    uri: &str,
+    ssh: Option<&ssh_tunnel::SshConfig>,
+    oidc: Option<&connections::OidcProfileConfig>,
+    login_id: Option<String>,
+    open: oidc::BrowserOpener,
+) -> Result<String, String> {
+    connect_db_with_login(state, uri, ssh, oidc_login::HumanLogin::interactive(oidc, login_id, open)).await
+}
+
+/// `connect_db_with_oidc_impl`, with the IdP HTTP client injectable so the
+/// real-server tests can trust their TEST-ONLY CA.
+pub(crate) async fn connect_db_with_login(
+    state: &AppState,
+    uri: &str,
+    ssh: Option<&ssh_tunnel::SshConfig>,
+    login: oidc_login::HumanLogin<'_>,
 ) -> Result<String, String> {
     let connection_id = Uuid::new_v4().to_string();
     if uri.starts_with("mongodb://mock") {
@@ -759,6 +793,41 @@ pub async fn connect_db_impl(
         mocks.insert(connection_id.clone(), true);
         return Ok(connection_id);
     }
+
+    // Connect streams no phases, but still records what the login reported,
+    // so a failed ping is explained by the login as a locale key rather than
+    // the driver's English. The registration is held to the end of the call:
+    // dropping it removes the login's entry. The driver's callback keeps its
+    // own handle, so reauthentication still works for the client's lifetime
+    // (see `oidc_login::LoginRegistration`).
+    let report = Arc::new(std::sync::Mutex::new(oidc_login::LoginReport::default()));
+    let recorder = report.clone();
+    let session = oidc::OidcSession::new(Arc::new(move |phase| {
+        if let Ok(mut report) = recorder.lock_safe() {
+            report.record(&phase);
+        }
+    }));
+    // Registered before the SSH tunnel and `ClientOptions::parse` (which can
+    // do SRV and TXT lookups), decided from the string alone: the UI can
+    // cancel the moment it has invoked, and a cancel sent during either must
+    // reach this session, which the flow then honours before it ever opens
+    // a browser.
+    let early_login = if oidc_login::uri_requests_oidc(uri) {
+        Some(oidc_login::register_login(&state.oidc_sessions, login.login_id.clone(), session.clone())?)
+    } else {
+        None
+    };
+
+    // Through an SSH tunnel the driver sees only 127.0.0.1, so an OIDC
+    // login's real host is checked now, before anything opens. The login
+    // then goes on with the profile's config minus its custom list.
+    let tunnelled_config: connections::OidcProfileConfig;
+    let login = if ssh.is_some_and(|cfg| cfg.enabled) && early_login.is_some() {
+        tunnelled_config = oidc_login::check_real_host_before_tunnel(uri, login.config)?;
+        oidc_login::HumanLogin { config: Some(&tunnelled_config), ..login }
+    } else {
+        login
+    };
 
     // If an SSH tunnel is configured, open it and rewrite the URI to the local
     // forwarded port before the driver connects.
@@ -781,14 +850,32 @@ pub async fn connect_db_impl(
     client_options.app_name = Some("MQLens-Engine".to_string());
     apply_main_timeouts(&mut client_options);
 
+    // Read before `login` is handed to the driver's callback, for the
+    // embedded shell's own login (see `mongosh_uri_args`).
+    let sends_id_token = login.config.is_some_and(|config| config.use_id_token);
+
+    // `uri_requests_oidc` reads the URI the way the driver does, so the two
+    // agree; should they ever not, the driver's reading still wins and the
+    // login is registered here instead.
+    let _login = match early_login {
+        Some(registration) => {
+            oidc_login::attach_human_login(&mut client_options, login, session)?;
+            Some(registration)
+        }
+        None => oidc_login::prepare_human_login(&mut client_options, &state.oidc_sessions, login, session)?,
+    };
+
     let client = Client::with_options(client_options)
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
     // Verify connection by running a ping command
     let db = client.database("admin");
-    db.run_command(mongodb::bson::doc! { "ping": 1 })
-        .await
-        .map_err(|e| format!("Database ping failed: {}", e))?;
+    db.run_command(mongodb::bson::doc! { "ping": 1 }).await.map_err(|e| {
+        match report.lock_safe().ok().and_then(|report| report.ping_failure_key(&e)) {
+            Some(key) => key.to_string(),
+            None => format!("Database ping failed: {}", e),
+        }
+    })?;
 
     {
         let mut connections = state.connections.lock_safe()?;
@@ -801,6 +888,11 @@ pub async fn connect_db_impl(
     {
         let mut conn_uris = state.conn_uris.lock_safe()?;
         conn_uris.insert(connection_id.clone(), normalized_uri.clone());
+    }
+    // Only a connection that actually logs in with MONGODB-OIDC (it holds a
+    // registration) and whose profile sends the ID token.
+    if _login.is_some() && sends_id_token {
+        state.conn_oidc_id_token.lock_safe()?.insert(connection_id.clone());
     }
     if let Some(t) = tunnel {
         let mut tunnels = state.ssh_tunnels.lock_safe()?;
@@ -840,6 +932,7 @@ pub async fn disconnect_db_impl(state: &AppState, id: &str) -> Result<(), String
         let mut conn_uris = state.conn_uris.lock_safe()?;
         conn_uris.remove(id);
     }
+    state.conn_oidc_id_token.lock_safe()?.remove(id);
     // Tear down the SSH tunnel (if any) — dropping SshTunnel aborts its accept loop.
     {
         let mut tunnels = state.ssh_tunnels.lock_safe()?;
@@ -905,6 +998,21 @@ pub fn connection_list_impl(state: &AppState) -> Result<Vec<ConnectionEntry>, St
     Ok(list)
 }
 
+/// The arguments every mongosh launch for `connection_id` starts with: quiet
+/// output, then the connection's URI. mongosh runs its own MONGODB-OIDC login
+/// from that URI, which cannot carry the profile's OIDC settings; when this
+/// connection's login sends MongoDB the ID token, mongosh is told to do the
+/// same (`--oidcIdTokenAsAccessToken`), or MongoDB refuses the shell's login
+/// exactly as it refused the access token (#430).
+pub fn mongosh_uri_args(state: &AppState, connection_id: &str, uri: &str) -> Result<Vec<String>, String> {
+    let mut args = vec!["--quiet".to_string()];
+    if state.conn_oidc_id_token.lock_safe()?.contains(connection_id) {
+        args.push("--oidcIdTokenAsAccessToken".to_string());
+    }
+    args.push(connections::normalize_mongodb_uri_options(uri));
+    Ok(args)
+}
+
 /// #188 security review Fix 2 (CRITICAL): mongosh pipes arbitrary free-form
 /// commands (`db.dropDatabase()`, `db.coll.deleteMany({})`, …) straight to
 /// the driver — there is no per-command `WriteOp` to gate like every other
@@ -949,8 +1057,7 @@ pub async fn start_mongosh_session_impl(
     };
 
     let mut child = TokioCommand::new(executable)
-        .arg("--quiet")
-        .arg(connections::normalize_mongodb_uri_options(uri))
+        .args(mongosh_uri_args(state, connection_id, uri)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1087,6 +1194,7 @@ pub async fn run_mongosh_script_impl(
     } else {
         mongosh_path.trim().to_string()
     };
+    let uri_args = mongosh_uri_args(state, connection_id, uri)?;
 
     // The script goes in a temp file, not an `--eval` argument: it can be large,
     // and a file sidesteps every argument-length and shell-quoting limit.
@@ -1098,9 +1206,7 @@ pub async fn run_mongosh_script_impl(
 
     let started = std::time::Instant::now();
     let mut command = TokioCommand::new(&executable);
-    command
-        .arg("--quiet")
-        .arg(connections::normalize_mongodb_uri_options(uri));
+    command.args(uri_args);
     // `use <db>` only when the name is a plain one — a control character could
     // not appear in a real database name and must never reach the argument.
     let db = database.trim();
@@ -1429,13 +1535,38 @@ pub(crate) fn connection_is_mock(state: &AppState, id: &str) -> Result<bool, Str
 }
 
 // Tauri Command wrappers (kept private to module to avoid reimport collisions)
+/// `oidc` and `login_id` are optional so an older frontend that omits them
+/// still connects; without a `login_id` an OIDC login cannot be cancelled
+/// from the UI, though the driver's five-minute deadline still bounds it.
 #[tauri::command]
 async fn connect_db(
     state: tauri::State<'_, AppState>,
     uri: String,
     ssh: Option<ssh_tunnel::SshConfig>,
+    oidc: Option<connections::OidcProfileConfig>,
+    login_id: Option<String>,
 ) -> Result<String, String> {
-    connect_db_impl(&state, &uri, ssh.as_ref()).await
+    connect_db_with_oidc_impl(
+        &state,
+        &uri,
+        ssh.as_ref(),
+        oidc.as_ref(),
+        login_id,
+        oidc_login::system_browser_opener(),
+    )
+    .await
+}
+
+/// Cancel a browser login whose connect or test is still in flight (#430).
+#[tauri::command]
+fn cancel_oidc_login(state: tauri::State<'_, AppState>, login_id: String) -> Result<(), String> {
+    oidc_login::cancel_oidc_login_impl(&state, &login_id)
+}
+
+/// "Open browser again" for a login in flight, reusing its URL (#430).
+#[tauri::command]
+fn reopen_oidc_login(state: tauri::State<'_, AppState>, login_id: String) -> Result<(), String> {
+    oidc_login::reopen_oidc_login_impl(&state, &login_id, &oidc_login::system_browser_opener())
 }
 
 /// Find mongodump/mongorestore: configured dir, managed install, then PATH.
@@ -3716,6 +3847,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             log_frontend_error,
             connect_db,
+            cancel_oidc_login,
+            reopen_oidc_login,
             detect_mongo_tools,
             detect_mongosh_binary,
             start_dump_task,
