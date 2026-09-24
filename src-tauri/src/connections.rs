@@ -20,6 +20,23 @@ pub enum ConnectionMode {
     ConfirmDestructive,
 }
 
+/// OIDC settings that cannot live in the URI. `ALLOWED_HOSTS` is one:
+/// `ClientOptions::parse` rejects it as a URI option, so it is applied to the
+/// credential after parsing. A struct rather than a bare `Vec<String>` so
+/// settings can be added without a migration.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct OidcProfileConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
+    /// Hand MongoDB the IdP's ID token instead of its access token (T21) —
+    /// for an IdP whose access tokens MongoDB refuses, such as cidaas's RFC
+    /// 9068 `typ: "at+jwt"` ones. mongosh's `--oidcIdTokenAsAccessToken`.
+    /// Old profiles without the key read as off, and off is never written,
+    /// the same additive pattern as `allowed_hosts`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_id_token: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ConnectionProfile {
     pub id: String,
@@ -41,6 +58,10 @@ pub struct ConnectionProfile {
     /// same additive pattern as `mcp_enabled`.
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    /// Human OIDC settings (#430). Old profiles without the field read as
+    /// `None` — the same additive pattern as `mcp_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcProfileConfig>,
 }
 
 fn default_anthropic_model() -> String {
@@ -965,6 +986,11 @@ pub enum TestPhase {
     Parse,
     Resolve,
     Connect,
+    /// A human MONGODB-OIDC login, emitted only for that mechanism and only
+    /// as the flow reports it (#430). Sits between Connect and Ping in the
+    /// checklist, though it physically happens inside the ping: the driver
+    /// authenticates lazily on the first operation.
+    Authenticate,
     Ping,
 }
 
@@ -989,13 +1015,54 @@ impl PhaseUpdate {
     }
 }
 
-/// Run the connection test as four real, observable phases — parse, resolve,
-/// connect, ping — emitting a start/ok/fail update for each. Stops at the first
-/// failing phase (later phases stay unreported). `emit` is a closure so this
-/// core is unit-testable without a Tauri Channel.
+/// `run_connection_test_with_oidc` for callers with no human watching: an
+/// OIDC login it reaches has no id the UI knows and never opens a browser.
 pub async fn run_connection_test(
     uri: &str,
     ssh: Option<&crate::ssh_tunnel::SshConfig>,
+    emit: &(dyn Fn(PhaseUpdate) + Send + Sync),
+) -> Result<(), String> {
+    let sessions = crate::oidc_login::OidcSessions::default();
+    run_connection_test_with_oidc(&sessions, uri, ssh, crate::oidc_login::HumanLogin::unattended(), emit).await
+}
+
+/// One step of a human OIDC login, as a row update for the checklist. A
+/// failure carries the error's locale key, which the frontend translates.
+pub(crate) fn authenticate_update(phase: crate::oidc::OidcPhase) -> PhaseUpdate {
+    use crate::oidc::OidcPhase;
+    match phase {
+        OidcPhase::WaitingForBrowser => PhaseUpdate::start(TestPhase::Authenticate),
+        OidcPhase::Completed(_) => PhaseUpdate::ok(TestPhase::Authenticate),
+        OidcPhase::Failed(error) => PhaseUpdate::fail(TestPhase::Authenticate, error.locale_key().to_string()),
+    }
+}
+
+/// Emit one step of the login and record it, so a ping that then fails can
+/// be explained by the login.
+fn forward_login_phase(
+    phase: crate::oidc::OidcPhase,
+    emit: &(dyn Fn(PhaseUpdate) + Send + Sync),
+    report: &mut crate::oidc_login::LoginReport,
+) {
+    report.record(&phase);
+    emit(authenticate_update(phase));
+}
+
+/// Run the connection test as real, observable phases — parse, resolve,
+/// connect, ping — emitting a start/ok/fail update for each. Stops at the first
+/// failing phase (later phases stay unreported). `emit` is a closure so this
+/// core is unit-testable without a Tauri Channel.
+///
+/// A `MONGODB-OIDC` connection also reports an Authenticate row, and only as
+/// the login itself reports progress (D6): the driver authenticates inside
+/// the ping, so the row runs within Ping's start and result. The login is
+/// registered in `sessions` under `login.login_id` for the length of the
+/// call, so the UI can cancel it or reopen its browser tab.
+pub async fn run_connection_test_with_oidc(
+    sessions: &crate::oidc_login::OidcSessions,
+    uri: &str,
+    ssh: Option<&crate::ssh_tunnel::SshConfig>,
+    login: crate::oidc_login::HumanLogin<'_>,
     emit: &(dyn Fn(PhaseUpdate) + Send + Sync),
 ) -> Result<(), String> {
     // Mock connections short-circuit: every phase reports ok, offline.
@@ -1006,6 +1073,31 @@ pub async fn run_connection_test(
         }
         return Ok(());
     }
+
+    // Login progress is reported from the driver's own task, which can outlive
+    // this call's borrow of `emit`, so the session's sink only queues it and
+    // this call forwards it while the ping runs.
+    let (progress_tx, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let session = crate::oidc::OidcSession::new(std::sync::Arc::new(move |phase| {
+        let _ = progress_tx.send(phase);
+    }));
+    // Registered before the DNS lookup, the SSH tunnel and
+    // `ClientOptions::parse`, decided from the string alone, as the connect
+    // path does: the UI cancels by this id the moment the editor closes, and a
+    // cancel sent during any of them must reach this session, which the flow
+    // honours before it ever opens a browser. Held to the end of the call.
+    let early_login = if crate::oidc_login::uri_requests_oidc(uri) {
+        match crate::oidc_login::register_login(sessions, login.login_id.clone(), session.clone()) {
+            Ok(registration) => Some(registration),
+            Err(e) => {
+                emit(PhaseUpdate::start(TestPhase::Parse));
+                emit(PhaseUpdate::fail(TestPhase::Parse, e.clone()));
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
 
     let ssh_enabled = ssh.map(|c| c.enabled).unwrap_or(false);
 
@@ -1044,6 +1136,26 @@ pub async fn run_connection_test(
             }
         }
     }
+
+    // Through an SSH tunnel the driver sees only 127.0.0.1, so an OIDC
+    // login's real host is checked now, before the tunnel opens. A refusal is
+    // Authenticate's, as when the driver refuses a host itself. The login then
+    // goes on with the profile's config minus its custom list.
+    let tunnelled_config: OidcProfileConfig;
+    let login = if ssh_enabled && crate::oidc_login::uri_requests_oidc(uri) {
+        match crate::oidc_login::check_real_host_before_tunnel(uri, login.config) {
+            Ok(config) => {
+                tunnelled_config = config;
+                crate::oidc_login::HumanLogin { config: Some(&tunnelled_config), ..login }
+            }
+            Err(key) => {
+                emit(PhaseUpdate::fail(TestPhase::Authenticate, key.clone()));
+                return Err(key);
+            }
+        }
+    } else {
+        login
+    };
 
     // Phase 3: Connect — open the SSH tunnel if configured, else TCP-connect.
     emit(PhaseUpdate::start(TestPhase::Connect));
@@ -1099,6 +1211,23 @@ pub async fn run_connection_test(
     client_options.connect_timeout = Some(std::time::Duration::from_secs(5));
     client_options.server_selection_timeout = Some(std::time::Duration::from_secs(5));
 
+    // `uri_requests_oidc` reads the URI the way the driver does, so the two
+    // agree; should they ever not, the driver's reading still wins and the
+    // login is registered here instead. Held to the end of the call: dropping
+    // it removes the login's entry.
+    let attached = match early_login {
+        Some(registration) => crate::oidc_login::attach_human_login(&mut client_options, login, session)
+            .map(|()| Some(registration)),
+        None => crate::oidc_login::prepare_human_login(&mut client_options, sessions, login, session),
+    };
+    let _login = match attached {
+        Ok(registration) => registration,
+        Err(e) => {
+            emit(PhaseUpdate::fail(TestPhase::Ping, e.clone()));
+            return Err(e);
+        }
+    };
+
     let client = match mongodb::Client::with_options(client_options) {
         Ok(c) => c,
         Err(e) => {
@@ -1108,34 +1237,91 @@ pub async fn run_connection_test(
         }
     };
 
-    match client
-        .database("admin")
-        .run_command(mongodb::bson::doc! { "ping": 1 })
-        .await
-    {
+    let admin = client.database("admin");
+    let ping = std::future::IntoFuture::into_future(admin.run_command(mongodb::bson::doc! { "ping": 1 }));
+    tokio::pin!(ping);
+    let mut report = crate::oidc_login::LoginReport::default();
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut ping => break outcome,
+            Some(phase) = progress.recv() => forward_login_phase(phase, emit, &mut report),
+        }
+    };
+    // The flow reports before it returns to the driver, so anything it said
+    // is already queued; forward it before the ping's own result.
+    while let Ok(phase) = progress.try_recv() {
+        forward_login_phase(phase, emit, &mut report);
+    }
+
+    let error = match outcome {
         Ok(_) => {
             emit(PhaseUpdate::ok(TestPhase::Ping));
-            Ok(())
+            return Ok(());
         }
-        Err(e) => {
-            let msg = format!("Database ping failed: {}", e);
-            emit(PhaseUpdate::fail(TestPhase::Ping, msg.clone()));
-            Err(msg)
-        }
-    }
-    // `_tunnel` drops here, tearing down the temporary tunnel.
+        Err(error) => error,
+    };
+    Err(report_failed_ping(&report, &error, emit))
+    // `_tunnel` and `_login` drop here: the temporary tunnel is torn down and
+    // the login's entry removed.
 }
 
+/// Paint the row a failed ping belongs to and return the test's error: a
+/// locale key when the login explains the failure, the driver's text when
+/// nothing does.
+fn report_failed_ping(
+    report: &crate::oidc_login::LoginReport,
+    error: &mongodb::error::Error,
+    emit: &(dyn Fn(PhaseUpdate) + Send + Sync),
+) -> String {
+    use crate::oidc_login::PingFailure;
+    match report.ping_failure(error) {
+        // The Authenticate row already carries the failure. Report it rather
+        // than the ping error it caused, so the user sees "browser login
+        // expired" and not a server-selection timeout.
+        Some(PingFailure::LoginFailed(key)) => key.to_string(),
+        // Authentication failed outside the flow: the driver refused the
+        // host before calling back, or MongoDB rejected the token the login
+        // produced. Authenticate's failure — repainting a row the login may
+        // already have marked ok.
+        Some(PingFailure::AuthenticateFailed(key)) => {
+            emit(PhaseUpdate::fail(TestPhase::Authenticate, key.to_string()));
+            key.to_string()
+        }
+        // The login succeeded and the ping failed anyway: Ping's failure,
+        // explained as such.
+        Some(PingFailure::PingFailed(key)) => {
+            emit(PhaseUpdate::fail(TestPhase::Ping, key.to_string()));
+            key.to_string()
+        }
+        None => {
+            let msg = format!("Database ping failed: {}", error);
+            emit(PhaseUpdate::fail(TestPhase::Ping, msg.clone()));
+            msg
+        }
+    }
+}
+
+/// `oidc` and `login_id` are optional so an older frontend that omits them
+/// still tests; `login_id` is what lets the dialog cancel or reopen an OIDC
+/// login while the test runs (#430).
 #[tauri::command]
 pub async fn test_connection_uri(
+    state: tauri::State<'_, crate::state::AppState>,
     uri: String,
     ssh: Option<crate::ssh_tunnel::SshConfig>,
+    oidc: Option<OidcProfileConfig>,
+    login_id: Option<String>,
     on_phase: tauri::ipc::Channel<PhaseUpdate>,
 ) -> Result<(), String> {
     let emit = move |update: PhaseUpdate| {
         let _ = on_phase.send(update);
     };
-    run_connection_test(&uri, ssh.as_ref(), &emit).await
+    let login = crate::oidc_login::HumanLogin::interactive(
+        oidc.as_ref(),
+        login_id,
+        crate::oidc_login::system_browser_opener(),
+    );
+    run_connection_test_with_oidc(&state.oidc_sessions, &uri, ssh.as_ref(), login, &emit).await
 }
 
 #[cfg(test)]
@@ -1344,5 +1530,289 @@ mod rotation_tests {
         assert!(!skipped.exists());
         assert!(!empty.exists());
         assert!(meta_path.exists());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Old vaults have no `oidc` key. They must still read — the same additive
+    /// contract `mcp_enabled` and `connection_mode` rely on.
+    #[test]
+    fn a_profile_saved_before_oidc_still_deserialises() {
+        let json = r#"{"id":"1","name":"Local","uri":"mongodb://localhost:27017"}"#;
+        let profile: ConnectionProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.oidc, None);
+    }
+
+    #[test]
+    fn allowed_hosts_round_trip_through_the_profile() {
+        let profile = ConnectionProfile {
+            id: "1".into(),
+            name: "Corp".into(),
+            uri: "mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC".into(),
+            color_tag: None,
+            ssh: None,
+            mcp_enabled: false,
+            connection_mode: ConnectionMode::Normal,
+            oidc: Some(OidcProfileConfig {
+                allowed_hosts: vec!["mongo.corp.example.com".into()],
+                ..Default::default()
+            }),
+        };
+        let round_tripped: ConnectionProfile =
+            serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        assert_eq!(round_tripped, profile);
+    }
+
+    /// An OIDC config saved before T21 has no `use_id_token`: it reads as off.
+    #[test]
+    fn an_oidc_config_saved_before_the_id_token_option_reads_as_off() {
+        let config: OidcProfileConfig = serde_json::from_str(r#"{"allowed_hosts":["mongo.corp.example.com"]}"#).unwrap();
+        assert!(!config.use_id_token);
+    }
+
+    /// Like `allowed_hosts`, the key is written only when it says something,
+    /// so a profile that never turned the option on gains no key.
+    #[test]
+    fn use_id_token_is_written_only_when_on() {
+        let off = OidcProfileConfig { allowed_hosts: vec!["mongo.corp.example.com".into()], use_id_token: false };
+        assert_eq!(serde_json::to_value(&off).unwrap(), serde_json::json!({"allowed_hosts": ["mongo.corp.example.com"]}));
+
+        let on = OidcProfileConfig { allowed_hosts: vec![], use_id_token: true };
+        assert_eq!(serde_json::to_value(&on).unwrap(), serde_json::json!({"use_id_token": true}));
+        let round_tripped: OidcProfileConfig = serde_json::from_value(serde_json::to_value(&on).unwrap()).unwrap();
+        assert_eq!(round_tripped, on);
+    }
+
+    // ---- the Authenticate test phase (#430) ------------------------------
+
+    #[test]
+    fn the_authenticate_phase_serialises_as_a_stable_wire_value() {
+        let json = serde_json::to_value(PhaseUpdate::start(TestPhase::Authenticate)).unwrap();
+        assert_eq!(json["phase"], "authenticate");
+    }
+
+    /// The row's message is a locale key the frontend translates — never
+    /// English, and never anything from the flow beyond the error category.
+    #[test]
+    fn login_progress_maps_onto_the_authenticate_row() {
+        let seen: Vec<(TestPhase, String, Option<String>)> = [
+            crate::oidc::OidcPhase::WaitingForBrowser,
+            crate::oidc::OidcPhase::Completed(crate::oidc::Presented::AccessToken),
+            crate::oidc::OidcPhase::Failed(crate::oidc::OidcError::TimedOut),
+        ]
+        .into_iter()
+        .map(authenticate_update)
+        .map(|u| (u.phase, u.status, u.message))
+        .collect();
+
+        assert_eq!(
+            seen,
+            vec![
+                (TestPhase::Authenticate, "start".to_string(), None),
+                (TestPhase::Authenticate, "ok".to_string(), None),
+                (TestPhase::Authenticate, "fail".to_string(), Some("auth.oidc.errors.timedOut".to_string())),
+            ]
+        );
+    }
+
+    // Passes Parse, Resolve and Connect, so a test against it reaches the ping.
+    use crate::oidc_login::test_support::silent_server;
+
+    type PhaseLog = std::sync::Arc<std::sync::Mutex<Vec<(TestPhase, String)>>>;
+
+    fn phase_recorder() -> (PhaseLog, impl Fn(PhaseUpdate) + Send + Sync) {
+        let log: PhaseLog = Default::default();
+        let recorder = log.clone();
+        (log, move |u: PhaseUpdate| recorder.lock().unwrap().push((u.phase, u.status)))
+    }
+
+    /// D6: the row must not appear for mechanisms whose authentication we
+    /// never observe. The test reaches the ping phase — the only place an
+    /// Authenticate row could come from — so its absence means something.
+    #[tokio::test]
+    async fn a_non_oidc_test_that_reaches_the_ping_never_emits_an_authenticate_phase() {
+        let port = silent_server().await;
+        let uri = format!("mongodb://user:pw@127.0.0.1:{port}/?authMechanism=SCRAM-SHA-256&authSource=admin");
+        let sessions = crate::oidc_login::OidcSessions::default();
+        let (log, emit) = phase_recorder();
+
+        let result = run_connection_test_with_oidc(
+            &sessions,
+            &uri,
+            None,
+            crate::oidc_login::HumanLogin::unattended(),
+            &emit,
+        )
+        .await;
+
+        let log = log.lock().unwrap().clone();
+        assert!(result.is_err(), "nothing answers, so the ping must fail");
+        assert!(
+            log.contains(&(TestPhase::Ping, "start".to_string())),
+            "the test must reach the ping for this to prove anything: {log:?}"
+        );
+        assert!(
+            log.iter().all(|(phase, _)| *phase != TestPhase::Authenticate),
+            "SCRAM must not grow an Authenticate row: {log:?}"
+        );
+    }
+
+    fn completed_login() -> crate::oidc_login::LoginReport {
+        let mut report = crate::oidc_login::LoginReport::default();
+        report.record(&crate::oidc::OidcPhase::WaitingForBrowser);
+        report.record(&crate::oidc::OidcPhase::Completed(crate::oidc::Presented::AccessToken));
+        report
+    }
+
+    fn command_error(code: i32, code_name: &str) -> mongodb::error::Error {
+        let error: mongodb::error::CommandError = serde_json::from_value(serde_json::json!({
+            "code": code,
+            "codeName": code_name,
+            "errmsg": "from the server",
+        }))
+        .unwrap();
+        mongodb::error::Error::from(mongodb::error::ErrorKind::Command(error))
+    }
+
+    /// The login marked Authenticate ok the moment the IdP returned a token;
+    /// MongoDB then refused it. The row must turn red with `tokenRejected`,
+    /// and Ping — which never got to run — must not be blamed.
+    #[test]
+    fn mongodb_rejecting_the_logins_token_fails_the_authenticate_row() {
+        let (log, emit) = phase_recorder();
+
+        let error = report_failed_ping(&completed_login(), &command_error(18, "AuthenticationFailed"), &emit);
+
+        assert_eq!(error, "auth.oidc.errors.tokenRejected");
+        assert_eq!(*log.lock().unwrap(), vec![(TestPhase::Authenticate, "fail".to_string())]);
+    }
+
+    /// An access token of a type MongoDB refuses, then rejected: the
+    /// Authenticate row turns red with the hint to use the ID token.
+    #[test]
+    fn mongodb_rejecting_an_access_token_of_a_refused_type_fails_the_authenticate_row_with_the_hint() {
+        let (log, emit) = phase_recorder();
+        let mut report = crate::oidc_login::LoginReport::default();
+        report.record(&crate::oidc::OidcPhase::WaitingForBrowser);
+        report.record(&crate::oidc::OidcPhase::Completed(crate::oidc::Presented::AccessTokenOfRefusedType));
+
+        let error = report_failed_ping(&report, &command_error(18, "AuthenticationFailed"), &emit);
+
+        assert_eq!(error, "auth.oidc.errors.accessTokenTypeRejected");
+        assert_eq!(*log.lock().unwrap(), vec![(TestPhase::Authenticate, "fail".to_string())]);
+    }
+
+    /// A ping that fails after a good login for any other reason is still
+    /// Ping's failure.
+    #[test]
+    fn a_non_authentication_failure_after_the_login_fails_the_ping_row() {
+        let (log, emit) = phase_recorder();
+
+        let error = report_failed_ping(&completed_login(), &command_error(2, "BadValue"), &emit);
+
+        assert_eq!(error, "auth.oidc.errors.loginOkPingFailed");
+        assert_eq!(*log.lock().unwrap(), vec![(TestPhase::Ping, "fail".to_string())]);
+    }
+
+    /// The login entry exists only while the test call is in flight, and a
+    /// failing test removes it. No login ever reached the browser here, so no
+    /// Authenticate row is claimed either.
+    #[tokio::test]
+    async fn an_oidc_test_registers_its_login_while_in_flight_and_removes_it_when_it_fails() {
+        let port = silent_server().await;
+        let uri = format!("mongodb://127.0.0.1:{port}/?authMechanism=MONGODB-OIDC&authSource=$external");
+        let sessions = crate::oidc_login::OidcSessions::default();
+        let (log, emit) = phase_recorder();
+        let login = crate::oidc_login::HumanLogin {
+            login_id: Some("test-login".to_string()),
+            ..crate::oidc_login::HumanLogin::unattended()
+        };
+
+        let call = run_connection_test_with_oidc(&sessions, &uri, None, login, &emit);
+        let watch = async {
+            for _ in 0..400 {
+                if sessions.lock().unwrap().contains_key("test-login") {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            false
+        };
+        let (result, registered) = tokio::join!(call, watch);
+
+        assert!(registered, "the login must be registered under the caller's id while the test runs");
+        assert!(result.is_err(), "nothing answers, so the test must fail");
+        assert!(sessions.lock().unwrap().is_empty(), "a failed test must leave no login behind");
+        let log = log.lock().unwrap().clone();
+        assert!(
+            log.iter().all(|(phase, _)| *phase != TestPhase::Authenticate),
+            "no login was observed, so no Authenticate row may be claimed: {log:?}"
+        );
+    }
+
+    /// Through a tunnel the driver only ever sees `127.0.0.1`, so the real
+    /// host is checked before the tunnel opens, and the refusal is
+    /// Authenticate's. The SSH port is closed: had the tunnel been tried,
+    /// Connect would have failed with an SSH error instead.
+    #[tokio::test]
+    async fn an_oidc_test_over_ssh_refuses_a_real_host_outside_the_allowed_list_before_tunnelling() {
+        use crate::oidc_login::test_support::{closed_port, ssh_to};
+        let ssh = ssh_to(closed_port());
+        let config = OidcProfileConfig { allowed_hosts: vec!["*.corp.example".into()], ..Default::default() };
+        let login = crate::oidc_login::HumanLogin { config: Some(&config), ..crate::oidc_login::HumanLogin::unattended() };
+        let sessions = crate::oidc_login::OidcSessions::default();
+        let (log, emit) = phase_recorder();
+        let uri = "mongodb://db.internal:27017/?authMechanism=MONGODB-OIDC&authSource=$external";
+
+        let result = run_connection_test_with_oidc(&sessions, uri, Some(&ssh), login, &emit).await;
+
+        assert_eq!(result, Err("auth.oidc.errors.hostNotAllowed".to_string()));
+        let log = log.lock().unwrap().clone();
+        assert!(log.contains(&(TestPhase::Authenticate, "fail".to_string())), "{log:?}");
+        assert!(
+            !log.iter().any(|(phase, _)| *phase == TestPhase::Connect),
+            "the tunnel must never be started: {log:?}"
+        );
+    }
+
+    /// An allowed real host gets past the check and on to the tunnel, which
+    /// is what fails here. A custom list without `127.0.0.1` is fine.
+    #[tokio::test]
+    async fn an_oidc_test_over_ssh_whose_real_host_is_allowed_goes_on_to_the_tunnel() {
+        use crate::oidc_login::test_support::{closed_port, ssh_to};
+        let ssh_port = closed_port();
+        let ssh = ssh_to(ssh_port);
+        let config = OidcProfileConfig { allowed_hosts: vec!["db.internal".into()], ..Default::default() };
+        let login = crate::oidc_login::HumanLogin { config: Some(&config), ..crate::oidc_login::HumanLogin::unattended() };
+        let sessions = crate::oidc_login::OidcSessions::default();
+        let (log, emit) = phase_recorder();
+        let uri = "mongodb://db.internal:27017/?authMechanism=MONGODB-OIDC&authSource=$external";
+
+        let result = run_connection_test_with_oidc(&sessions, uri, Some(&ssh), login, &emit).await;
+
+        let error = result.expect_err("nothing listens on the SSH port");
+        assert!(error.starts_with(&format!("SSH connection to 127.0.0.1:{ssh_port} failed")), "got {error}");
+        let log = log.lock().unwrap().clone();
+        assert!(log.contains(&(TestPhase::Connect, "fail".to_string())), "{log:?}");
+        assert!(!log.iter().any(|(phase, _)| *phase == TestPhase::Authenticate), "{log:?}");
+    }
+
+    /// A profile with no OIDC config must not grow an empty `oidc` key.
+    #[test]
+    fn a_non_oidc_profile_serialises_without_the_field() {
+        let profile = ConnectionProfile {
+            id: "1".into(),
+            name: "Local".into(),
+            uri: "mongodb://localhost:27017".into(),
+            color_tag: None,
+            ssh: None,
+            mcp_enabled: false,
+            connection_mode: ConnectionMode::Normal,
+            oidc: None,
+        };
+        assert!(!serde_json::to_string(&profile).unwrap().contains("oidc"));
     }
 }

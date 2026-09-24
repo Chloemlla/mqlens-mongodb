@@ -17,6 +17,7 @@ import {
   takeSettledChatRequest,
 } from './lib/aiChatRequest';
 import { stopChangeStream } from './lib/changeStream';
+import { describeConnectError } from './lib/describeConnectError';
 import { startWriteRequests } from './lib/mcpWriteRequests';
 import { McpWriteConfirm } from './components/McpWriteConfirm';
 import {
@@ -1149,7 +1150,7 @@ function Workspace() {
     );
     if (existing) return existing.id;
     try {
-      const id = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null });
+      const id = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null, oidc: profile.oidc ?? null });
       addActiveConnection(id, profile.name, profile.uri, profile.id, profile.color_tag ?? undefined, undefined, profile.connection_mode ?? 'normal');
       // Announce this fresh id to every other window (Phase 3 Task 6) — see
       // `setConnectionMeta`'s doc comment for why every connect path calls it.
@@ -1159,7 +1160,7 @@ function Workspace() {
       rebindProfileTabs(profile.id, id);
       return id;
     } catch (e) {
-      toast(t('toast.couldNotConnectToProfile', { name: profile.name, detail: (e as any)?.message || String(e) }), 'error');
+      toast(t('toast.couldNotConnectToProfile', { name: profile.name, detail: describeConnectError(e, t) }), 'error');
       return null;
     }
   };
@@ -1168,7 +1169,7 @@ function Workspace() {
     const SAMPLE_ID = '__sample__';
     if (activeConnections.some((c) => c.profileId === SAMPLE_ID)) return;
     try {
-      const id = await invoke<string>('connect_db', { uri: 'mongodb://mock', ssh: null });
+      const id = await invoke<string>('connect_db', { uri: 'mongodb://mock', ssh: null, oidc: null });
       addActiveConnection(id, 'Sample (mqlens_demo)', 'mongodb://mock', SAMPLE_ID);
     } catch (e) {
       toast(t('toast.couldNotLoadSampleData', { detail: (e as any)?.message || String(e) }), 'error');
@@ -3853,7 +3854,7 @@ function Workspace() {
           return;
         }
 
-        newId = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null });
+        newId = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null, oidc: profile.oidc ?? null });
         addActiveConnection(newId, profileName, profile.uri, profile.id, profile.color_tag ?? undefined, undefined, profile.connection_mode ?? 'normal');
         // Announce this fresh id to every other window (Phase 3 Task 6) —
         // see `setConnectionMeta`'s doc comment. Deliberately NOT called on
@@ -3890,7 +3891,7 @@ function Workspace() {
         await refreshTabResults(tab);
       }
     } catch (err: any) {
-      patchReconnectState(profileId, { busy: false, error: err?.message || String(err) });
+      patchReconnectState(profileId, { busy: false, error: describeConnectError(err, t) });
     } finally {
       reconnectBusyRef.current.delete(profileId);
     }

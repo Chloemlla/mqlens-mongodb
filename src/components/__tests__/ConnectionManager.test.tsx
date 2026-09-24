@@ -1,15 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ReactElement } from 'react';
-import { render as rtlRender, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render as rtlRender, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import {
   ConnectionManager,
   buildUri,
   buildSshConfig,
+  buildOidcConfig,
+  isOidcUri,
   parseUriIntoFields,
   summarizeConnectionError,
   suggestConnectionName,
 } from '../ConnectionManager';
 import { DialogProvider } from '../dialogs/DialogProvider';
+import { stripUriSecrets } from '../../lib/connection';
 import enErrors from '../../locales/en/errors.json';
 
 // ConnectionManager now uses the in-app dialog system, so it must render inside a provider.
@@ -134,6 +137,21 @@ describe('parseUriIntoFields (import → form)', () => {
     expect(f.defaultDb).toBe('shop');
     expect(f.hosts).toEqual([{ host: 'db.example.com', port: '27018' }]);
     expect(f.topology).toBe('standalone');
+  });
+
+  // `;` separates options as `&` does, for the driver and the backend's
+  // normaliser alike. Missing it dropped an OIDC mechanism on import, so the
+  // editor rebuilt the URI with no authentication at all (PR #433 review).
+  it('reads options separated by semicolons, the OIDC mechanism included', () => {
+    const f = parseUriIntoFields(
+      'mongodb+srv://cluster.example.com/?retryWrites=true;authMechanism=MONGODB-OIDC;authSource=$external',
+    );
+    expect(f.authMethod).toBe('oidc');
+
+    const g = parseUriIntoFields('mongodb://h1:27017,h2:27018/?tls=true;replicaSet=rs0;tlsInsecure=true');
+    expect(g.tlsMode).toBe('system');
+    expect(g.replicaSetName).toBe('rs0');
+    expect(g.tlsAllowInvalidCerts).toBe(true);
   });
 
   it('keeps a non-admin auth database instead of resetting it to admin (#349)', () => {
@@ -785,6 +803,7 @@ describe('ConnectionManager Component', () => {
         color_tag: null,
         mcp_enabled: false,
         connection_mode: 'normal',
+        oidc: null,
       });
       // The nested modal should be closed
       expect(screen.queryByText('New Connection')).not.toBeInTheDocument();
@@ -2632,5 +2651,835 @@ describe('URI import and export', () => {
       ]);
       expect(screen.queryByTestId('import-uri-success')).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('OIDC auth method and URI round-trip (#430)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  const openAuthTab = async () => {
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
+  };
+
+  it('builds an OIDC URI with the mechanism and $external, and drops a stale password', () => {
+    const uri = buildUri({ ...baseConn, authMethod: 'oidc', authPass: 'leftover-pw' });
+    expect(uri).toContain('authMechanism=MONGODB-OIDC');
+    expect(uri).toContain('authSource=$external');
+    expect(uri).not.toContain('authMechanismProperties');
+    expect(uri).not.toContain('leftover-pw');
+  });
+
+  it('never writes ALLOWED_HOSTS into the URI, because the driver rejects it', () => {
+    const uri = buildUri({
+      ...baseConn,
+      authMethod: 'oidc',
+      oidcAllowedHosts: 'mongo.corp.example.com',
+    });
+    expect(uri).not.toContain('ALLOWED_HOSTS');
+    expect(uri).not.toContain('mongo.corp.example.com');
+  });
+
+  it('restores the auth method from an imported OIDC URI (allowed hosts are never in the URI)', () => {
+    const state = parseUriIntoFields(
+      'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+    );
+    expect(state.authMethod).toBe('oidc');
+    expect(state.authDb).toBe('admin');
+  });
+
+  it('round-trips an OIDC URI without drift', () => {
+    const uri = 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external';
+    const rebuilt = buildUri({ ...baseConn, ...parseUriIntoFields(uri) });
+    expect(rebuilt).toContain('authMechanism=MONGODB-OIDC');
+    expect(rebuilt).toContain('authSource=$external');
+  });
+
+  it('keeps no token material in a redacted OIDC URI', () => {
+    const uri = 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external';
+    expect(stripUriSecrets(uri)).toBe(uri);
+  });
+
+  describe('buildOidcConfig', () => {
+    it('splits the allowed-hosts text on commas, trims, and drops empties', () => {
+      expect(
+        buildOidcConfig({ ...baseConn, authMethod: 'oidc', oidcAllowedHosts: ' a.example.com ,, b.example.com ,' }),
+      ).toEqual({ allowed_hosts: ['a.example.com', 'b.example.com'] });
+    });
+
+    it('returns null when the method is not oidc, even with hosts typed in', () => {
+      expect(
+        buildOidcConfig({ ...baseConn, authMethod: 'scram-256', oidcAllowedHosts: 'a.example.com' }),
+      ).toBeNull();
+    });
+
+    it('returns null when oidc is selected but the host list is empty', () => {
+      expect(buildOidcConfig({ ...baseConn, authMethod: 'oidc', oidcAllowedHosts: '  , ,' })).toBeNull();
+    });
+
+    // T21: the ID-token option is a setting of its own, so a profile with
+    // only it set still has an OIDC config to send and save.
+    it('returns just use_id_token when that is the only OIDC setting', () => {
+      expect(
+        buildOidcConfig({ ...baseConn, authMethod: 'oidc', oidcAllowedHosts: '', oidcUseIdToken: true }),
+      ).toEqual({ use_id_token: true });
+    });
+
+    it('carries the allowed hosts and use_id_token together', () => {
+      expect(
+        buildOidcConfig({ ...baseConn, authMethod: 'oidc', oidcAllowedHosts: 'a.example.com', oidcUseIdToken: true }),
+      ).toEqual({ allowed_hosts: ['a.example.com'], use_id_token: true });
+    });
+
+    it('leaves use_id_token out when it is off', () => {
+      expect(
+        buildOidcConfig({ ...baseConn, authMethod: 'oidc', oidcAllowedHosts: 'a.example.com', oidcUseIdToken: false }),
+      ).toEqual({ allowed_hosts: ['a.example.com'] });
+    });
+
+    it('returns null when the method is not oidc, even with use_id_token set', () => {
+      expect(
+        buildOidcConfig({ ...baseConn, authMethod: 'scram-256', oidcAllowedHosts: '', oidcUseIdToken: true }),
+      ).toBeNull();
+    });
+  });
+
+  it('offers OIDC in the auth selector', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    await openAuthTab();
+    fireEvent.click(screen.getByTestId('auth-method-select'));
+    expect(await screen.findByRole('option', { name: /oidc \(browser login\)/i })).toBeInTheDocument();
+  });
+
+  it('hides password and auth-database fields for OIDC and explains the browser login', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    await openAuthTab();
+    await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+
+    expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/authentication database/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/opens in your system browser/i)).toBeInTheDocument();
+  });
+
+  it('splits the allowed-hosts field on commas, trims, and drops empties on save', async () => {
+    let savedProfile: any = null;
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    await openAuthTab();
+    await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+
+    fireEvent.change(screen.getByLabelText(/allowed hosts/i), {
+      target: { value: ' mongo.corp.example.com ,, other.example.com ,' },
+    });
+    fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'Self-managed OIDC' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => {
+      expect(savedProfile?.oidc).toEqual({
+        allowed_hosts: ['mongo.corp.example.com', 'other.example.com'],
+      });
+    });
+  });
+
+  it('sends oidc:null on save when the auth method is not oidc', async () => {
+    let savedProfile: any = null;
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'Plain' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => {
+      expect(savedProfile?.oidc).toBeNull();
+    });
+  });
+
+  it('sends oidc:null on save when oidc is selected but the allowed-hosts list is empty', async () => {
+    let savedProfile: any = null;
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    await openAuthTab();
+    await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+    fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'Atlas OIDC' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => {
+      expect(savedProfile?.oidc).toBeNull();
+    });
+  });
+
+  it('restores allowed hosts from the saved profile on reopen, not from the URI', async () => {
+    const profile = {
+      id: 'p-oidc',
+      name: 'Corp OIDC',
+      uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+      ssh: null,
+      color_tag: null,
+      oidc: { allowed_hosts: ['mongo.corp.example.com', 'backup.corp.example.com'] },
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    fireEvent.click((await screen.findAllByText('Corp OIDC'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
+    expect(screen.getByLabelText(/allowed hosts/i)).toHaveValue('mongo.corp.example.com, backup.corp.example.com');
+  });
+
+  it('sends the OIDC config built from the editor when connecting an unsaved configuration', async () => {
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'connect_db') return Promise.resolve('conn-oidc-1');
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openAuthTab();
+    await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+    fireEvent.change(screen.getByLabelText(/allowed hosts/i), {
+      target: { value: 'mongo.corp.example.com' },
+    });
+
+    fireEvent.click(screen.getByTestId('editor-connect-btn'));
+
+    await waitFor(() => {
+      const call = calls.find((c) => c.cmd === 'connect_db');
+      expect(call?.args?.oidc).toEqual({ allowed_hosts: ['mongo.corp.example.com'] });
+    });
+  });
+
+  describe('"Use ID token instead of access token" (T21)', () => {
+    const useIdToken = () => screen.getByRole('checkbox', { name: /use id token instead of access token/i });
+
+    it('offers the option, off by default, with help text that names the audience', async () => {
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+        return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+      });
+      render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+      await openAuthTab();
+      await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+
+      expect(useIdToken()).not.toBeChecked();
+      expect(screen.getByText(/rejects your identity provider's access tokens/i)).toHaveTextContent(/client id/i);
+    });
+
+    it('is not offered for other authentication methods', async () => {
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+        return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+      });
+      render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+      await openAuthTab();
+
+      expect(screen.queryByRole('checkbox', { name: /use id token/i })).not.toBeInTheDocument();
+    });
+
+    it('saves use_id_token on its own, with no allowed hosts', async () => {
+      let savedProfile: any = null;
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+        if (cmd === 'save_connection_profile') {
+          savedProfile = args.profile;
+          return Promise.resolve();
+        }
+        return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+      });
+      render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+      await openAuthTab();
+      await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+      fireEvent.click(useIdToken());
+      fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: 'cidaas' } });
+
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => {
+        expect(savedProfile?.oidc).toEqual({ use_id_token: true });
+      });
+    });
+
+    it('is restored from the saved profile on reopen', async () => {
+      const profile = {
+        id: 'p-cidaas',
+        name: 'cidaas OIDC',
+        uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+        ssh: null,
+        color_tag: null,
+        oidc: { use_id_token: true },
+      };
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+        return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+      });
+      render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+      fireEvent.click((await screen.findAllByText('cidaas OIDC'))[0]);
+      fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+      fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
+
+      expect(useIdToken()).toBeChecked();
+    });
+
+    it('sends use_id_token to connect_db for an unsaved configuration', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+        if (cmd === 'connect_db') return Promise.resolve('conn-oidc-1');
+        return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+      });
+      render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+      await openAuthTab();
+      await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+      fireEvent.click(useIdToken());
+
+      fireEvent.click(screen.getByTestId('editor-connect-btn'));
+
+      await waitFor(() => {
+        const call = calls.find((c) => c.cmd === 'connect_db');
+        expect(call?.args?.oidc).toEqual({ use_id_token: true });
+      });
+    });
+
+    it('sends use_id_token to test_connection_uri', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+        if (cmd === 'test_connection_uri') return Promise.resolve();
+        return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+      });
+      render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+      await openAuthTab();
+      await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+      fireEvent.click(useIdToken());
+
+      fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+      await waitFor(() => {
+        const call = calls.find((c) => c.cmd === 'test_connection_uri');
+        expect(call?.args?.oidc).toEqual({ use_id_token: true });
+      });
+    });
+
+    it('sends a saved profile’s use_id_token to connect_db from the profile list', async () => {
+      const calls: any[] = [];
+      const profile = {
+        id: 'p-cidaas',
+        name: 'cidaas OIDC',
+        uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+        ssh: null,
+        color_tag: null,
+        oidc: { use_id_token: true },
+      };
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+        if (cmd === 'connect_db') return Promise.resolve('conn-cidaas');
+        return Promise.resolve(null);
+      });
+      render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+      fireEvent.click((await screen.findAllByText('cidaas OIDC'))[0]);
+      fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+
+      await waitFor(() => {
+        const call = calls.find((c) => c.cmd === 'connect_db');
+        expect(call?.args?.oidc).toEqual({ use_id_token: true });
+      });
+    });
+  });
+
+  it('sends the OIDC config built from the editor to test_connection_uri', async () => {
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'test_connection_uri') return Promise.resolve();
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openAuthTab();
+    await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+    fireEvent.change(screen.getByLabelText(/allowed hosts/i), {
+      target: { value: 'mongo.corp.example.com' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() => {
+      const call = calls.find((c) => c.cmd === 'test_connection_uri');
+      expect(call?.args?.oidc).toEqual({ allowed_hosts: ['mongo.corp.example.com'] });
+    });
+  });
+});
+
+// A `loginId` is minted only when this says yes, and the backend starts a
+// browser login whenever the driver reads the URI as MONGODB-OIDC. So this must
+// read a URI the way `uri_requests_oidc` (oidc_login.rs) does, or a login runs
+// with no Cancel. The cases mirror that function's own tests.
+describe('isOidcUri reads the mechanism as the backend does (#430)', () => {
+  it.each([
+    'mongodb://h:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+    'mongodb://h/?authSource=%24external&authmechanism=MONGODB-OIDC',
+    'mongodb://h/?AUTHMECHANISM=mongodb-oidc',
+    'mongodb://h/db?authMechanism=MONGODB%2DOIDC',
+    'mongodb://h/?authmechanism=MONGODB%2DOIDC&authSource=%24external',
+    'mongodb+srv://cluster.example.com/?retryWrites=true;authMechanism=MONGODB-OIDC',
+    'mongodb://h/?authMechanism= MONGODB-OIDC ',
+    'mongodb://h/?appName=x#&authMechanism=MONGODB-OIDC&authSource=$external',
+    'mongodb://h/#?authMechanism=MONGODB-OIDC&authSource=$external',
+  ])('detects OIDC in %s', (uri) => {
+    expect(isOidcUri(uri)).toBe(true);
+  });
+
+  it.each([
+    'mongodb://h:27017/',
+    'mongodb://h/?authMechanism=SCRAM-SHA-256',
+    'mongodb://u:pw@h/?authMechanism=MONGODB-X509',
+    'mongodb://MONGODB-OIDC:pw@h/?authSource=admin',
+    'mongodb://h/authMechanism=MONGODB-OIDC',
+    'mongodb://h/?authMechanismProperties=ENVIRONMENT:MONGODB-OIDC',
+    'mongodb://h/?appName=authMechanism=MONGODB-OIDC',
+    'mongodb://h/?authMechanism=MONGODB-OIDC-EXTRA',
+  ])('does not treat %s as OIDC', (uri) => {
+    expect(isOidcUri(uri)).toBe(false);
+  });
+
+  it('reads a malformed escape as not OIDC instead of throwing', () => {
+    expect(isOidcUri('mongodb://h/?authMechanism=MONGODB-OIDC%ZZ')).toBe(false);
+    expect(isOidcUri('mongodb://h/?authMechanism=%E0%A4%A')).toBe(false);
+    expect(isOidcUri('mongodb://h/?authMechanism=MONGODB%2DOIDC&appName=%ZZ')).toBe(true);
+  });
+});
+
+describe('waiting-for-browser-login UI (#430 Task 15)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  const openEditorWith = async (uri: string) => {
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    await pickSelectOption('topology-select', /full uri string only/i);
+    fireEvent.change(screen.getByLabelText(/connection uri/i), { target: { value: uri } });
+  };
+
+  /**
+   * `test_connection_uri` never settles on its own — the real backend's own
+   * call is in flight for exactly as long as the human login is (the login
+   * runs inside the ping). `emit` drives its phase channel live, and `calls`
+   * records every invoke so a test can assert on the exact args a later call
+   * (e.g. `cancel_oidc_login`) was made with.
+   */
+  const startOidcTest = () => {
+    let emitFn: (phase: string, status: string, message?: string) => void = () => {};
+    const calls: { cmd: string; args: any }[] = [];
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'test_connection_uri') {
+        emitFn = (phase, status, message) => args.onPhase.onmessage({ phase, status, message });
+        return new Promise(() => {});
+      }
+      if (cmd === 'cancel_oidc_login' || cmd === 'reopen_oidc_login') return Promise.resolve(null);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    return {
+      emit: (phase: string, status: string, message?: string) => emitFn(phase, status, message),
+      calls,
+    };
+  };
+
+  const runToAuthenticateStart = async (test: ReturnType<typeof startOidcTest>) => {
+    await waitFor(() => expect(test.calls.some((c) => c.cmd === 'test_connection_uri')).toBe(true));
+    test.emit('parse', 'start'); test.emit('parse', 'ok');
+    test.emit('resolve', 'start'); test.emit('resolve', 'ok');
+    test.emit('connect', 'start'); test.emit('connect', 'ok');
+    test.emit('ping', 'start');
+    test.emit('authenticate', 'start');
+  };
+
+  it('shows the authenticate row only once the backend reports it', async () => {
+    const test = startOidcTest();
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await waitFor(() => expect(test.calls.some((c) => c.cmd === 'test_connection_uri')).toBe(true));
+
+    test.emit('parse', 'start'); test.emit('parse', 'ok');
+    test.emit('resolve', 'start'); test.emit('resolve', 'ok');
+    test.emit('connect', 'start'); test.emit('connect', 'ok');
+    test.emit('ping', 'start');
+
+    await waitFor(() => expect(screen.getByTestId('test-step-ping')).toBeInTheDocument());
+    expect(screen.queryByTestId('test-step-authenticate')).not.toBeInTheDocument();
+    expect(screen.queryByText(/waiting for browser login/i)).not.toBeInTheDocument();
+
+    test.emit('authenticate', 'start');
+
+    expect(await screen.findByTestId('test-step-authenticate')).toBeInTheDocument();
+    expect(screen.getByText(/waiting for browser login/i)).toBeInTheDocument();
+  });
+
+  it('offers cancel and reopen while the authenticate row is running, inserted before ping', async () => {
+    const test = startOidcTest();
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await runToAuthenticateStart(test);
+
+    expect(await screen.findByRole('button', { name: /cancel login/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /open browser again/i })).toBeInTheDocument();
+    expect(screen.getByTestId('test-step-authenticate')).toHaveAttribute('data-status', 'running');
+
+    const order = screen.getAllByTestId(/^test-step-/).map((el) => el.getAttribute('data-testid'));
+    expect(order.indexOf('test-step-authenticate')).toBeLessThan(order.indexOf('test-step-ping'));
+  });
+
+  it('a SCRAM test never shows an authenticate row', async () => {
+    mockInvoke.mockImplementation((cmd, args) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'test_connection_uri') {
+        const emit = (phase: string, status: string) => args.onPhase.onmessage({ phase, status });
+        for (const p of ['parse', 'resolve', 'connect', 'ping']) {
+          emit(p, 'start');
+          emit(p, 'ok');
+        }
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() => expect(screen.getByTestId('test-result-summary')).toBeInTheDocument());
+    expect(screen.queryByText(/waiting for browser login/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('test-step-authenticate')).not.toBeInTheDocument();
+  });
+
+  it('cancelling the login invokes cancel_oidc_login with the same loginId sent to test_connection_uri', async () => {
+    const test = startOidcTest();
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await runToAuthenticateStart(test);
+
+    fireEvent.click(await screen.findByRole('button', { name: /cancel login/i }));
+
+    await waitFor(() => expect(test.calls.some((c) => c.cmd === 'cancel_oidc_login')).toBe(true));
+    const testCall = test.calls.find((c) => c.cmd === 'test_connection_uri')!;
+    const cancelCall = test.calls.find((c) => c.cmd === 'cancel_oidc_login')!;
+    expect(typeof testCall.args.loginId).toBe('string');
+    expect(cancelCall.args.loginId).toBe(testCall.args.loginId);
+  });
+
+  it('shows the localized reason for a failed login on its own row, never a raw locale key', async () => {
+    const test = startOidcTest();
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await runToAuthenticateStart(test);
+    test.emit('authenticate', 'fail', 'auth.oidc.errors.timedOut');
+
+    expect(await screen.findByText(/browser login expired/i)).toBeInTheDocument();
+    expect(screen.queryByText('auth.oidc.errors.timedOut')).not.toBeInTheDocument();
+  });
+
+  it('never leaves the ping row spinning when the OIDC login inside it fails the whole test', async () => {
+    mockInvoke.mockImplementation((cmd, args) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'test_connection_uri') {
+        const emit = (phase: string, status: string, message?: string) => args.onPhase.onmessage({ phase, status, message });
+        emit('parse', 'start'); emit('parse', 'ok');
+        emit('resolve', 'start'); emit('resolve', 'ok');
+        emit('connect', 'start'); emit('connect', 'ok');
+        emit('ping', 'start');
+        emit('authenticate', 'start');
+        emit('authenticate', 'fail', 'auth.oidc.errors.timedOut');
+        return Promise.reject('auth.oidc.errors.timedOut');
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('test-step-authenticate')).toHaveAttribute('data-status', 'failed');
+    });
+    // Ping was already 'running' (its 'start' fired before the login failed
+    // inside it) and never receives its own 'ok'/'fail' — it must not still
+    // read 'running' once the test has concluded.
+    expect(screen.getByTestId('test-step-ping')).not.toHaveAttribute('data-status', 'running');
+  });
+
+  it('closing the editor while a login is pending cancels it', async () => {
+    const test = startOidcTest();
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await runToAuthenticateStart(test);
+    await screen.findByRole('button', { name: /cancel login/i });
+
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+
+    await waitFor(() => expect(test.calls.some((c) => c.cmd === 'cancel_oidc_login')).toBe(true));
+    const testCall = test.calls.find((c) => c.cmd === 'test_connection_uri')!;
+    const cancelCall = test.calls.find((c) => c.cmd === 'cancel_oidc_login')!;
+    expect(cancelCall.args.loginId).toBe(testCall.args.loginId);
+  });
+
+  it('translates a bare OIDC error key in the connect-error banner instead of showing it raw', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'connect_db') return Promise.reject('auth.oidc.errors.cancelled');
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByTestId('editor-connect-btn'));
+
+    expect(await screen.findByTestId('connect-error-summary')).toHaveTextContent(/login was cancelled/i);
+    expect(screen.queryByText(/auth\.oidc\.errors\.cancelled/)).not.toBeInTheDocument();
+  });
+
+  // M11: every way the manager goes away must cancel a login still waiting
+  // on the browser, or it runs on unobserved until the driver's 5 minutes
+  // are up. App keeps the manager mounted and closes it through `isOpen`,
+  // and the X, the footer Close and Escape all call `onClose` directly, so
+  // the dialog's own `onOpenChange` never sees them.
+  it('closing the manager while a test login is pending cancels it', async () => {
+    const test = startOidcTest();
+    const { rerender } = render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await runToAuthenticateStart(test);
+    await screen.findByRole('button', { name: /cancel login/i });
+
+    rerender(<DialogProvider><ConnectionManager isOpen={false} onClose={() => {}} onConnect={() => {}} /></DialogProvider>);
+
+    await waitFor(() => expect(test.calls.some((c) => c.cmd === 'cancel_oidc_login')).toBe(true));
+    const testCall = test.calls.find((c) => c.cmd === 'test_connection_uri')!;
+    const cancelCall = test.calls.find((c) => c.cmd === 'cancel_oidc_login')!;
+    expect(cancelCall.args.loginId).toBe(testCall.args.loginId);
+  });
+
+  it('closing the manager while a list-view OIDC connect is pending cancels it', async () => {
+    const calls: { cmd: string; args: any }[] = [];
+    const profile = {
+      id: 'p-oidc',
+      name: 'Corp OIDC',
+      uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+      ssh: null,
+      color_tag: null,
+      oidc: null,
+    };
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+      if (cmd === 'connect_db') return new Promise(() => {});
+      if (cmd === 'cancel_oidc_login') return Promise.resolve(null);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    const { rerender } = render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    fireEvent.click((await screen.findAllByText('Corp OIDC'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    await screen.findByTestId('connect-cancel-login');
+
+    rerender(<DialogProvider><ConnectionManager isOpen={false} onClose={() => {}} onConnect={() => {}} /></DialogProvider>);
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === 'cancel_oidc_login')).toBe(true));
+    const connectCall = calls.find((c) => c.cmd === 'connect_db')!;
+    const cancelCall = calls.find((c) => c.cmd === 'cancel_oidc_login')!;
+    expect(cancelCall.args.loginId).toBe(connectCall.args.loginId);
+  });
+
+  // An imported URI may percent-encode the mechanism. The backend still starts
+  // a browser login for it, so the connect must still carry a cancellable id.
+  it('offers cancel for a saved profile whose URI percent-encodes the OIDC mechanism', async () => {
+    const calls: { cmd: string; args: any }[] = [];
+    const profile = {
+      id: 'p-oidc-encoded',
+      name: 'Encoded OIDC',
+      uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB%2DOIDC&authSource=%24external',
+      ssh: null,
+      color_tag: null,
+      oidc: null,
+    };
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+      if (cmd === 'connect_db') return new Promise(() => {});
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    fireEvent.click((await screen.findAllByText('Encoded OIDC'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+
+    expect(await screen.findByTestId('connect-cancel-login')).toBeInTheDocument();
+    const connectCall = calls.find((c) => c.cmd === 'connect_db')!;
+    expect(typeof connectCall.args.loginId).toBe('string');
+  });
+
+  it('unmounting the manager while a test login is pending cancels it', async () => {
+    const test = startOidcTest();
+    const { unmount } = render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    await runToAuthenticateStart(test);
+    await screen.findByRole('button', { name: /cancel login/i });
+
+    unmount();
+
+    const testCall = test.calls.find((c) => c.cmd === 'test_connection_uri')!;
+    const cancelCall = test.calls.find((c) => c.cmd === 'cancel_oidc_login');
+    expect(cancelCall?.args.loginId).toBe(testCall.args.loginId);
+  });
+
+  // OIDC messages are two sentences: what happened, then what to do. The
+  // generic driver-error summary cuts at the first ". ", which hid exactly
+  // the actionable half (M1).
+  it('shows the whole OIDC message as the test result, not just its first sentence', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'test_connection_uri') return Promise.reject('auth.oidc.errors.tokenExchangeFailed');
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+
+    const summary = await screen.findByTestId('test-result-summary');
+    expect(summary).toHaveTextContent(/could not exchange the login for a token/i);
+    expect(summary).toHaveTextContent(/not through the connection's SOCKS5 proxy/i);
+  });
+
+  it('shows the whole OIDC message in the connect-error banner, not just its first sentence', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'connect_db') return Promise.reject('auth.oidc.errors.hostNotAllowed');
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByTestId('editor-connect-btn'));
+
+    const summary = await screen.findByTestId('connect-error-summary');
+    expect(summary).toHaveTextContent(/not in the allowed hosts for OIDC/i);
+    expect(summary).toHaveTextContent(/add it under allowed hosts/i);
+  });
+
+  // The key is kept and translated at render, so a result on screen follows
+  // a language switch instead of staying in the language it arrived in (#32).
+  it('re-renders an OIDC test result in the new language after a language switch', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'test_connection_uri') return Promise.reject('auth.oidc.errors.cancelled');
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    const { i18next } = await import('@/lib/i18n');
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    await openEditorWith('mongodb://mock');
+    fireEvent.click(screen.getByRole('button', { name: /test connection/i }));
+    expect(await screen.findByTestId('test-result-summary')).toHaveTextContent('The login was cancelled.');
+
+    try {
+      await act(async () => { await i18next.changeLanguage('de'); });
+      await waitFor(() =>
+        expect(screen.getByTestId('test-result-summary')).toHaveTextContent('Die Anmeldung wurde abgebrochen.'),
+      );
+    } finally {
+      await act(async () => { await i18next.changeLanguage('en'); });
+    }
+  });
+
+  it('offers cancel and reopen while an OIDC connect (no phase stream) is in flight', async () => {
+    let releaseConnect: (() => void) | undefined;
+    const calls: { cmd: string; args: any }[] = [];
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_connection_profiles') return Promise.resolve([]);
+      if (cmd === 'connect_db') return new Promise((resolve) => { releaseConnect = () => resolve('conn-1'); });
+      if (cmd === 'cancel_oidc_login' || cmd === 'reopen_oidc_login') return Promise.resolve(null);
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: /new\.\.\./i }));
+    fireEvent.change(screen.getByTestId('host-list'), { target: { value: 'mongo.corp.example.com:27017' } });
+    fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
+    await pickSelectOption('auth-method-select', /oidc \(browser login\)/i);
+
+    fireEvent.click(screen.getByTestId('editor-connect-btn'));
+
+    expect(await screen.findByRole('button', { name: /cancel login/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /open browser again/i })).toBeInTheDocument();
+    const connectCall = calls.find((c) => c.cmd === 'connect_db')!;
+    expect(typeof connectCall.args.loginId).toBe('string');
+
+    releaseConnect?.();
+  });
+
+  it('does not duplicate cancel/reopen when a profile is selected behind an open OIDC editor connect', async () => {
+    let releaseConnect: (() => void) | undefined;
+    const profile = {
+      id: 'p-oidc',
+      name: 'Corp OIDC',
+      uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+      ssh: null,
+      color_tag: null,
+      oidc: null,
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+      if (cmd === 'connect_db') return new Promise((resolve) => { releaseConnect = () => resolve('conn-1'); });
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+    render(<ConnectionManager isOpen onClose={() => {}} onConnect={() => {}} />);
+    fireEvent.click((await screen.findAllByText('Corp OIDC'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+    fireEvent.click(screen.getByTestId('editor-connect-btn'));
+
+    await screen.findByTestId('connect-cancel-login');
+    // The list view behind the open editor dialog stays mounted (it's a
+    // separate top-layer Dialog, not unmounted while the editor is open) —
+    // without gating on `showEditDialog` it would render its own copy of
+    // these buttons too, so `getByTestId` would find two.
+    expect(screen.getAllByTestId('connect-cancel-login')).toHaveLength(1);
+    expect(screen.getAllByTestId('connect-reopen-login')).toHaveLength(1);
+
+    releaseConnect?.();
   });
 });
