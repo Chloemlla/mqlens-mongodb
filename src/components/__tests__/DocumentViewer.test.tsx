@@ -16,18 +16,20 @@ vi.mock('@tauri-apps/api/core', () => ({
 // that round-trips value/onChange — this keeps the existing stage tests, which
 // drive `pipeline-stage-N textarea`, working against the real component shape.
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, wrapperProps }: { value: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
+  // QueryEditor hands the library only `defaultValue` (it writes later values
+  // into the model itself), so show whichever one the editor was given.
+  default: ({ value, defaultValue, onChange, wrapperProps }: { value?: string; defaultValue?: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
     <textarea
       data-testid={wrapperProps?.['data-testid'] as string | undefined}
-      value={value}
+      value={value ?? defaultValue}
       onChange={(e) => onChange?.(e.target.value)}
     />
   ),
 }));
 
 vi.mock('@/components/ui/resizable', () => ({
-  ResizablePanelGroup: ({ children, className }: { children: React.ReactNode; className?: string }) => (
-    <div className={className}>{children}</div>
+  ResizablePanelGroup: ({ children, className, id }: { children: React.ReactNode; className?: string; id?: string }) => (
+    <div className={className} data-group-id={id}>{children}</div>
   ),
   ResizablePanel: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   ResizableHandle: (props: React.HTMLAttributes<HTMLDivElement>) => <div {...props} />,
@@ -1571,6 +1573,33 @@ describe('page size resync from the pager (#218)', () => {
 // `children` — a subtree React skips when only DocumentViewer's own state
 // changes — but the provider was handed a fresh object literal every render, so
 // every keystroke re-rendered the whole grid.
+describe('workspace split group id (#392)', () => {
+  it('gives each mounted DocumentViewer its own resizable group id', () => {
+    // Recently used tabs stay mounted (#345), so several collection tabs can be
+    // mounted at once. react-resizable-panels looks a group up by its id; with
+    // one shared id, opening the AI helper in one tab while another showed only
+    // the document area threw "Invalid 2 panel layout: 100%" (#392).
+    const props = {
+      connectionName: 'test-conn',
+      databaseName: 'test-db',
+      onExecute: vi.fn(),
+      onExplain: vi.fn(),
+      loading: false,
+    };
+    render(
+      <>
+        <DocumentViewer {...props} collectionName="orders" />
+        <DocumentViewer {...props} collectionName="invoices" />
+      </>,
+    );
+
+    const ids = [...document.querySelectorAll('[data-group-id]')].map((el) => el.getAttribute('data-group-id'));
+    expect(ids).toHaveLength(2);
+    expect(ids.every((id) => id?.startsWith('document-viewer-workspace-'))).toBe(true);
+    expect(new Set(ids).size).toBe(2);
+  });
+});
+
 describe('DocumentViewer — typing does not re-render the results (#310)', () => {
   const Consumer: React.FC<{ onRender: () => void }> = ({ onRender }) => {
     // Stands in for DataGrid: consumes this context and triggers Explain

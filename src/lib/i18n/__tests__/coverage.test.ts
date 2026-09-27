@@ -126,6 +126,9 @@ const EXEMPT_HITS: Record<string, string[]> = {
     'placeholder="1080"',
     'placeholder="username"',
     'placeholder="test"',
+    // OIDC allowed-hosts example (#430) — a hostname the user would type, not
+    // instructional prose; same treatment as the other example placeholders above.
+    'placeholder="mongo.corp.example.com"',
     // Stored profile default value, not UI copy (see the source comment at
     // its definition) — it is written straight into connection state and
     // must never be a translated word (Global Constraint 1's "sammlung" bug).
@@ -300,6 +303,12 @@ const EXEMPT_HITS: Record<string, string[]> = {
   ],
   'src/workspace/workspaceStore.ts': [
     "throw new Error('hydrate is frontend-only and must never be mirrored to workspace_apply'",
+  ],
+  'src/App.tsx': [
+    // Written to the crash log (logFrontendError) when a window's event
+    // subscription is refused; never rendered. Kept English so bug reports
+    // stay searchable, like the console.* diagnostics beside it.
+    'listening for ${event} failed in window ${windowLabel()}: ${String(err)}',
   ],
 
   // ── Detector false positives ─────────────────────────────────────────────
