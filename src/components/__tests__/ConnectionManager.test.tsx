@@ -712,6 +712,34 @@ describe('SSH agent auth in the editor (issue #130)', () => {
       expect(savedProfile?.ssh).toEqual(agentProfile.ssh);
     });
   });
+
+  it('displays a warning when SSH tunnel is enabled for a mongodb+srv:// connection (#440)', async () => {
+    const srvProfile = {
+      id: 'srv-1',
+      name: 'Atlas Cluster',
+      uri: 'mongodb+srv://user:pass@cluster0.abcde.mongodb.net/test',
+      ssh: { enabled: true, host: 'jump.example.com', port: 22, user: 'ops', auth: { type: 'agent' } },
+      color_tag: null,
+    };
+    renderWithProfiles([srvProfile]);
+
+    fireEvent.click((await screen.findAllByText('Atlas Cluster'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+    fireEvent.click(screen.getByRole('button', { name: /ssh tunnel/i }));
+    expect(screen.getByTestId('ssh-srv-warning')).toBeInTheDocument();
+    expect(screen.getByTestId('ssh-srv-warning')).toHaveTextContent(/cannot be used with the current single-host SSH tunnel/i);
+  });
+
+  it('does not display srv warning for a standard mongodb:// connection', async () => {
+    renderWithProfiles([agentProfile]);
+
+    fireEvent.click((await screen.findAllByText('Bastion'))[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
+
+    fireEvent.click(screen.getByRole('button', { name: /ssh tunnel/i }));
+    expect(screen.queryByTestId('ssh-srv-warning')).not.toBeInTheDocument();
+  });
 });
 
 describe('ConnectionManager Component', () => {
@@ -2856,6 +2884,45 @@ describe('OIDC auth method and URI round-trip (#430)', () => {
     fireEvent.click(screen.getByRole('button', { name: /^edit$/i }));
     fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
     expect(screen.getByLabelText(/allowed hosts/i)).toHaveValue('mongo.corp.example.com, backup.corp.example.com');
+  });
+
+  it('preserves OIDC settings when duplicating a saved profile', async () => {
+    let savedProfile: any = null;
+    const profile = {
+      id: 'p-oidc',
+      name: 'Corp OIDC',
+      uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+      ssh: null,
+      color_tag: null,
+      oidc: {
+        allowed_hosts: ['mongo.corp.example.com', 'backup.corp.example.com'],
+        use_id_token: true,
+      },
+    };
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    await waitFor(() => expect(screen.getAllByText('Corp OIDC')[0]).toBeInTheDocument());
+    fireEvent.click(screen.getAllByText('Corp OIDC')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^duplicate$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
+
+    expect(screen.getByLabelText(/allowed hosts/i)).toHaveValue('mongo.corp.example.com, backup.corp.example.com');
+    expect(screen.getByRole('checkbox', { name: /use id token instead of access token/i })).toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(savedProfile?.uri).toContain('authMechanism=MONGODB-OIDC');
+      expect(savedProfile?.oidc).toEqual(profile.oidc);
+    });
   });
 
   it('sends the OIDC config built from the editor when connecting an unsaved configuration', async () => {
