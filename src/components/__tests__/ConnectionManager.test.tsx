@@ -2886,6 +2886,45 @@ describe('OIDC auth method and URI round-trip (#430)', () => {
     expect(screen.getByLabelText(/allowed hosts/i)).toHaveValue('mongo.corp.example.com, backup.corp.example.com');
   });
 
+  it('preserves OIDC settings when duplicating a saved profile', async () => {
+    let savedProfile: any = null;
+    const profile = {
+      id: 'p-oidc',
+      name: 'Corp OIDC',
+      uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+      ssh: null,
+      color_tag: null,
+      oidc: {
+        allowed_hosts: ['mongo.corp.example.com', 'backup.corp.example.com'],
+        use_id_token: true,
+      },
+    };
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === 'load_connection_profiles') return Promise.resolve([profile]);
+      if (cmd === 'save_connection_profile') {
+        savedProfile = args.profile;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unhandled mock: ${cmd}`));
+    });
+
+    render(<ConnectionManager isOpen={true} onClose={() => {}} onConnect={() => {}} />);
+    await waitFor(() => expect(screen.getAllByText('Corp OIDC')[0]).toBeInTheDocument());
+    fireEvent.click(screen.getAllByText('Corp OIDC')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /^duplicate$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^authentication$/i }));
+
+    expect(screen.getByLabelText(/allowed hosts/i)).toHaveValue('mongo.corp.example.com, backup.corp.example.com');
+    expect(screen.getByRole('checkbox', { name: /use id token instead of access token/i })).toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(savedProfile?.uri).toContain('authMechanism=MONGODB-OIDC');
+      expect(savedProfile?.oidc).toEqual(profile.oidc);
+    });
+  });
+
   it('sends the OIDC config built from the editor when connecting an unsaved configuration', async () => {
     const calls: any[] = [];
     mockInvoke.mockImplementation((cmd: string, args: any) => {
