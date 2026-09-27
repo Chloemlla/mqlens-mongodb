@@ -22,9 +22,14 @@ message ListFilesRequest {
   string connection_id = 1;
   string database = 2;
   string bucket = 3; // empty => "fs"
+  // Return file documents in files_bson instead of files_ejson.
+  // Feature "documents.raw_bson".
+  bool raw_bson = 4;
 }
+// Exactly one of the two fields is filled, as the request's raw_bson chose.
 message ListFilesResponse {
   repeated string files_ejson = 1; // canonical Extended JSON file documents
+  repeated bytes files_bson = 2;   // file documents' BSON bytes, exactly as stored
 }
 
 message DownloadFileRequest {
@@ -45,6 +50,9 @@ message UploadChunk {
   string bucket = 3;
   string filename = 4;
   bytes data = 5;
+  // First chunk only. Feature "gridfs.upload_options".
+  string content_type = 6;  // stored as the file document's contentType
+  string metadata_json = 7; // Extended JSON document stored as its metadata
 }
 message UploadFileResponse {
   string file_id_ejson = 1;

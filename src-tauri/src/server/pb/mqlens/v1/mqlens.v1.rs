@@ -347,6 +347,10 @@ pub struct AggregateRequest {
     /// Extended JSON array of stages
     #[prost(string, tag="4")]
     pub pipeline_json: ::prost::alloc::string::String,
+    /// Return documents as raw BSON in FindBatch.documents_bson instead of
+    /// Extended JSON. Feature "documents.raw_bson".
+    #[prost(bool, tag="5")]
+    pub raw_bson: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExplainRequest {
@@ -388,12 +392,22 @@ pub struct FindRequest {
     pub skip: i64,
     #[prost(int64, tag="8")]
     pub limit: i64,
+    /// Return documents as raw BSON in FindBatch.documents_bson instead of
+    /// Extended JSON. Feature "documents.raw_bson".
+    #[prost(bool, tag="9")]
+    pub raw_bson: bool,
 }
+/// Exactly one of the two fields is filled, as the request's raw_bson chose.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FindBatch {
     /// canonical Extended JSON
     #[prost(string, repeated, tag="1")]
     pub documents_ejson: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Each document's BSON bytes exactly as stored. Extended JSON cannot carry
+    /// every document: a sub-document such as {"$numberLong": "7"} reads back as
+    /// the number it resembles.
+    #[prost(bytes="bytes", repeated, tag="2")]
+    pub documents_bson: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CountRequest {
@@ -651,12 +665,20 @@ pub struct ListFilesRequest {
     /// empty => "fs"
     #[prost(string, tag="3")]
     pub bucket: ::prost::alloc::string::String,
+    /// Return file documents in files_bson instead of files_ejson.
+    /// Feature "documents.raw_bson".
+    #[prost(bool, tag="4")]
+    pub raw_bson: bool,
 }
+/// Exactly one of the two fields is filled, as the request's raw_bson chose.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListFilesResponse {
     /// canonical Extended JSON file documents
     #[prost(string, repeated, tag="1")]
     pub files_ejson: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// file documents' BSON bytes, exactly as stored
+    #[prost(bytes="bytes", repeated, tag="2")]
+    pub files_bson: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DownloadFileRequest {
@@ -689,6 +711,14 @@ pub struct UploadChunk {
     pub filename: ::prost::alloc::string::String,
     #[prost(bytes="bytes", tag="5")]
     pub data: ::prost::bytes::Bytes,
+    /// First chunk only. Feature "gridfs.upload_options".
+    ///
+    /// stored as the file document's contentType
+    #[prost(string, tag="6")]
+    pub content_type: ::prost::alloc::string::String,
+    /// Extended JSON document stored as its metadata
+    #[prost(string, tag="7")]
+    pub metadata_json: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UploadFileResponse {
