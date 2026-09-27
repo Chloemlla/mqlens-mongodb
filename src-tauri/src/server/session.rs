@@ -65,6 +65,19 @@ pub(crate) trait TokenStore: Send + Sync + 'static {
     fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String>;
     /// Replaces the stored refresh token. The caller holds the lock.
     fn write(&self, account: &ServerAccount, token: Option<&str>) -> Result<(), String>;
+    /// Stores `token` and returns the one it displaced, if any: another
+    /// sign-in to the same account finished first, and its server session
+    /// must now be ended, since nothing stores its token any more. The caller
+    /// holds the lock.
+    fn replace(
+        &self,
+        account: &ServerAccount,
+        token: &str,
+    ) -> Result<Option<Zeroizing<String>>, String> {
+        let previous = self.read(account)?;
+        self.write(account, Some(token))?;
+        Ok(previous.filter(|p| p.as_str() != token))
+    }
 }
 
 pub(crate) const ACCOUNT_CHANGED: &str =
@@ -215,14 +228,21 @@ impl AccountSession {
             let refresh = Zeroizing::new(login.refresh_token.clone());
             blocking(move || {
                 let _lock = store.lock()?;
-                store.write(&who, Some(&refresh))
+                store.replace(&who, &refresh)
             })
             .await
         };
-        if let Err(e) = stored {
-            // A session nobody holds must not stay usable on the server.
-            let _ = logout(&session.channel, &login.access_token, &login.refresh_token).await;
-            return Err(format!("Could not save the MQLens Server session: {e}"));
+        match stored {
+            Ok(Some(displaced)) => {
+                // A concurrent sign-in stored first; its session is ours to end.
+                let _ = logout_with_refresh_token(&session.channel, &displaced).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // A session nobody holds must not stay usable on the server.
+                let _ = logout(&session.channel, &login.access_token, &login.refresh_token).await;
+                return Err(format!("Could not save the MQLens Server session: {e}"));
+            }
         }
         session.adopt(login).await;
         Ok(Arc::new(session))

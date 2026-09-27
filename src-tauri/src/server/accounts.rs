@@ -8,6 +8,7 @@
 //! The account password is used once to sign in and never stored.
 
 use crate::server::channel;
+use crate::server::session::KeySource;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -208,13 +209,35 @@ pub(crate) fn lock(path: &Path) -> Result<fs::File, String> {
     crate::connections::lock_settings_for_write(path)
 }
 
+pub(crate) const VAULT_CHANGED: &str =
+    "The vault was locked or reset while this was in progress. Unlock it and try again.";
+
 /// Load, change and save the accounts under the file lock.
 pub(crate) fn update<T>(
     path: &Path,
     key: &[u8; 32],
     change: impl FnOnce(&mut Vec<ServerAccount>) -> Result<T, String>,
 ) -> Result<T, String> {
+    update_while(path, key, None, change)
+}
+
+/// `update`, going ahead only while `current` still yields `key`, checked under
+/// the file lock. A command can wait on the network between reading the key
+/// and writing; if the vault is locked or reset meanwhile, writing with the
+/// captured key would recreate the file under a key no vault uses any more.
+fn update_while<T>(
+    path: &Path,
+    key: &[u8; 32],
+    current: Option<&KeySource>,
+    change: impl FnOnce(&mut Vec<ServerAccount>) -> Result<T, String>,
+) -> Result<T, String> {
     let _lock = lock(path)?;
+    if let Some(current) = current {
+        match current() {
+            Ok(now) if now == *key => {}
+            _ => return Err(VAULT_CHANGED.to_string()),
+        }
+    }
     let mut accounts = load(path, key)?;
     let out = change(&mut accounts)?;
     save(path, key, &accounts)?;
@@ -236,8 +259,18 @@ pub(crate) fn save_account(
     key: &[u8; 32],
     input: ServerAccountInput,
 ) -> Result<(ServerAccount, Option<ServerAccount>), String> {
+    save_account_while(path, key, None, input)
+}
+
+/// `save_account`, refused if the vault stopped using `key` (see `update_while`).
+pub(crate) fn save_account_while(
+    path: &Path,
+    key: &[u8; 32],
+    current: Option<&KeySource>,
+    input: ServerAccountInput,
+) -> Result<(ServerAccount, Option<ServerAccount>), String> {
     let mut account = input.into_account()?;
-    update(path, key, move |accounts| {
+    update_while(path, key, current, move |accounts| {
         match accounts.iter_mut().find(|a| a.id == account.id) {
             Some(existing) => {
                 let previous = existing.clone();
@@ -261,7 +294,17 @@ pub(crate) fn delete_account(
     key: &[u8; 32],
     id: &str,
 ) -> Result<Option<ServerAccount>, String> {
-    update(path, key, |accounts| {
+    delete_account_while(path, key, None, id)
+}
+
+/// `delete_account`, refused if the vault stopped using `key` (see `update_while`).
+pub(crate) fn delete_account_while(
+    path: &Path,
+    key: &[u8; 32],
+    current: Option<&KeySource>,
+    id: &str,
+) -> Result<Option<ServerAccount>, String> {
+    update_while(path, key, current, |accounts| {
         Ok(accounts
             .iter()
             .position(|a| a.id == id)

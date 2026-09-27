@@ -75,7 +75,9 @@ pub(crate) async fn account_save_impl(
         }
     }
     let file = path.to_path_buf();
-    let (saved, _) = blocking(move || accounts::save_account(&file, &key, input)).await?;
+    let current = key_source(state.vault_key.clone());
+    let (saved, _) =
+        blocking(move || accounts::save_account_while(&file, &key, Some(&current), input)).await?;
     if saved.refresh_token.is_none() {
         state.server.remove(&saved.id).await;
     }
@@ -93,7 +95,9 @@ pub(crate) async fn account_delete_impl(
     // A sign-in storing later finds the account gone and ends its own session.
     let file = path.to_path_buf();
     let id = account_id.to_string();
-    let removed = blocking(move || accounts::delete_account(&file, &key, &id)).await?;
+    let current = key_source(state.vault_key.clone());
+    let removed =
+        blocking(move || accounts::delete_account_while(&file, &key, Some(&current), &id)).await?;
     state.server.remove(account_id).await;
     if let Some(account) = removed {
         if let Some(token) = account.refresh_token.as_deref() {
@@ -177,18 +181,36 @@ pub(crate) async fn list_connections_impl(
 /// unreadable. Best effort and bounded: an unreachable server must not hold up
 /// a reset, and sessions are dropped here regardless.
 pub(crate) async fn sign_out_all_best_effort(state: &AppState, path: &Path) {
-    if let Ok(key) = state.require_key() {
-        if let Ok(all) = accounts::load(path, &key) {
-            let sign_outs = all
-                .iter()
-                .filter(|a| a.refresh_token.is_some())
-                .map(|a| sign_out_account(state, path, a));
-            let _ =
-                tokio::time::timeout(RESET_SIGN_OUT_TIMEOUT, futures::future::join_all(sign_outs))
-                    .await;
-        }
-    }
+    sign_out_all_within(state, path, RESET_SIGN_OUT_TIMEOUT).await
+}
+
+/// Each account gets `limit` of its own, all at once, so one unreachable server
+/// cannot use up the time every other account needed.
+async fn sign_out_all_within(state: &AppState, path: &Path, limit: Duration) {
     state.server.clear().await;
+    let Ok(key) = state.require_key() else {
+        return;
+    };
+    // Every token is taken out of the file in one locked step, so no session,
+    // here or in another instance, presents one again while it is revoked,
+    // which would trip the server's reuse check. No lock is held across the
+    // network calls below.
+    let file = path.to_path_buf();
+    let taken = blocking(move || {
+        accounts::update(&file, &key, |all| {
+            Ok(all
+                .iter_mut()
+                .filter_map(|a| a.refresh_token.take().map(|token| (a.clone(), token)))
+                .collect::<Vec<_>>())
+        })
+    })
+    .await;
+    if let Ok(taken) = taken {
+        let revokes = taken
+            .iter()
+            .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
+        futures::future::join_all(revokes).await;
+    }
 }
 
 /// Ends an account's session on the server and here, best effort. Returns
@@ -489,6 +511,135 @@ mod tests {
                 "the deleted account's session is still live on the server"
             )
         });
+    }
+
+    // An edit waiting on the old identity's sign-out can outlive a vault reset
+    // in another window. It must not then write the accounts file under the
+    // key the reset discarded: the new vault could not read its own accounts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_that_outlives_a_vault_reset_writes_nothing() {
+        let env = Env::new().await;
+        let state = Arc::new(unlocked());
+        // Signing out then needs a refresh, which the fake holds for a while.
+        env.fake.with(|s| s.access_ttl_secs = -1);
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake.with(|s| {
+            s.access_ttl_secs = 3600;
+            s.refresh_delay = Duration::from_millis(400);
+        });
+
+        let editing = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let moved = ServerAccountInput {
+                email: "dba@acme.test".to_string(),
+                ..form(&env)
+            };
+            tokio::spawn(async move { account_save_impl(&state, &path, moved).await })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Another window resets the vault and sets up a new one.
+        std::fs::remove_file(&env.path).unwrap();
+        *state.vault_key.lock().unwrap() = Some([9; 32]);
+
+        let result = editing.await.unwrap();
+        assert!(result.is_err(), "the edit went through: {result:?}");
+        assert!(
+            !env.path.exists(),
+            "the edit recreated the accounts file under the discarded key"
+        );
+    }
+
+    // Two windows signing in to the same signed-out account at once each get a
+    // server session; only one can be stored, and the other must be ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_sign_ins_leave_one_live_session() {
+        let env = Env::new().await;
+        let a = Arc::new(unlocked());
+        let b = Arc::new(unlocked());
+        env.fake
+            .with(|s| s.login_delay = Duration::from_millis(200));
+        let sign_in = |state: Arc<AppState>| {
+            let path = env.path.clone();
+            let id = env.account.id.clone();
+            tokio::spawn(
+                async move { sign_in_impl(&state, &path, &id, PASSWORD.to_string()).await },
+            )
+        };
+        let (x, y) = (sign_in(a.clone()), sign_in(b.clone()));
+        x.await.unwrap().unwrap();
+        y.await.unwrap().unwrap();
+
+        env.fake.with(|s| {
+            assert_eq!(s.logins, 2);
+            assert_eq!(
+                s.live_families(),
+                1,
+                "a displaced sign-in is still live on the server"
+            );
+        });
+        // Both windows go on working with the session that is stored.
+        list_connections_impl(&a, &env.path, &env.account.id)
+            .await
+            .unwrap();
+        list_connections_impl(&b, &env.path, &env.account.id)
+            .await
+            .unwrap();
+    }
+
+    // One unreachable server must not use up the reset's time for everyone:
+    // every other account's session still gets ended before its token is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reset_reaches_every_account_even_if_one_server_hangs() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        // A server that accepts connections and never answers.
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_url = format!("http://{}", hung.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = hung.accept().await {
+                held.push(socket);
+            }
+        });
+        // Listed first, so it would be first in line for the accounts lock.
+        accounts::update(&env.path, &KEY, |all| {
+            let mut stuck = ServerAccountInput {
+                id: None,
+                name: "Hung".to_string(),
+                url: hung_url,
+                tenant: TENANT.to_string(),
+                email: EMAIL.to_string(),
+                allow_insecure_http: false,
+                extra_ca_pem: None,
+            }
+            .into_account()?;
+            stuck.refresh_token = Some("refresh-for-the-hung-server".to_string());
+            all.insert(0, stuck);
+            Ok(())
+        })
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        sign_out_all_within(&state, &env.path, Duration::from_millis(500)).await;
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the reachable server's session was never ended"
+            )
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
