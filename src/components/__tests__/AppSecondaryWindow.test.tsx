@@ -46,8 +46,14 @@ const eventListeners = new Map<string, Array<(event: { payload: unknown }) => vo
 function fireMockEvent(eventName: string, payload: unknown) {
   for (const cb of eventListeners.get(eventName) ?? []) cb({ payload });
 }
+// Events whose `listen` rejects, as Tauri rejects one the window's capability
+// does not allow.
+const deniedEvents = new Set<string>();
 vi.mock('@tauri-apps/api/event', () => ({
   listen: (eventName: string, cb: (event: { payload: unknown }) => void) => {
+    if (deniedEvents.has(eventName)) {
+      return Promise.reject(`event.listen not allowed on window "win-2"`);
+    }
     const arr = eventListeners.get(eventName) ?? [];
     arr.push(cb);
     eventListeners.set(eventName, arr);
@@ -83,6 +89,7 @@ describe('App as a secondary window (windowLabel() === "win-2") — Phase 3 Task
   beforeEach(() => {
     vi.clearAllMocks();
     eventListeners.clear();
+    deniedEvents.clear();
   });
 
   it('an emptied secondary window (no tabs restored for it) closes itself via close_workspace_window', async () => {
@@ -232,5 +239,29 @@ describe('App as a secondary window (windowLabel() === "win-2") — Phase 3 Task
     expect(calls.filter((c) => c.cmd === 'stop_mongosh_session')).toEqual([]);
     // Forgotten here, though: the destination window owns it now.
     expect(readShellSession('conn-1.sales_db.customers')).toBeUndefined();
+  });
+
+  it('logs an event subscription the window was refused instead of swallowing it', async () => {
+    // What a detached window whose label no capability covered did: it never
+    // heard a disconnect in main, and nothing said so.
+    deniedEvents.add('connections-changed');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd: string, args: any) => {
+      calls.push({ cmd, args });
+      if (cmd === 'load_app_settings') return Promise.resolve({});
+      return Promise.resolve([]);
+    });
+
+    renderWithProviders(<App />);
+    await screen.findByTestId('mock-sidebar');
+
+    await vi.waitFor(() => {
+      const logged = calls.filter((c) => c.cmd === 'log_frontend_error').map((c) => c.args.message as string);
+      expect(logged).toContainEqual(expect.stringContaining('listening for connections-changed failed in window win-2'));
+      expect(logged.some((m) => m.includes('workspace-changed'))).toBe(false);
+    });
+    expect(warn).toHaveBeenCalledWith('listening for connections-changed failed', expect.anything());
+    warn.mockRestore();
   });
 });

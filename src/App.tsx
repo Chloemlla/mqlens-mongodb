@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useReducer } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useReducer } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { AppShell } from '@/components/layout/AppShell';
@@ -17,6 +17,7 @@ import {
   takeSettledChatRequest,
 } from './lib/aiChatRequest';
 import { stopChangeStream } from './lib/changeStream';
+import { describeConnectError } from './lib/describeConnectError';
 import { startWriteRequests } from './lib/mcpWriteRequests';
 import { McpWriteConfirm } from './components/McpWriteConfirm';
 import {
@@ -88,6 +89,7 @@ import {
   type ConnectionsChangedPayload,
   type ConnectionEntry,
 } from './workspace/workspaceStore';
+import { logFrontendError } from './lib/crashLog';
 import {
   toPersistedTab,
   isEphemeralProfileId,
@@ -171,7 +173,8 @@ interface DocumentEdit {
 const newEditId = (): string =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
-    : `edit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    : /* v8 ignore next -- every engine the app runs on has randomUUID */
+      `edit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 export interface QueryTab {
   id: string;
@@ -618,9 +621,10 @@ function Workspace() {
   // Foreign-event reconciliation (below) runs inside a `listen` callback
   // captured once at mount — it can never see a fresh `tabs` STATE value
   // from that closure, same staleness problem `activeConnectionsRef` exists
-  // to solve for `handleBuilderStateChange`. Mirrors `tabs` on every change.
+  // to solve for `handleBuilderStateChange`. Mirrors `tabs` on every change,
+  // in a layout effect for the reason given on `activeConnectionsRef` below.
   const tabsRef = useRef<QueryTab[]>(tabs);
-  useEffect(() => {
+  useLayoutEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
   const [layout, dispatchLayout] = useReducer(
@@ -704,8 +708,15 @@ function Workspace() {
   // fresh `activeConnections` STATE value from its closure — it would stay
   // pinned at mount's `[]` forever. A ref mirrors the state on every change
   // so the callback can read the current connections via `.current` instead.
+  //
+  // A layout effect, not a passive one: the `connections-changed` listener
+  // reads this ref too, and React runs passive effects in a task it schedules
+  // after the commit. A broadcast handled in between found a just-opened
+  // connection already on screen but missing here, so it skipped the
+  // self-heal re-announce for it. A layout effect runs inside the commit, so
+  // no event can see the DOM and this ref disagree.
   const activeConnectionsRef = useRef<ActiveConnection[]>(activeConnections);
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeConnectionsRef.current = activeConnections;
   }, [activeConnections]);
   // Every CONNECTION id this window has ever learned about from a
@@ -1139,7 +1150,7 @@ function Workspace() {
     );
     if (existing) return existing.id;
     try {
-      const id = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null });
+      const id = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null, oidc: profile.oidc ?? null });
       addActiveConnection(id, profile.name, profile.uri, profile.id, profile.color_tag ?? undefined, undefined, profile.connection_mode ?? 'normal');
       // Announce this fresh id to every other window (Phase 3 Task 6) — see
       // `setConnectionMeta`'s doc comment for why every connect path calls it.
@@ -1149,7 +1160,7 @@ function Workspace() {
       rebindProfileTabs(profile.id, id);
       return id;
     } catch (e) {
-      toast(t('toast.couldNotConnectToProfile', { name: profile.name, detail: (e as any)?.message || String(e) }), 'error');
+      toast(t('toast.couldNotConnectToProfile', { name: profile.name, detail: describeConnectError(e, t) }), 'error');
       return null;
     }
   };
@@ -1158,7 +1169,7 @@ function Workspace() {
     const SAMPLE_ID = '__sample__';
     if (activeConnections.some((c) => c.profileId === SAMPLE_ID)) return;
     try {
-      const id = await invoke<string>('connect_db', { uri: 'mongodb://mock', ssh: null });
+      const id = await invoke<string>('connect_db', { uri: 'mongodb://mock', ssh: null, oidc: null });
       addActiveConnection(id, 'Sample (mqlens_demo)', 'mongodb://mock', SAMPLE_ID);
     } catch (e) {
       toast(t('toast.couldNotLoadSampleData', { detail: (e as any)?.message || String(e) }), 'error');
@@ -3452,14 +3463,21 @@ function Workspace() {
   useEffect(() => {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
-    const own = (p: Promise<() => void>) => {
+    // A rejected subscription leaves this window deaf to `event` for its whole
+    // life — which is what a secondary window whose label no capability
+    // covered looked like: it never heard a disconnect. Log it, never swallow.
+    const own = (event: string, p: Promise<() => void>) => {
       p.then((unlisten) => {
         if (cancelled) unlisten();
         else unlistenFns.push(unlisten);
-      }).catch(() => {});
+      }).catch((err) => {
+        console.warn(`listening for ${event} failed`, err);
+        logFrontendError(`listening for ${event} failed in window ${windowLabel()}: ${String(err)}`);
+      });
     };
 
     own(
+      'workspace-changed',
       subscribeWorkspaceChanged((payload: WorkspaceChangedPayload) => {
         // Drop a replayed/out-of-order event — revisions only ever
         // increase, so anything at or below what's already applied adds
@@ -3677,6 +3695,7 @@ function Workspace() {
     );
 
     own(
+      'connections-changed',
       subscribeConnectionsChanged((payload: ConnectionsChangedPayload) => {
         // Connection-id keyed, NOT profileId keyed (final fix wave,
         // agent-connection visibility): a profile can now legitimately have
@@ -3835,7 +3854,7 @@ function Workspace() {
           return;
         }
 
-        newId = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null });
+        newId = await invoke<string>('connect_db', { uri: profile.uri, ssh: profile.ssh ?? null, oidc: profile.oidc ?? null });
         addActiveConnection(newId, profileName, profile.uri, profile.id, profile.color_tag ?? undefined, undefined, profile.connection_mode ?? 'normal');
         // Announce this fresh id to every other window (Phase 3 Task 6) —
         // see `setConnectionMeta`'s doc comment. Deliberately NOT called on
@@ -3872,7 +3891,7 @@ function Workspace() {
         await refreshTabResults(tab);
       }
     } catch (err: any) {
-      patchReconnectState(profileId, { busy: false, error: err?.message || String(err) });
+      patchReconnectState(profileId, { busy: false, error: describeConnectError(err, t) });
     } finally {
       reconnectBusyRef.current.delete(profileId);
     }

@@ -4,10 +4,12 @@ import { render, screen, fireEvent } from '@testing-library/react';
 // QueryEditor wraps Monaco, which has no usable DOM under jsdom — mock it as a
 // plain textarea that round-trips value/onChange, matching the other tests.
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, wrapperProps }: { value: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
+  // QueryEditor hands the library only `defaultValue` (it writes later values
+  // into the model itself), so show whichever one the editor was given.
+  default: ({ value, defaultValue, onChange, wrapperProps }: { value?: string; defaultValue?: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
     <textarea
       data-testid={wrapperProps?.['data-testid'] as string | undefined}
-      value={value}
+      value={value ?? defaultValue}
       onChange={(e) => onChange?.(e.target.value)}
     />
   ),

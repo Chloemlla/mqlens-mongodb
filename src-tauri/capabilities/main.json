@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Permissions only the main window gets. The updater plugin's own API stays here: updates are checked and installed through the app's update_check/update_install commands, and no secondary window needs to drive the plugin directly.",
+  "windows": ["main"],
+  "permissions": ["updater:default"]
+}

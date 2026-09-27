@@ -739,7 +739,7 @@ fn default_window() -> WindowModel {
 /// excluded. Stateless for the same reason `next_pane_id`/`next_split_id`
 /// are: a `Workspace` restored from disk may already contain `win-3`, and a
 /// process-local counter seeded at 0 would collide with it immediately.
-fn next_window_id(ws: &Workspace) -> String {
+pub(crate) fn next_window_id(ws: &Workspace) -> String {
     let best = ws
         .windows
         .iter()

@@ -117,6 +117,11 @@ pub struct AppState {
     /// leaving the survivor unable to confirm anything.
     pub mcp_helper_requesters: Mutex<Vec<HelperRun>>,
     pub connections: Mutex<HashMap<String, Client>>,
+    /// Human MONGODB-OIDC logins whose connect or test call is still in
+    /// flight, keyed by the caller's login id (#430). This is how the UI
+    /// cancels a login and how "Open browser again" finds its URL. An entry
+    /// lives only as long as that call — see `oidc_login::LoginRegistration`.
+    pub oidc_sessions: crate::oidc_login::OidcSessions,
     pub mocks: Mutex<HashMap<String, bool>>,
     pub mock_indexes: Mutex<HashMap<String, Vec<IndexInfo>>>,
     pub mongosh_sessions: Mutex<HashMap<String, Arc<MongoshSession>>>,
@@ -158,6 +163,11 @@ pub struct AppState {
     /// connection id, for tools that need to hand a URI to an external
     /// process (mongodump/mongorestore). Never populated for mock connections.
     pub conn_uris: Mutex<HashMap<String, String>>,
+    /// Real connections whose MONGODB-OIDC login sends MongoDB the ID token
+    /// (the profile's "Use ID token instead of access token", #430). The
+    /// embedded shell runs its own login from the URI alone, which cannot
+    /// carry that setting, so it is recorded here for mongosh's launch.
+    pub conn_oidc_id_token: Mutex<HashSet<String>>,
     /// In-memory cache of the workspace.json document. `None` until the
     /// first `workspace_get`/`workspace_apply` call populates it (see
     /// `workspace::get_impl`/`workspace::apply_impl`).
@@ -222,6 +232,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
+            oidc_sessions: Mutex::new(HashMap::new()),
             mocks: Mutex::new(HashMap::new()),
             mock_indexes: Mutex::new(HashMap::new()),
             mongosh_sessions: Mutex::new(HashMap::new()),
@@ -236,6 +247,7 @@ impl AppState {
             resource_tree_at: Mutex::new(Instant::now()),
             vault_key: Mutex::new(None),
             conn_uris: Mutex::new(HashMap::new()),
+            conn_oidc_id_token: Mutex::new(HashSet::new()),
             workspace: Mutex::new(None),
             workspace_write_gen: Arc::new(AtomicU64::new(0)),
             namespaces: Mutex::new(Default::default()),
