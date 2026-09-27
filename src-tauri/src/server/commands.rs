@@ -8,7 +8,7 @@ use crate::server::channel::client;
 use crate::server::key_source;
 use crate::server::pb::mqlens::v1::connection_service_client::ConnectionServiceClient;
 use crate::server::pb::mqlens::v1::ListConnectionsRequest;
-use crate::server::session::{blocking, AccountSession, FileTokenStore, TokenStore};
+use crate::server::session::{self, blocking, AccountSession, FileTokenStore, TokenStore};
 use crate::AppState;
 use serde::Serialize;
 use std::path::Path;
@@ -88,16 +88,18 @@ pub(crate) async fn account_delete_impl(
     account_id: &str,
 ) -> Result<(), String> {
     let key = state.require_key()?;
-    let existing = accounts::load(path, &key)?
-        .into_iter()
-        .find(|a| a.id == account_id);
-    if let Some(existing) = existing.filter(|a| a.refresh_token.is_some()) {
-        sign_out_account(state, path, &existing).await;
-    }
-    state.server.remove(account_id).await;
+    // Removed first, under the file lock, so the session ended below is exactly
+    // the one stored at that moment, including one a sign-in stored just before.
+    // A sign-in storing later finds the account gone and ends its own session.
     let file = path.to_path_buf();
     let id = account_id.to_string();
-    blocking(move || accounts::delete_account(&file, &key, &id)).await?;
+    let removed = blocking(move || accounts::delete_account(&file, &key, &id)).await?;
+    state.server.remove(account_id).await;
+    if let Some(account) = removed {
+        if let Some(token) = account.refresh_token.as_deref() {
+            session::revoke(&account, token).await;
+        }
+    }
     Ok(())
 }
 
@@ -135,10 +137,7 @@ pub(crate) async fn sign_out_impl(
 ) -> Result<SignOutResult, String> {
     let key = state.require_key()?;
     let account = accounts::find(path, &key, account_id)?;
-    let session = match state.server.remove(account_id).await {
-        Some(session) => session,
-        None => AccountSession::resume(&account, token_store(state, path))?,
-    };
+    let session = current_session(state, path, &account).await?;
     let ended_on_server = session.sign_out().await?;
     Ok(SignOutResult { ended_on_server })
 }
@@ -195,20 +194,30 @@ pub(crate) async fn sign_out_all_best_effort(state: &AppState, path: &Path) {
 /// Ends an account's session on the server and here, best effort. Returns
 /// whether the server confirmed it.
 async fn sign_out_account(state: &AppState, path: &Path, account: &ServerAccount) -> bool {
-    let session = match state.server.remove(&account.id).await {
-        Some(session) => session,
-        None => match AccountSession::resume(account, token_store(state, path)) {
-            Ok(session) => session,
-            Err(_) => return false,
-        },
-    };
-    session.sign_out().await.unwrap_or(false)
+    match current_session(state, path, account).await {
+        Ok(session) => session.sign_out().await.unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// The session to end for `account` as it is stored now, taken out of the
+/// runtime. A cached session for an identity the account no longer has is
+/// dropped: signing it out would find no token of its own and end nothing.
+async fn current_session(
+    state: &AppState,
+    path: &Path,
+    account: &ServerAccount,
+) -> Result<Arc<AccountSession>, String> {
+    match state.server.remove(&account.id).await {
+        Some(session) if session.serves(account) => Ok(session),
+        _ => AccountSession::resume(account, token_store(state, path)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::fake::{Env, EMAIL, KEY, PASSWORD, TENANT};
+    use crate::server::fake::{file_store, Env, EMAIL, KEY, PASSWORD, TENANT};
 
     fn unlocked() -> AppState {
         let state = AppState::new();
@@ -396,6 +405,90 @@ mod tests {
         assert!(!view.signed_in);
         assert_ne!(view.id, env.account.id);
         assert_eq!(account_list_impl(&state, &env.path).unwrap().len(), 2);
+    }
+
+    // Another instance repointed the account (here, the same server reached by
+    // another name) and signed in again, while this one still caches the old
+    // session. Signing out here must end the sign-in that is current.
+    #[tokio::test]
+    async fn signing_out_ends_the_current_session_not_a_stale_cached_one() {
+        let env = Env::new().await;
+        let here = unlocked();
+        let elsewhere = unlocked();
+        let id = env.account.id.as_str();
+        sign_in_impl(&here, &env.path, id, PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        let moved = ServerAccountInput {
+            url: env.account.url.replace("127.0.0.1", "localhost"),
+            ..form(&env)
+        };
+        account_save_impl(&elsewhere, &env.path, moved)
+            .await
+            .unwrap();
+        sign_in_impl(&elsewhere, &env.path, id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
+
+        let result = sign_out_impl(&here, &env.path, id).await.unwrap();
+        assert!(result.ended_on_server);
+        assert!(!account_list_impl(&here, &env.path).unwrap()[0].signed_in);
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the current sign-in is still live on the server"
+            )
+        });
+    }
+
+    // A sign-in can store its session after a delete has started. The delete
+    // must end whatever session the account holds when it is removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_ends_a_session_stored_while_the_delete_waited() {
+        let env = Env::new().await;
+        let state = Arc::new(unlocked());
+
+        // A live session for this account, obtained through a separate store.
+        let other = tempfile::tempdir().unwrap();
+        let other_path = other.path().join(accounts::ACCOUNTS_FILE_NAME);
+        std::fs::copy(&env.path, &other_path).unwrap();
+        if let Err(e) =
+            AccountSession::sign_in(&env.account, PASSWORD, file_store(&other_path)).await
+        {
+            panic!("sign in failed: {e}");
+        }
+        let token = accounts::find(&other_path, &KEY, &env.account.id)
+            .unwrap()
+            .refresh_token
+            .unwrap();
+
+        // The delete has to wait for the accounts lock...
+        let held = accounts::lock(&env.path).unwrap();
+        let deleting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let id = env.account.id.clone();
+            tokio::spawn(async move { account_delete_impl(&state, &path, &id).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // ...while the session is stored under it, as a sign-in finishing then does.
+        let mut all = accounts::load(&env.path, &KEY).unwrap();
+        all[0].refresh_token = Some(token);
+        accounts::save(&env.path, &KEY, &all).unwrap();
+        drop(held);
+
+        deleting.await.unwrap().unwrap();
+        assert!(account_list_impl(&state, &env.path).unwrap().is_empty());
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the deleted account's session is still live on the server"
+            )
+        });
     }
 
     #[tokio::test]

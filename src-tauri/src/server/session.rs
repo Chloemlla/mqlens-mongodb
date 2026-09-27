@@ -387,14 +387,7 @@ impl AccountSession {
                 .filter(|_| tokens.expires_at > unix_now());
             ended_on_server = match live_access {
                 Some(access) => logout(&self.channel, &access, &refresh).await.is_ok(),
-                // Logout needs an access token; a refresh gets one, and the token
-                // it spends is being thrown away regardless.
-                None => match refresh_rpc(&self.channel, &refresh).await {
-                    Ok(fresh) => logout(&self.channel, &fresh.access_token, &fresh.refresh_token)
-                        .await
-                        .is_ok(),
-                    Err(_) => false,
-                },
+                None => logout_with_refresh_token(&self.channel, &refresh).await,
             };
         }
 
@@ -443,6 +436,27 @@ async fn logout(channel: &Channel, access_token: &str, refresh_token: &str) -> R
         .logout(request)
         .await
         .map(|_| ())
+}
+
+/// Ends the server session behind `refresh_token` for an account that no
+/// longer stores it, such as one just deleted. Best effort; returns whether the
+/// server confirmed.
+pub(crate) async fn revoke(account: &ServerAccount, refresh_token: &str) -> bool {
+    match channel::channel(&account.channel_config()) {
+        Ok(channel) => logout_with_refresh_token(&channel, refresh_token).await,
+        Err(_) => false,
+    }
+}
+
+/// Logout needs an access token; a refresh gets one, and the refresh token it
+/// spends is being thrown away regardless.
+async fn logout_with_refresh_token(channel: &Channel, refresh_token: &str) -> bool {
+    match refresh_rpc(channel, refresh_token).await {
+        Ok(fresh) => logout(channel, &fresh.access_token, &fresh.refresh_token)
+            .await
+            .is_ok(),
+        Err(_) => false,
+    }
 }
 
 fn login_error(status: &Status) -> String {
