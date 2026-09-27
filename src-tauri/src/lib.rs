@@ -3693,8 +3693,9 @@ async fn vault_change_password(
     // Held from before the accounts file is re-encrypted until the new key is
     // live: a server session storing a refreshed token in between would write
     // it under the old key, over the rotated file. Taken before the audit lock,
-    // whose failure paths must reopen the audit session.
-    let server_accounts_lock = server::accounts::lock(&server_accounts_path)?;
+    // whose failure paths must reopen the audit session. Waited for off the
+    // async workers: a session can hold it across a network call.
+    let server_accounts_lock = server::accounts::lock_async(&server_accounts_path).await?;
 
     // Close the audit session so the log is not being appended to while it is
     // re-encrypted, but keep its cross-process lock: releasing it would let a

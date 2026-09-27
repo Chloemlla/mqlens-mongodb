@@ -217,6 +217,14 @@ pub(crate) fn lock(path: &Path) -> Result<fs::File, String> {
     crate::connections::lock_settings_for_write(path)
 }
 
+/// `lock` for async code, waited for off the async workers. A holder can be a
+/// task awaiting the network, such as a refresh; blocking a worker on the lock
+/// could leave that task no worker to finish on.
+pub(crate) async fn lock_async(path: &Path) -> Result<fs::File, String> {
+    let path = path.to_path_buf();
+    crate::server::session::blocking(move || lock(&path)).await
+}
+
 pub(crate) const VAULT_CHANGED: &str =
     "The vault was locked or reset while this was in progress. Unlock it and try again.";
 
@@ -330,6 +338,38 @@ pub(crate) fn delete_account_while(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The lock can be held by a task awaiting the network, such as a refresh.
+    // Waiting for it must leave the runtime free to run that task to the end,
+    // even with a single worker, or neither ever finishes.
+    #[test]
+    fn waiting_for_the_lock_leaves_the_runtime_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNTS_FILE_NAME);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let held = lock(&path).unwrap();
+                let holder = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    drop(held);
+                });
+                let _lock = lock_async(&path).await.unwrap();
+                holder.await.unwrap();
+            });
+            let _ = done.send(());
+        });
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "waiting for the lock blocked the only worker"
+        );
+    }
 
     const KEY: [u8; 32] = [3; 32];
 
