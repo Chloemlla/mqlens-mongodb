@@ -38,8 +38,15 @@ async function runCommand(page: Page, title: string): Promise<void> {
 /** The height of the first row the grid is currently drawing. */
 async function rowHeight(page: Page): Promise<number> {
   const row = view(page).locator('[style*="height"]').filter({ hasText: 'ord-1' }).last();
-  await expect(row).toBeVisible();
-  return (await row.boundingBox())!.height;
+  let height = 0;
+  await expect.poll(async () => {
+    // A virtualized row can detach between the visibility check and layout
+    // measurement while the density change is being applied. Poll the actual
+    // measurement so that brief detachments do not turn into a null dereference.
+    height = (await row.boundingBox())?.height ?? 0;
+    return height;
+  }).toBeGreaterThan(0);
+  return height;
 }
 
 test.describe('Row height', () => {
