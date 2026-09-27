@@ -951,10 +951,11 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
       ...BLANK_CONN,
       name: `${profile.name} (Copy)`,
       uri: profile.uri,
-      topology: profile.uri.includes('replicaSet=') ? 'replicaSet' : 'standalone',
-      hosts: [{ host: 'localhost', port: '27017' }],
+      ...parseUriIntoFields(profile.uri),
       folder: profileFolderMap[profile.id] || '',
       colorTag: profile.color_tag || '',
+      oidcAllowedHosts: (profile.oidc?.allowed_hosts ?? []).join(', '),
+      oidcUseIdToken: profile.oidc?.use_id_token ?? false,
       // Adjudicated product call (final fix wave): a duplicated profile
       // never inherits "Expose to MCP agents" from the profile it was
       // copied from, even when the original has it on — the new profile is
