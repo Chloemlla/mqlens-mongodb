@@ -45,6 +45,12 @@ use zeroize::Zeroizing;
 /// so a call does not set out with a token that expires on the way.
 pub(crate) const REFRESH_MARGIN_SECS: i64 = 60;
 const AUTH_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for a call through `AccountSession::call`.
+pub(crate) const CALL_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(30)
+};
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const SESSION_ENDED: &str = "Your MQLens Server session has ended. Sign in again.";
@@ -268,13 +274,23 @@ impl AccountSession {
         Fut: Future<Output = Result<Response<R>, Status>>,
     {
         let (token, generation) = self.access_token(None).await?;
-        match rpc(self.channel.clone(), authorized(message.clone(), &token)?).await {
+        match rpc(
+            self.channel.clone(),
+            with_deadline(authorized(message.clone(), &token)?),
+        )
+        .await
+        {
             Ok(response) => return Ok(response.into_inner()),
             Err(status) if errors::is_unauthenticated(&status) => {}
             Err(status) => return Err(errors::describe(&status)),
         }
         let (token, _) = self.access_token(Some(generation)).await?;
-        match rpc(self.channel.clone(), authorized(message, &token)?).await {
+        match rpc(
+            self.channel.clone(),
+            with_deadline(authorized(message, &token)?),
+        )
+        .await
+        {
             Ok(response) => Ok(response.into_inner()),
             Err(status) if errors::is_unauthenticated(&status) => {
                 self.end_locally().await;
@@ -419,6 +435,13 @@ impl AccountSession {
         tokens.generation += 1;
         cleared.map(|()| ended_on_server)
     }
+}
+
+/// A server can accept the connection and then never answer; the connect
+/// timeout does not cover that, so every call carries its own deadline.
+fn with_deadline<M>(mut request: Request<M>) -> Request<M> {
+    request.set_timeout(CALL_TIMEOUT);
+    request
 }
 
 fn authorized<M>(message: M, access_token: &str) -> Result<Request<M>, String> {
@@ -620,6 +643,27 @@ mod tests {
             assert_eq!(s.logins, 1);
             assert_eq!(s.refreshes, 0);
         });
+    }
+
+    // A server can accept the connection and then never answer a call. The
+    // call gives up rather than leaving the command pending forever, and a slow
+    // server is no reason to end the session.
+    #[tokio::test]
+    async fn a_call_the_server_never_answers_times_out() {
+        let env = Env::new().await;
+        let session = signed_in(&env).await;
+        env.fake.with(|s| s.list_delay = CALL_TIMEOUT * 3);
+
+        let started = std::time::Instant::now();
+        let result = list_connections(&session).await;
+        assert!(
+            started.elapsed() < CALL_TIMEOUT * 2,
+            "the call waited {:?}",
+            started.elapsed()
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("did not answer in time"), "{err}");
+        assert!(!session.is_ended());
     }
 
     #[tokio::test]

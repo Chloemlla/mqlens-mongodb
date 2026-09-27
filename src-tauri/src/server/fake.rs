@@ -51,6 +51,8 @@ pub(crate) struct FakeState {
     pub refresh_delay: Duration,
     /// Held before a login answers, so a test can act while it is in flight.
     pub login_delay: Duration,
+    /// Held before ListConnections answers, to play a server that stalls.
+    pub list_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
     pub refresh_failures: Vec<Code>,
     pub connections: Vec<ConnectionRef>,
@@ -149,6 +151,7 @@ impl Fake {
                 access_ttl_secs: 3600,
                 refresh_delay: Duration::ZERO,
                 login_delay: Duration::ZERO,
+                list_delay: Duration::ZERO,
                 refresh_failures: Vec::new(),
                 connections: vec![ConnectionRef {
                     id: "c1".to_string(),
@@ -287,6 +290,8 @@ impl ConnectionService for Fake {
         &self,
         request: Request<ListConnectionsRequest>,
     ) -> Result<Response<ListConnectionsResponse>, Status> {
+        let delay = self.with(|s| s.list_delay);
+        tokio::time::sleep(delay).await;
         let mut state = self.state.lock().unwrap();
         state.authenticate(&request)?;
         state.list_calls += 1;
