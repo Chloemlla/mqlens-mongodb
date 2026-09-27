@@ -117,12 +117,30 @@ pub(crate) async fn sign_in_impl(
     // mistyped password or a failed login leaves the user signed in.
     // `AccountSession::sign_in` ends the session it displaces on the server.
     let session = AccountSession::sign_in(&account, &password, token_store(state, path)).await?;
-    state.server.insert(session).await;
+    state.server.insert(session.clone()).await;
     // The vault may have locked while the server answered; a session must not
     // be left behind for a locked vault.
     if state.require_key().is_err() {
         state.server.remove(account_id).await;
         return Err("vault is locked".to_string());
+    }
+    // Checked once the session is in the runtime, where a later sign-out or
+    // delete finds it: one that came first, while this sign-in was still
+    // ending the session it displaced, already ended this one.
+    match session.stored_token_is_ours().await {
+        Some(true) => {}
+        // A concurrent sign-in stored its own and ended this one. The account
+        // is signed in with that session, resumed from the store on next use.
+        Some(false) => {
+            state.server.remove(account_id).await;
+        }
+        None => {
+            state.server.remove(account_id).await;
+            return Err(
+                "This MQLens Server account was signed out, deleted or changed while signing in."
+                    .to_string(),
+            );
+        }
     }
     let mut view = account.view();
     view.signed_in = true;
@@ -172,9 +190,9 @@ pub(crate) async fn list_connections_impl(
         .collect())
 }
 
-/// The MQLens Server part of a vault reset: removes vault.json and the accounts
-/// file under the accounts lock, and hands back the stored sessions still to
-/// be ended on their servers. Sessions are dropped here regardless.
+/// The MQLens Server part of a vault reset: removes the accounts file and then
+/// vault.json under the accounts lock, and hands back the stored sessions still
+/// to be ended on their servers. Sessions are dropped here regardless.
 pub(crate) async fn reset_accounts(
     state: &AppState,
     path: &Path,
@@ -190,19 +208,24 @@ pub(crate) async fn reset_accounts(
 pub(crate) struct PendingSignOuts {
     taken: Vec<(ServerAccount, String)>,
     limit: Duration,
+    /// Why the reset stopped short after the accounts file was gone. The
+    /// sessions are ended regardless: their tokens exist nowhere else.
+    failed: Option<String>,
 }
 
 impl PendingSignOuts {
     /// Ends every session, each within its own time limit and all at once, so
     /// one unreachable server cannot use up the time every other one needed.
-    /// Best effort: an unreachable server cannot hold up a reset.
-    pub(crate) async fn finish(self) {
+    /// Best effort: an unreachable server cannot hold up a reset. Returns the
+    /// reset's own failure, if it had one.
+    pub(crate) async fn finish(self) -> Result<(), String> {
         let limit = self.limit;
         let revokes = self
             .taken
             .iter()
             .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
         futures::future::join_all(revokes).await;
+        self.failed.map_or(Ok(()), Err)
     }
 }
 
@@ -214,14 +237,15 @@ async fn reset_accounts_within(
 ) -> Result<PendingSignOuts, String> {
     state.server.clear().await;
     let key = state.require_key().ok();
-    // One locked step takes every stored token and removes the vault metadata
-    // and the accounts file. After it, nothing can present one of these tokens
+    // One locked step takes every stored token and removes the accounts file
+    // and then the vault metadata, last, so a failure part way leaves a vault
+    // that still opens. After it, nothing can present one of these tokens
     // again while it is revoked (which would trip the server's reuse check),
     // a sign-in still in flight finds its account gone and ends its own
     // session, and a write from any process sees the vault gone and is refused.
     // No lock is held across the network calls below.
     let file = path.to_path_buf();
-    let taken = blocking(move || {
+    let (taken, failed) = blocking(move || {
         let _lock = accounts::lock(&file)?;
         let taken: Vec<(ServerAccount, String)> = key
             .and_then(|key| accounts::load(&file, &key).ok())
@@ -229,19 +253,25 @@ async fn reset_accounts_within(
             .into_iter()
             .filter_map(|a| a.refresh_token.clone().map(|token| (a, token)))
             .collect();
-        for p in [accounts::vault_meta_path(&file), file.clone()] {
-            if p.exists() {
-                std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
-            }
-        }
-        Ok(taken)
+        let remove = |p: &Path| match p.exists() {
+            true => std::fs::remove_file(p).map_err(|e| format!("remove {}: {e}", p.display())),
+            false => Ok(()),
+        };
+        // Still in the file, the tokens need no ending: the reset failed and
+        // the vault is as it was.
+        remove(&file)?;
+        Ok((taken, remove(&accounts::vault_meta_path(&file)).err()))
     })
     .await?;
     // Not ended here: waiting on servers now would leave the vault half
     // removed, vault.json gone and its other files still there, for as long as
     // the slowest server, and another window could set up a new vault in that
     // gap only to lose it to the rest of the reset.
-    Ok(PendingSignOuts { taken, limit })
+    Ok(PendingSignOuts {
+        taken,
+        limit,
+        failed,
+    })
 }
 
 /// The session to end for `account` as it is stored now, taken out of the
@@ -379,6 +409,43 @@ mod tests {
         assert!(account_list_impl(&state, &env.path).unwrap()[0].signed_in);
         env.fake.with(|s| assert_eq!(s.live_families(), 1));
         list_connections_impl(&state, &env.path, id).await.unwrap();
+    }
+
+    // Another window deletes the account while this sign-in is still ending
+    // the session it displaced. The delete ended the new session too, so the
+    // sign-in must not then report the account signed in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sign_in_overtaken_by_a_delete_does_not_report_success() {
+        let env = Env::new().await;
+        let state = Arc::new(unlocked());
+        let id = env.account.id.clone();
+        sign_in_impl(&state, &env.path, &id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake
+            .with(|s| s.logout_delay = Duration::from_millis(400));
+        let signing_in = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let id = id.clone();
+            tokio::spawn(
+                async move { sign_in_impl(&state, &path, &id, PASSWORD.to_string()).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let deleting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let id = id.clone();
+            tokio::spawn(async move { account_delete_impl(&state, &path, &id).await })
+        };
+
+        let result = signing_in.await.unwrap();
+        deleting.await.unwrap().unwrap();
+        assert!(
+            result.is_err(),
+            "reported signed in to a deleted account: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -666,7 +733,8 @@ mod tests {
             .await
             .unwrap()
             .finish()
-            .await;
+            .await
+            .unwrap();
         env.fake.with(|s| {
             assert_eq!(
                 s.live_families(),
@@ -735,7 +803,8 @@ mod tests {
             .await
             .unwrap()
             .finish()
-            .await;
+            .await
+            .unwrap();
 
         let result = signing_in.await.unwrap();
         assert!(
@@ -845,7 +914,7 @@ mod tests {
             started.elapsed()
         );
         assert!(!env.path.exists());
-        pending.finish().await;
+        pending.finish().await.unwrap();
         env.fake.with(|s| assert_eq!(s.live_families(), 0));
     }
 
@@ -864,7 +933,7 @@ mod tests {
 
         let pending = reset_accounts(&state, &env.path).await.unwrap();
         assert!(!env.path.exists());
-        pending.finish().await;
+        pending.finish().await.unwrap();
         env.fake.with(|s| {
             assert_eq!(
                 s.live_families(),
@@ -872,6 +941,22 @@ mod tests {
                 "the reset finished with a session still live"
             )
         });
+    }
+
+    // vault.json is what makes the other files a vault, so it goes last: a
+    // reset that fails part way leaves a vault that still opens.
+    #[tokio::test]
+    async fn a_reset_that_cannot_remove_the_accounts_keeps_the_vault() {
+        let env = Env::new().await;
+        let state = unlocked();
+        std::fs::remove_file(&env.path).unwrap();
+        std::fs::create_dir(&env.path).unwrap();
+
+        assert!(reset_accounts(&state, &env.path).await.is_err());
+        assert!(
+            accounts::vault_meta_path(&env.path).exists(),
+            "vault.json went before the accounts file"
+        );
     }
 
     #[tokio::test]
@@ -886,7 +971,8 @@ mod tests {
             .await
             .unwrap()
             .finish()
-            .await;
+            .await
+            .unwrap();
         env.fake.with(|s| assert_eq!(s.live_families(), 0));
         assert!(!env.path.exists());
         assert!(!accounts::vault_meta_path(&env.path).exists());
@@ -898,7 +984,8 @@ mod tests {
             .await
             .unwrap()
             .finish()
-            .await;
+            .await
+            .unwrap();
         assert!(!accounts::vault_meta_path(&env.path).exists());
     }
 }

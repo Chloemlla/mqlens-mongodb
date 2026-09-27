@@ -7475,6 +7475,68 @@ mod vault_reset_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    // A reset that fails part way must not leave this process holding the key,
+    // nor have removed vault.json while other vault files are still there.
+    #[tokio::test]
+    async fn a_reset_that_cannot_remove_a_vault_file_drops_the_key_and_keeps_the_vault() {
+        let env = Env::new().await;
+        let state = AppState::new();
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let profiles = dir.join("profiles.json.enc");
+        // A directory cannot be removed as a file.
+        std::fs::create_dir(&profiles).unwrap();
+        let files = [profiles, dir.join("settings.json.enc")];
+
+        assert!(crate::reset_vault_files(&state, &env.path, files)
+            .await
+            .is_err());
+        assert!(
+            state.require_key().is_err(),
+            "the failed reset left the discarded key usable"
+        );
+        assert!(
+            crate::server::accounts::vault_meta_path(&env.path).exists(),
+            "vault.json went before the files it describes"
+        );
+    }
+
+    // Once the accounts file is gone its tokens exist nowhere else. If
+    // vault.json then cannot be removed the reset fails, but it still ends
+    // those sessions on their servers.
+    #[tokio::test]
+    async fn a_reset_that_cannot_remove_vault_json_still_ends_the_sessions() {
+        let env = Env::new().await;
+        let state = AppState::new();
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        crate::server::commands::sign_in_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            PASSWORD.to_string(),
+        )
+        .await
+        .unwrap();
+        let meta = crate::server::accounts::vault_meta_path(&env.path);
+        std::fs::remove_file(&meta).unwrap();
+        // A directory cannot be removed as a file.
+        std::fs::create_dir(&meta).unwrap();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        assert!(crate::reset_vault_files(&state, &env.path, files)
+            .await
+            .is_err());
+        assert!(!env.path.exists());
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the tokens are gone but their sessions were never ended"
+            )
+        });
+    }
+
     // A reset waits on servers to end the stored sessions. The key it discards
     // must be gone by then: a window saving a profile or the settings meanwhile
     // would recreate those files under that key, and the next vault could not
@@ -7495,11 +7557,7 @@ mod vault_reset_tests {
         env.fake
             .with(|s| s.logout_delay = Duration::from_millis(800));
         let dir = env.path.parent().unwrap().to_path_buf();
-        let files = [
-            crate::server::accounts::vault_meta_path(&env.path),
-            dir.join("profiles.json.enc"),
-            dir.join("settings.json.enc"),
-        ];
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
 
         let resetting = {
             let state = state.clone();

@@ -257,6 +257,24 @@ impl AccountSession {
         Ok(Arc::new(session))
     }
 
+    /// Whether the refresh token stored for this account is the one this
+    /// session last stored, or `None` if none is stored any more: another
+    /// window or process signed out, deleted the account or changed who it
+    /// signs in as. `Some(false)` means another sign-in stored its own.
+    pub(crate) async fn stored_token_is_ours(&self) -> Option<bool> {
+        let ours = self.tokens.lock().await.refresh.clone();
+        let store = self.store.clone();
+        let who = self.account.clone();
+        blocking(move || {
+            let _lock = store.lock()?;
+            store.read(&who)
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|stored| Some(&stored) == ours.as_ref())
+    }
+
     async fn adopt(&self, login: LoginResponse) {
         let mut tokens = self.tokens.lock().await;
         tokens.refresh = Some(Zeroizing::new(login.refresh_token));
