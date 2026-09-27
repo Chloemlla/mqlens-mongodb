@@ -336,6 +336,41 @@ fn redact_uris_in_text(text: &str) -> String {
         .collect()
 }
 
+/// Recognize the bundled Database Tools' actual OIDC failure mode: the Go
+/// driver's connector rejects a `MONGODB-OIDC` auth mechanism outright when
+/// neither an OIDC callback nor `ENVIRONMENT` is configured — which is all
+/// mongodump/mongorestore ever supply for a human-login OIDC profile, since
+/// they only implement the automated (workload) OIDC flows, not browser
+/// login. The failure is immediate and client-side: no server contact, no
+/// identity provider, no browser.
+///
+/// Anchored on the driver's own wording (`OIDCHumanCallback` /
+/// `ENVIRONMENT authMechanismProperty`), captured from a real mongodump
+/// 100.17.0 run against a live OIDC server — not a guessed phrase like
+/// "unsupported authentication mechanism", which this tool never prints.
+/// Returns `None` for every other failure, which keeps today's redacted
+/// raw-stderr behavior unchanged.
+fn explain_database_tools_oidc_failure(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("OIDCHumanCallback") && stderr.contains("ENVIRONMENT authMechanismProperty")
+    {
+        Some("tools.errors.oidcUnsupportedByDatabaseTools")
+    } else {
+        None
+    }
+}
+
+/// Turn a dump/restore tool's stderr tail into the message stored on the
+/// failed task: a translatable locale key for the recognized OIDC failure,
+/// or today's redacted raw stderr for everything else. `redact_uris_in_text`
+/// still runs on every non-OIDC path, so a raw connection string can never
+/// bypass redaction.
+fn tool_failure_message(stderr_tail: &str) -> String {
+    match explain_database_tools_oidc_failure(stderr_tail) {
+        Some(key) => key.to_string(),
+        None => redact_uris_in_text(stderr_tail),
+    }
+}
+
 /// Strip the path database from a MongoDB URI for tool invocations, then
 /// append the query parameters mongodump/mongorestore need to avoid hanging
 /// on unreachable topology members:
@@ -863,8 +898,10 @@ async fn run_tool_process(
             Err(format!("{} exited with {}", tool_path, status))
         } else {
             // The tail is raw stderr — it can quote the connection string
-            // (the redacted variant only goes on the sub label).
-            Err(redact_uris_in_text(&msg.join("\n")))
+            // (the redacted variant only goes on the sub label) — unless it's
+            // the recognized OIDC failure, which becomes a translatable
+            // locale key instead (see `tool_failure_message`).
+            Err(tool_failure_message(&msg.join("\n")))
         }
     }
 }
@@ -1162,17 +1199,48 @@ pub struct ToolsStatus {
     pub mongorestore: Option<ToolInfo>,
 }
 
+/// How many times [`run_version_probe`] retries a spawn that failed with
+/// ETXTBSY before giving up on the candidate.
+const PROBE_BUSY_RETRIES: u32 = 20;
+/// Upper bound on the (doubling) wait between ETXTBSY retries. With
+/// [`PROBE_BUSY_RETRIES`] this caps the total wait at under a second.
+const PROBE_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Spawn `<candidate> --version`, retrying while exec fails with ETXTBSY.
+///
+/// Why: Linux refuses to exec a file that anything holds open for writing.
+/// When a binary was only just written (a tool install, a test stub), a
+/// process forked by another thread while the writer's fd was open inherits
+/// that fd and keeps it until the child itself execs (`O_CLOEXEC` closes it
+/// only then). Until those children exec, spawning the new binary fails with
+/// "Text file busy" even though the file is complete and usable. The state
+/// clears on its own within moments, so a short bounded retry rides it out.
+/// Every other spawn error (e.g. `NotFound` while walking `PATH`) returns
+/// immediately.
+fn run_version_probe(candidate: &Path) -> std::io::Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        let result = std::process::Command::new(candidate)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < PROBE_BUSY_RETRIES => {
+                std::thread::sleep(Duration::from_millis(1 << attempt.min(6)).min(PROBE_BUSY_MAX_BACKOFF));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run `<candidate> --version` and, if it succeeds, return the first line of
 /// stdout (trimmed) as the version string. Any spawn failure or non-zero-ish
 /// output is treated as "not this candidate" rather than an error.
 fn probe_tool(candidate: &std::path::Path) -> Option<ToolInfo> {
-    let output = std::process::Command::new(candidate)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    let output = run_version_probe(candidate).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1260,6 +1328,46 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The real mongodump 100.17.0 stderr tail captured against a live Percona
+    // OIDC server for a human MONGODB-OIDC URI (#430 Task 16 controller
+    // capture) — the tool fails immediately, client-side, before contacting
+    // the server. Anchoring the matcher on THIS text (rather than a guessed
+    // phrase like "unsupported authentication mechanism", which the tool
+    // never prints) is the whole point: a matcher keyed to invented text
+    // would pass its own test while never firing in production.
+    const CAPTURED_DATABASE_TOOLS_OIDC_STDERR: &str = "Failed: can't create session: error configuring the connector: must specify at least one of OIDCMachineCallback, OIDCHumanCallback, or ENVIRONMENT authMechanismProperty";
+
+    #[test]
+    fn database_tools_oidc_failure_is_recognized_from_the_captured_line() {
+        assert_eq!(
+            explain_database_tools_oidc_failure(CAPTURED_DATABASE_TOOLS_OIDC_STDERR),
+            Some("tools.errors.oidcUnsupportedByDatabaseTools")
+        );
+    }
+
+    #[test]
+    fn unrelated_database_tools_failures_are_not_matched() {
+        assert_eq!(explain_database_tools_oidc_failure("Failed: no reachable servers"), None);
+    }
+
+    #[test]
+    fn tool_failure_message_returns_the_locale_key_for_the_oidc_case() {
+        assert_eq!(
+            tool_failure_message(CAPTURED_DATABASE_TOOLS_OIDC_STDERR),
+            "tools.errors.oidcUnsupportedByDatabaseTools"
+        );
+    }
+
+    // Non-OIDC unchanged: an unrelated failure must still come back as
+    // redacted raw stderr, exactly like today — this goes red if the OIDC
+    // branch were ever applied unconditionally.
+    #[test]
+    fn tool_failure_message_still_redacts_unrelated_failures() {
+        let msg = tool_failure_message("cannot connect to mongodb://u:sekrit@h:27017/db");
+        assert_eq!(msg, "cannot connect to mongodb://u:***@h:27017/db");
+        assert!(!msg.contains("sekrit"), "password must be redacted, got {:?}", msg);
+    }
 
     fn dump_defaults(scope: DumpScope) -> DumpOptions {
         DumpOptions {
@@ -1586,6 +1694,26 @@ mod tests {
         let _ = std::fs::remove_file(&tool);
     }
 
+    /// A candidate that is still open for writing when first probed must be
+    /// detected once the writer lets go, not skipped for the next candidate.
+    /// The extra handle stands in for the write fd a concurrently forked child
+    /// inherits right after the tool is written (the ETXTBSY race).
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_waits_out_a_busy_binary() {
+        let tool = crate::db::mongotools::test_support::write_fake_tool("echo 'mongodump version: 1'\n");
+        let writer = std::fs::OpenOptions::new().write(true).open(&tool).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let info = probe_tool(&tool);
+        release.join().unwrap();
+        let _ = std::fs::remove_file(&tool);
+        let info = info.expect("a briefly busy binary must still be detected");
+        assert!(info.version.contains("version: 1"), "{:?}", info.version);
+    }
+
     #[test]
     fn missing_tools_yield_none() {
         let status = detect_mongo_tools(Some("/definitely/not/a/dir"), None);
@@ -1817,6 +1945,46 @@ mod tests {
         // Raw stderr can quote the connection string — never with the password.
         assert!(error.contains("mongodb://u:***@h:27017/db"), "{:?}", t.error);
         assert!(!error.contains("sekrit"), "password must be redacted, got {:?}", t.error);
+        assert!(state.cancels.lock().unwrap().get(&task.id).is_none(), "flag cleaned up");
+        let _ = std::fs::remove_file(&tool);
+    }
+
+    /// End-to-end proof that `run_tool_process`'s failure branch — the single
+    /// production call site at `Err(tool_failure_message(&msg.join("\n")))` —
+    /// actually maps the real captured OIDC failure to the locale key rather
+    /// than redacted raw stderr. `tool_failure_message` and
+    /// `explain_database_tools_oidc_failure` are unit-tested directly above,
+    /// but nothing exercised the wiring itself: a revert of that one line back
+    /// to `redact_uris_in_text(...)` would leave users seeing raw stderr again
+    /// with no test anywhere failing. This drives the real task path — a fake
+    /// tool exiting non-zero with the verbatim captured line on stderr — the
+    /// same way `test_dump_task_failure_captures_stderr_tail` does for the
+    /// unrelated-failure case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dump_task_oidc_failure_becomes_the_locale_key_not_raw_stderr() {
+        use crate::db::mongotools::*;
+        let state = AppState::new();
+        state.conn_uris.lock().unwrap().insert("c1".into(), "mongodb://u:pw@localhost:27017".into());
+        // Double-quoted (not single-quoted, like the sibling tests above): the
+        // captured line contains an apostrophe ("can't") that would otherwise
+        // break out of a single-quoted `echo`. No `$`, backtick, `"`, or `\`
+        // appears in the captured text, so double-quoting it is safe as-is.
+        let tool = crate::db::mongotools::test_support::write_fake_tool(&format!(
+            "echo \"{}\" 1>&2\nexit 3\n",
+            CAPTURED_DATABASE_TOOLS_OIDC_STDERR
+        ));
+        let task = start_dump_task_retrying(&state, &tool, "/tmp/mqlens-dump-test-oidc").await;
+        wait_for_task(&state, &task.id).await;
+        let t = state.tasks.lock().unwrap().get(&task.id).cloned().unwrap();
+        assert_eq!(t.status, "failed");
+        assert_eq!(
+            t.error.as_deref(),
+            Some("tools.errors.oidcUnsupportedByDatabaseTools"),
+            "run_tool_process's failure branch must map the real captured OIDC \
+             stderr to the locale key, not echo it redacted-but-raw: {:?}",
+            t.error
+        );
         assert!(state.cancels.lock().unwrap().get(&task.id).is_none(), "flag cleaned up");
         let _ = std::fs::remove_file(&tool);
     }

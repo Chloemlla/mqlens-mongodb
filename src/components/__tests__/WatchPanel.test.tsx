@@ -78,6 +78,26 @@ describe('WatchPanel', () => {
     expect(callsTo('start_change_stream')[0][1]).toMatchObject({ operationTypes: [] });
   });
 
+  it('gives each mounted panel its own resizable group id (#392)', async () => {
+    // Recently used tabs stay mounted (#345), so two Watch tabs can be mounted
+    // at once. react-resizable-panels looks a group up by its id, and groups
+    // sharing one id read and write each other's layout: a group whose panel
+    // count changed (here, when an event is selected and the detail panel
+    // opens) could be handed the other group's layout.
+    render(
+      <>
+        {panel()}
+        {panel({ collectionName: 'invoices', streamId: 'watch.c.c1.sales.invoices' })}
+      </>,
+    );
+    await waitFor(() => expect(callsTo('start_change_stream')).toHaveLength(2));
+
+    const ids = [...document.querySelectorAll('[data-group]')].map((el) => el.id);
+    expect(ids).toHaveLength(2);
+    expect(ids.every((id) => id.startsWith('watch-workspace-'))).toBe(true);
+    expect(new Set(ids).size).toBe(2);
+  });
+
   it('does not poll while its tab is hidden, and resumes when it is shown', async () => {
     // A kept-alive Watch tab stays mounted while another tab is on screen
     // (#240). The stream keeps running and buffering on the backend; this

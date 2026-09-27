@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { List, type RowComponentProps } from 'react-window';
 import { useTranslation } from 'react-i18next';
 import { useTabVisible } from '../workspace/tabVisibility';
@@ -161,6 +161,10 @@ export const WatchPanel: React.FC<WatchPanelProps> = ({
   density,
 }) => {
   const { t } = useTranslation('shell');
+  // Its own id for the resizable split below. Recently used tabs stay mounted
+  // (#345) and react-resizable-panels looks groups up by id, so Watch tabs
+  // sharing one id would read and write each other's layout (#392).
+  const workspaceGroupId = `watch-workspace-${useId()}`;
   const [events, setEvents] = useState<ChangeEvent[]>([]);
   const [status, setStatus] = useState<StreamStatus>('starting');
   const [error, setError] = useState<string | null>(null);
@@ -601,9 +605,9 @@ export const WatchPanel: React.FC<WatchPanelProps> = ({
 
       {/* Draggable split — the namespaces in a real deployment are long, and a
           fixed 40% left the identifier truncated with no way to widen it. The
-          group id keeps the drag across tab switches, like the query builder's. */}
+          group id is unique per panel; see `workspaceGroupId`. */}
       <ResizablePanelGroup
-        id="watch-workspace"
+        id={workspaceGroupId}
         orientation="horizontal"
         className="flex min-h-0 flex-1"
       >

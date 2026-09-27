@@ -311,7 +311,7 @@ struct Open {
     /// process lock the new file while the first still appends to the unlinked
     /// old one. The sidecar inode is stable, so the exclusion holds across
     /// compaction. Released when this handle drops.
-    lock: fs::File,
+    lock: HeldLock,
     file: fs::File,
     seq: u64,
     head: [u8; 32],
@@ -395,7 +395,7 @@ impl AuditLog {
     }
 
     /// Take the cross-process exclusive lock for this session.
-    fn acquire_lock(&self) -> Result<fs::File, String> {
+    fn acquire_lock(&self) -> Result<HeldLock, String> {
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
@@ -407,7 +407,7 @@ impl AuditLog {
             .open(&self.lock_path)
             .map_err(|e| format!("open {}: {e}", self.lock_path.display()))?;
         match file.try_lock_exclusive() {
-            Ok(true) => Ok(file),
+            Ok(true) => Ok(HeldLock(file)),
             Ok(false) => Err(format!(
                 "another MQLens instance is already recording to the activity log ({}) — \
                  only one instance can record at a time",
@@ -826,7 +826,27 @@ pub fn prepare_reencrypted(
 /// it, but it also has to close the session to get a consistent snapshot.
 /// Handing the lock through instead of dropping it removes the window where a
 /// second instance could take the log and append under the old key.
-pub struct RetainedLock(fs::File);
+pub struct RetainedLock(HeldLock);
+
+/// The sidecar lock file, explicitly unlocked when it drops.
+///
+/// Closing the handle is not enough on Unix. An `flock` lock belongs to the open
+/// file description, not the descriptor, and a process forked by any other
+/// thread gets a copy of every descriptor that stays open until it execs —
+/// `O_CLOEXEC` only closes it then. MQLens spawns external tools, so a close
+/// could leave the lock held by a child for that window, and reopening the log
+/// in this same process would be refused as "another MQLens instance".
+/// `LOCK_UN` releases the lock for every copy of the description at once, so it
+/// ends exactly when this drops, however many copies are still open.
+struct HeldLock(fs::File);
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        // Nothing useful to do on failure: closing the handle straight after
+        // still releases the lock once any inherited copies are gone.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1304,6 +1324,43 @@ mod tests {
             events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
             ["e3", "e4"]
         );
+    }
+
+    #[test]
+    fn a_surviving_copy_of_the_lock_handle_does_not_keep_the_log_locked() {
+        // A process forked by another thread holds a copy of every descriptor
+        // until it execs, so a spawned tool can briefly own a duplicate of the
+        // sidecar handle. A duplicate made here stands in for that child: the
+        // lock must still end when the log lets go of it, or the next open in
+        // this same process is refused as "another MQLens instance".
+        let dir = tempdir().unwrap();
+        let (log, path) = log_with(dir.path(), 1);
+        let inherited = {
+            let slot = log.open.lock().unwrap();
+            slot.as_ref().unwrap().lock.0.try_clone().unwrap()
+        };
+        log.close();
+
+        let reopened = AuditLog::new(path.clone());
+        let (events, report) = reopened
+            .open(&KEY)
+            .expect("closing must release the lock while a copy of its handle survives");
+        assert!(report.integrity_error.is_none(), "{report:?}");
+        assert_eq!(events.len(), 1);
+        reopened.close();
+
+        // The same for a lock held only for key rotation.
+        let rotation = AuditLog::new(path.clone())
+            .acquire_retained_lock()
+            .expect("rotation lock");
+        let inherited_by_rotation = rotation.0.0.try_clone().unwrap();
+        drop(rotation);
+        AuditLog::new(path)
+            .open(&KEY)
+            .expect("dropping the rotation lock must release it while a copy survives");
+
+        drop(inherited);
+        drop(inherited_by_rotation);
     }
 
     #[test]

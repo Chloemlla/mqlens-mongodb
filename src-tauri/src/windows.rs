@@ -414,7 +414,69 @@ pub async fn close_workspace_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{LayoutNode, WindowModel};
+    use crate::workspace::{next_window_id, LayoutNode, WindowModel};
+    use std::collections::BTreeSet;
+
+    /// Permissions deliberately withheld from secondary windows. Everything
+    /// else main has, a `win-N` window must have too: it runs the same
+    /// frontend, so a gap breaks that feature only once a tab is detached.
+    const MAIN_ONLY_PERMISSIONS: &[&str] = &["updater:default"];
+
+    /// What Tauri grants the window `label`: the union over every
+    /// `capabilities/*.json` whose `windows` glob matches it, matched with
+    /// `glob::Pattern::matches` as `tauri::ipc::RuntimeAuthority` does.
+    fn permissions_for(label: &str) -> BTreeSet<String> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities");
+        let mut granted = BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).expect("read capabilities dir") {
+            let path = entry.expect("capabilities entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read capability");
+            let cap: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let windows = cap["windows"].as_array().map(Vec::as_slice).unwrap_or_default();
+            let matches = windows
+                .iter()
+                .any(|w| glob::Pattern::new(w.as_str().expect("window pattern")).expect("valid glob").matches(label));
+            if !matches {
+                continue;
+            }
+            for permission in cap["permissions"].as_array().expect("permissions array") {
+                // A bare identifier, or an object carrying one plus a scope.
+                let id = permission
+                    .as_str()
+                    .or_else(|| permission["identifier"].as_str())
+                    .expect("permission identifier");
+                granted.insert(id.to_string());
+            }
+        }
+        granted
+    }
+
+    // A detached window that couldn't `plugin:event|listen` silently never
+    // heard connections-changed/workspace-changed: a disconnect in main left
+    // its dead connection and tab on screen.
+    #[test]
+    fn a_label_minted_for_a_detached_tab_may_listen_for_events() {
+        let label = next_window_id(&ws_with_windows(&["main", "win-1", "win-7"]));
+        assert_eq!(label, "win-8");
+        assert!(permissions_for(&label).contains("core:default"), "{label} is not granted core:default");
+    }
+
+    #[test]
+    fn secondary_windows_get_everything_main_has_except_main_only_permissions() {
+        let main = permissions_for("main");
+        let secondary = permissions_for(&next_window_id(&ws_with_windows(&["main"])));
+        for permission in MAIN_ONLY_PERMISSIONS {
+            assert!(main.contains(*permission), "main lost {permission}");
+            assert!(!secondary.contains(*permission), "{permission} is meant to stay main-only");
+        }
+        let expected: BTreeSet<String> =
+            main.iter().filter(|p| !MAIN_ONLY_PERMISSIONS.contains(&p.as_str())).cloned().collect();
+        assert_eq!(secondary, expected);
+    }
 
     fn ws_with_windows(ids: &[&str]) -> Workspace {
         Workspace {

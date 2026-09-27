@@ -13,6 +13,21 @@ permissions:
   contents: read
 
 jobs:
+  # `tauri build` refuses to start when a Tauri crate and its npm package are on
+  # different major.minor releases, but only the Release workflow runs it. Check
+  # the same pairing on every PR, so a one-sided dependency bump fails here
+  # instead of failing every platform build of the next release (#382, #387).
+  tauri-versions:
+    name: tauri versions
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Tauri crate/npm version check
+        run: npm run check:tauri-versions
+
   frontend:
     name: frontend
     runs-on: ubuntu-22.04
@@ -95,9 +110,20 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
+      # The real MONGODB-OIDC handshake test (#430) needs Percona configured
+      # with the test's mock IdP as an identity provider. That takes
+      # `--setParameter` arguments and a TEST-ONLY CA installed before mongod
+      # starts, neither of which `services:` can do, so a script runs the
+      # container. It prints the MQLENS_TEST_OIDC_* variables the test reads;
+      # when they are unset the test skips.
+      - name: Start the MONGODB-OIDC Percona fixture
+        run: bash scripts/oidc-percona-fixture.sh start >> "$GITHUB_ENV"
       - name: Backend tests with coverage
         # Fail the build if line coverage drops below 70% (the agreed target floor).
         # The generated MQLens Server client (src/server/pb) is excluded: it is
         # produced by buf, not written here, and most of it is client methods a
         # given build never calls.
         run: cargo llvm-cov --manifest-path src-tauri/Cargo.toml --summary-only --fail-under-lines 70 --ignore-filename-regex 'src-tauri/src/((lib|main)\.rs|server/pb/)'
+      - name: Stop the MONGODB-OIDC Percona fixture
+        if: always()
+        run: bash scripts/oidc-percona-fixture.sh stop

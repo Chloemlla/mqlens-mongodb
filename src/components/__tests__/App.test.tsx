@@ -65,10 +65,12 @@ const mockInvoke = vi.fn();
 // that round-trips value/onChange — this keeps the existing stage tests, which
 // drive `pipeline-stage-N textarea`, working against the real component shape.
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, wrapperProps }: { value: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
+  // QueryEditor hands the library only `defaultValue` (it writes later values
+  // into the model itself), so show whichever one the editor was given.
+  default: ({ value, defaultValue, onChange, wrapperProps }: { value?: string; defaultValue?: string; onChange?: (v: string) => void; wrapperProps?: Record<string, unknown> }) => (
     <textarea
       data-testid={wrapperProps?.['data-testid'] as string | undefined}
-      value={value}
+      value={value ?? defaultValue}
       onChange={(e) => onChange?.(e.target.value)}
     />
   ),
@@ -144,6 +146,23 @@ vi.mock('../Sidebar', () => ({
         }
       >
         Quick Connect Prod
+      </button>
+      {/* #430: a profile with self-managed OIDC settings, to prove the allowed
+          hosts survive the quick-connect path (App.tsx's own connect_db call),
+          not just the ConnectionManager's. */}
+      <button
+        data-testid="quick-connect-oidc-btn"
+        onClick={() =>
+          onConnectProfile?.({
+            id: 'profile-oidc',
+            name: 'OIDC Corp',
+            uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+            ssh: null,
+            oidc: { allowed_hosts: ['mongo.corp.example.com'], use_id_token: true },
+          })
+        }
+      >
+        Quick Connect OIDC
       </button>
       <button
         data-testid="select-trial-collection-btn"
@@ -869,7 +888,7 @@ describe('App Component', () => {
       // keyed error could not tell from a new edit beginning.
       fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
       await screen.findByText(/"John Doe"/);
-      fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+      fireEvent.click(screen.getAllByTestId('edit-doc-btn').find((b) => !b.closest('[hidden]'))!);
       await screen.findByTestId('document-json-input');
 
       // Only now does the customers insert fail, with its own dialog off screen.
@@ -909,7 +928,7 @@ describe('App Component', () => {
       // A different tab's edit is savable while this one is still in flight.
       fireEvent.click(screen.getByTestId('select-orders-collection-btn'));
       await screen.findByText(/"John Doe"/);
-      fireEvent.click(screen.getAllByTestId('edit-doc-btn')[0]);
+      fireEvent.click(screen.getAllByTestId('edit-doc-btn').find((b) => !b.closest('[hidden]'))!);
       await screen.findByTestId('document-json-input');
       expect(screen.getByTestId('document-save-btn')).not.toBeDisabled();
 
@@ -2804,6 +2823,38 @@ describe('App Component', () => {
       expect(connectCalls).toHaveLength(1); // one connect_db for the whole profile, not per-tab
     });
 
+    it('(b2) reconnecting a profile sends its saved OIDC config to connect_db (#430)', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'workspace_get') return Promise.resolve(workspaceSnapshot);
+        if (cmd === 'load_connection_profiles') {
+          return Promise.resolve([
+            {
+              id: 'p1',
+              name: 'Prod Cluster',
+              uri: 'mongodb://mongo.corp.example.com:27017/?authMechanism=MONGODB-OIDC&authSource=$external',
+              ssh: null,
+              oidc: { allowed_hosts: ['mongo.corp.example.com'], use_id_token: true },
+            },
+          ]);
+        }
+        if (cmd === 'connect_db') return Promise.resolve('new-conn-oidc');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+
+      const [firstBtn] = await screen.findAllByRole('button', { name: /Reconnect Prod Cluster/ });
+      fireEvent.click(firstBtn);
+
+      await waitFor(() => {
+        const connectCall = calls.find((c) => c.cmd === 'connect_db');
+        expect(connectCall?.args?.oidc).toEqual({ allowed_hosts: ['mongo.corp.example.com'], use_id_token: true });
+      });
+    });
+
     it('(b1) clicking two banners for the same profile back-to-back only connects once — IMPORTANT fix regression guard', async () => {
       // Both panes' banners share profileId p1. A synchronous double-click
       // (or two banners firing before either's setReconnectState commits) used
@@ -3113,6 +3164,33 @@ describe('App Component', () => {
       // the other window has been updating, not this stale snapshot.
       expect(readShellSession('new-conn-1.sales_db.customers')).toBeUndefined();
     });
+
+    it('translates a bare OIDC error key on the reconnect banner instead of showing it raw (#430)', async () => {
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'workspace_get') return Promise.resolve(workspaceSnapshot);
+        if (cmd === 'load_connection_profiles') {
+          return Promise.resolve([{
+            id: 'p1',
+            name: 'Prod Cluster',
+            uri: 'mongodb://prod/?authMechanism=MONGODB-OIDC&authSource=$external',
+            ssh: null,
+          }]);
+        }
+        if (cmd === 'connect_db') return Promise.reject('auth.oidc.errors.cancelled');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+
+      const [firstBtn] = await screen.findAllByRole('button', { name: /Reconnect Prod Cluster/ });
+      fireEvent.click(firstBtn);
+
+      await waitFor(() => {
+        expect(screen.getAllByTestId('reconnect-error')[0]).toHaveTextContent(/login was cancelled/i);
+      });
+      expect(screen.queryByText(/auth\.oidc\.errors\.cancelled/)).not.toBeInTheDocument();
+    });
   });
 
   describe('dispatchWorkspace no-op mirror gate (#97 phase 2 final review Fix 3)', () => {
@@ -3217,6 +3295,46 @@ describe('App Component', () => {
       // shortcut against a server the user was only trying out.
       await waitFor(() => {
         expect(calls.some((c) => c.cmd === 'connect_db' && c.args?.uri === 'mongodb://saved')).toBe(true);
+      });
+    });
+
+    it('quick-connects an OIDC profile with its allowed hosts (#430)', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'connect_db') return Promise.resolve('conn-from-oidc-profile');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+
+      fireEvent.click(screen.getByTestId('quick-connect-oidc-btn'));
+
+      await waitFor(() => {
+        const call = calls.find((c) => c.cmd === 'connect_db');
+        expect(call?.args?.oidc).toEqual({ allowed_hosts: ['mongo.corp.example.com'], use_id_token: true });
+      });
+    });
+
+    it('never sends OIDC config when loading the built-in sample data (#430)', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'connect_db') return Promise.resolve('conn-sample-1');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+      await screen.findByTestId('mock-sidebar');
+
+      fireEvent.click(screen.getAllByText('Load sample data')[0]);
+
+      await waitFor(() => {
+        const call = calls.find((c) => c.cmd === 'connect_db' && c.args?.uri === 'mongodb://mock');
+        expect(call?.args?.oidc).toBeNull();
       });
     });
 
@@ -4322,6 +4440,50 @@ describe('App Component', () => {
       });
     });
 
+    it('(f1) the self-heal still fires for a broadcast that lands right after the sidebar row commits, before passive effects have flushed', async () => {
+      const calls: any[] = [];
+      mockInvoke.mockImplementation((cmd: string, args: any) => {
+        calls.push({ cmd, args });
+        if (cmd === 'load_connection_profiles') {
+          return Promise.resolve([{ id: 'p1', name: 'Prod Cluster', uri: 'mongodb://prod', ssh: null }]);
+        }
+        if (cmd === 'connect_db') return Promise.resolve('live-1');
+        return Promise.resolve([]);
+      });
+
+      const { fireEvent, waitFor } = await import('@testing-library/react');
+      renderWithProviders(<App />);
+
+      const connectCard = await screen.findByTestId('conn-card-p1');
+      // Pins the timing (f) above only hits under load: a MutationObserver
+      // callback runs in the microtask right after the commit that inserts the
+      // row, before React's scheduled passive-effect flush. The listener reads
+      // `activeConnectionsRef`, so it must already hold 'live-1' by then.
+      let fired = false;
+      const observer = new MutationObserver(() => {
+        if (fired || !screen.queryByTestId('sidebar-conn-live-1')) return;
+        observer.disconnect();
+        fired = true;
+        calls.length = 0;
+        fireMockEvent('connections-changed', {
+          connections: [{ id: 'live-other', profileId: 'p-other', name: 'Other Cluster' }],
+        });
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      fireEvent.click(connectCard);
+      await waitFor(() => expect(fired).toBe(true));
+
+      expect(screen.getByTestId('sidebar-conn-live-1')).toBeInTheDocument();
+      expect(calls.some((c) => c.cmd === 'disconnect_db')).toBe(false);
+      await waitFor(() => {
+        expect(
+          calls.some(
+            (c) => c.cmd === 'set_connection_meta' && c.args?.id === 'live-1' && c.args?.profileId === 'p1',
+          ),
+        ).toBe(true);
+      });
+    });
+
     it('(f2) a self-heal re-announce for a read_only connection preserves read_only — does NOT reset to normal (#188 Task 5 regression)', async () => {
       const calls: any[] = [];
       mockInvoke.mockImplementation((cmd: string, args: any) => {
@@ -5001,5 +5163,34 @@ describe('pipelineYieldsWholeDocuments (#275)', () => {
     const { pipelineYieldsWholeDocuments } = await import('../../App');
     expect(pipelineYieldsWholeDocuments([{} as Record<string, unknown>])).toBe(false);
     expect(pipelineYieldsWholeDocuments([{ $match: {}, $sort: {} }])).toBe(false);
+  });
+});
+
+describe('quick-connect toast translates OIDC error keys (#430)', () => {
+  it('shows the localized reason for a failed sidebar quick-connect, not a raw locale key', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'workspace_get') return Promise.resolve(null);
+      if (cmd === 'load_connection_profiles') {
+        return Promise.resolve([{
+          id: 'p1',
+          name: 'Prod Cluster',
+          uri: 'mongodb://prod/?authMechanism=MONGODB-OIDC&authSource=$external',
+          ssh: null,
+        }]);
+      }
+      if (cmd === 'connect_db') return Promise.reject('auth.oidc.errors.cancelled');
+      return Promise.resolve([]);
+    });
+
+    const { fireEvent, waitFor } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+
+    const connectCard = await screen.findByTestId('conn-card-p1');
+    fireEvent.click(connectCard);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Could not connect to Prod Cluster: The login was cancelled\./)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/auth\.oidc\.errors\.cancelled/)).not.toBeInTheDocument();
   });
 });

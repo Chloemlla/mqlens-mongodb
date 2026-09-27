@@ -3,14 +3,21 @@ import { render, screen, fireEvent } from '@testing-library/react';
 
 // The modal's JSON editor wraps @monaco-editor/react; mock it with a plain
 // <textarea> that exposes the test id via wrapperProps and round-trips value.
+// The modal hands the library only `defaultValue` (useMonacoValue writes later
+// values into the model itself), so show whichever one the editor was given.
+let lastEditorProps: Record<string, unknown> | undefined;
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, wrapperProps }: any) => (
-    <textarea
-      data-testid={wrapperProps?.['data-testid']}
-      value={value}
-      onChange={(e) => onChange?.(e.target.value)}
-    />
-  ),
+  default: (props: any) => {
+    lastEditorProps = props;
+    const { value, defaultValue, onChange, wrapperProps } = props;
+    return (
+      <textarea
+        data-testid={wrapperProps?.['data-testid']}
+        value={value ?? defaultValue}
+        onChange={(e) => onChange?.(e.target.value)}
+      />
+    );
+  },
 }));
 
 import { DocumentEditModal } from '../DocumentEditModal';
@@ -107,6 +114,18 @@ describe('DocumentEditModal', () => {
       />
     );
     expect(screen.queryByTestId('document-edit-modal')).not.toBeInTheDocument();
+  });
+
+  it('keeps the draft out of the library\'s `value` prop', () => {
+    // The library writes `value` into the model from a passive effect, which on
+    // a slow machine landed on the next keystroke and erased it. The draft goes
+    // through useMonacoValue instead; its tests cover the typing itself.
+    render(
+      <DocumentEditModal isOpen mode="edit" initialJson="{}" json='{ "a": 1 }' onJsonChange={() => {}} onClose={() => {}} onSave={() => {}} />
+    );
+    expect(lastEditorProps?.value).toBeUndefined();
+    expect(lastEditorProps?.defaultValue).toBe('{ "a": 1 }');
+    expect(lastEditorProps?.onMount).toBeTypeOf('function');
   });
 });
 
