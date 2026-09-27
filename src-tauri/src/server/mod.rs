@@ -44,7 +44,10 @@ impl ServerRuntime {
     ) -> Result<Arc<AccountSession>, String> {
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(&account.id) {
-            if !existing.is_ended() {
+            // Another instance can repoint the account at a different server or
+            // user, or sign it out; a cached session still holding a live access
+            // token for the old identity must not serve the account as it is now.
+            if !existing.is_ended() && existing.serves(account) && account.refresh_token.is_some() {
                 return Ok(existing.clone());
             }
         }
@@ -92,7 +95,8 @@ pub(crate) fn key_source(vault_key: Arc<Mutex<Option<[u8; 32]>>>) -> KeySource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::fake::{list_connections, Env, PASSWORD};
+    use crate::server::accounts::ServerAccountInput;
+    use crate::server::fake::{list_connections, Env, KEY, PASSWORD, TENANT};
 
     async fn sign_in(env: &Env) -> Arc<AccountSession> {
         match AccountSession::sign_in(&env.account, PASSWORD, env.store()).await {
@@ -160,6 +164,52 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&current, &again));
         assert!(runtime.remove(&env.account.id).await.is_some());
+    }
+
+    // Another MQLens instance repointed the account at a different user. The
+    // cached session still holds a live access token for the old one, and must
+    // not be handed out for the account as it is now.
+    #[tokio::test]
+    async fn a_cached_session_is_not_reused_after_the_identity_changes() {
+        let env = Env::new().await;
+        sign_in(&env).await;
+        let runtime = ServerRuntime::default();
+        let old = runtime
+            .session(&env.stored_account(), env.store())
+            .await
+            .unwrap();
+        list_connections(&old).await.unwrap();
+
+        accounts::save_account(
+            &env.path,
+            &KEY,
+            ServerAccountInput {
+                id: Some(env.account.id.clone()),
+                name: env.account.name.clone(),
+                url: env.account.url.clone(),
+                tenant: TENANT.to_string(),
+                email: "dba@acme.test".to_string(),
+                allow_insecure_http: false,
+                extra_ca_pem: None,
+            },
+        )
+        .unwrap();
+        match runtime.session(&env.stored_account(), env.store()).await {
+            Err(e) => assert!(e.contains("Sign in"), "{e}"),
+            Ok(_) => panic!("reused the old identity's session"),
+        }
+
+        // Signed in again as the new user, the account gets a session of its own.
+        accounts::update(&env.path, &KEY, |all| {
+            all[0].refresh_token = Some("refresh-for-the-new-identity".to_string());
+            Ok(())
+        })
+        .unwrap();
+        let current = runtime
+            .session(&env.stored_account(), env.store())
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&current, &old));
     }
 
     #[test]

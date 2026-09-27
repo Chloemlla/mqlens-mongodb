@@ -50,15 +50,25 @@ const LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SESSION_ENDED: &str = "Your MQLens Server session has ended. Sign in again.";
 
 /// Where a session's refresh token is kept.
+///
+/// A token belongs to an identity, not only to an account id: another MQLens
+/// instance can repoint the account at a different server or user at any time.
+/// So both calls take the account as the session knows it, and act only while
+/// the stored account is still that identity (`ServerAccount::same_identity`).
+/// Otherwise `read` finds nothing, storing a token fails, and clearing one
+/// does nothing, since the token there now belongs to someone else.
 pub(crate) trait TokenStore: Send + Sync + 'static {
     /// Blocks until the caller holds the store's cross-process lock; released
     /// when the returned guard drops. Not re-entrant.
     fn lock(&self) -> Result<Box<dyn Send>, String>;
     /// The stored refresh token. The caller holds the lock.
-    fn read(&self, account_id: &str) -> Result<Option<Zeroizing<String>>, String>;
+    fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String>;
     /// Replaces the stored refresh token. The caller holds the lock.
-    fn write(&self, account_id: &str, token: Option<&str>) -> Result<(), String>;
+    fn write(&self, account: &ServerAccount, token: Option<&str>) -> Result<(), String>;
 }
+
+pub(crate) const ACCOUNT_CHANGED: &str =
+    "This MQLens Server account was changed to another server or user. Sign in again.";
 
 /// The vault key, or why it is not available.
 pub(crate) type KeySource = Arc<dyn Fn() -> Result<[u8; 32], String> + Send + Sync>;
@@ -80,24 +90,29 @@ impl TokenStore for FileTokenStore {
         Ok(Box::new(accounts::lock(&self.path)?))
     }
 
-    fn read(&self, account_id: &str) -> Result<Option<Zeroizing<String>>, String> {
+    fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String> {
         let key = (self.key)()?;
         Ok(accounts::load(&self.path, &key)?
             .into_iter()
-            .find(|a| a.id == account_id)
+            .find(|a| a.id == account.id && a.same_identity(account))
             .and_then(|a| a.refresh_token)
             .map(Zeroizing::new))
     }
 
-    fn write(&self, account_id: &str, token: Option<&str>) -> Result<(), String> {
+    fn write(&self, account: &ServerAccount, token: Option<&str>) -> Result<(), String> {
         let key = (self.key)()?;
         let mut all = accounts::load(&self.path, &key)?;
-        let account = all
-            .iter_mut()
-            .find(|a| a.id == account_id)
-            .ok_or_else(|| "This MQLens Server account has been removed".to_string())?;
-        account.refresh_token = token.map(str::to_string);
-        accounts::save(&self.path, &key, &all)
+        let stored = all.iter_mut().find(|a| a.id == account.id);
+        match (stored, token) {
+            (Some(stored), _) if stored.same_identity(account) => {
+                stored.refresh_token = token.map(str::to_string);
+                accounts::save(&self.path, &key, &all)
+            }
+            // Clearing: the session is gone, or belongs to someone else now.
+            (_, None) => Ok(()),
+            (None, Some(_)) => Err("This MQLens Server account has been removed".to_string()),
+            (Some(_), Some(_)) => Err(ACCOUNT_CHANGED.to_string()),
+        }
     }
 }
 
@@ -113,7 +128,9 @@ struct Tokens {
 }
 
 pub(crate) struct AccountSession {
-    account_id: String,
+    /// The account as it was when the session started, without its token. The
+    /// session only ever serves that identity.
+    account: ServerAccount,
     channel: Channel,
     store: Arc<dyn TokenStore>,
     tokens: tokio::sync::Mutex<Tokens>,
@@ -123,7 +140,10 @@ pub(crate) struct AccountSession {
 impl AccountSession {
     fn new(account: &ServerAccount, store: Arc<dyn TokenStore>) -> Result<Self, String> {
         Ok(Self {
-            account_id: account.id.clone(),
+            account: ServerAccount {
+                refresh_token: None,
+                ..account.clone()
+            },
             channel: channel::channel(&account.channel_config())?,
             store,
             tokens: tokio::sync::Mutex::new(Tokens::default()),
@@ -132,7 +152,13 @@ impl AccountSession {
     }
 
     pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
+        &self.account.id
+    }
+
+    /// Whether this session belongs to `account` as it is now: the same
+    /// account, still pointing at the same server and user.
+    pub(crate) fn serves(&self, account: &ServerAccount) -> bool {
+        self.account.id == account.id && self.account.same_identity(account)
     }
 
     /// True once the session can no longer make calls: signed out, or its
@@ -185,11 +211,11 @@ impl AccountSession {
 
         let stored = {
             let store = session.store.clone();
-            let id = session.account_id.clone();
+            let who = session.account.clone();
             let refresh = Zeroizing::new(login.refresh_token.clone());
             blocking(move || {
                 let _lock = store.lock()?;
-                store.write(&id, Some(&refresh))
+                store.write(&who, Some(&refresh))
             })
             .await
         };
@@ -268,10 +294,10 @@ impl AccountSession {
     async fn refresh_locked(&self, tokens: &mut Tokens) -> Result<(), String> {
         tokens.access = None;
         let store = self.store.clone();
-        let id = self.account_id.clone();
+        let who = self.account.clone();
         let (lock, stored) = blocking(move || {
             let lock = store.lock()?;
-            let stored = store.read(&id)?;
+            let stored = store.read(&who)?;
             Ok((lock, stored))
         })
         .await?;
@@ -284,9 +310,9 @@ impl AccountSession {
         let result = match refresh_rpc(&self.channel, &refresh).await {
             Ok(fresh) => {
                 let store = self.store.clone();
-                let id = self.account_id.clone();
+                let who = self.account.clone();
                 let successor = Zeroizing::new(fresh.refresh_token.clone());
-                match blocking(move || store.write(&id, Some(&successor))).await {
+                match blocking(move || store.write(&who, Some(&successor))).await {
                     Ok(()) => {
                         tokens.access = Some(Zeroizing::new(fresh.access_token));
                         tokens.expires_at = fresh.expires_at;
@@ -311,8 +337,8 @@ impl AccountSession {
             }
             Err(status) if errors::is_unauthenticated(&status) => {
                 let store = self.store.clone();
-                let id = self.account_id.clone();
-                let _ = blocking(move || store.write(&id, None)).await;
+                let who = self.account.clone();
+                let _ = blocking(move || store.write(&who, None)).await;
                 self.ended.store(true, Ordering::SeqCst);
                 Err(errors::with_correlation(SESSION_ENDED.to_string(), &status))
             }
@@ -330,10 +356,10 @@ impl AccountSession {
         tokens.access = None;
         tokens.generation += 1;
         let store = self.store.clone();
-        let id = self.account_id.clone();
+        let who = self.account.clone();
         let _ = blocking(move || {
             let _lock = store.lock()?;
-            store.write(&id, None)
+            store.write(&who, None)
         })
         .await;
     }
@@ -345,10 +371,10 @@ impl AccountSession {
         let mut tokens = self.tokens.lock().await;
         self.ended.store(true, Ordering::SeqCst);
         let store = self.store.clone();
-        let id = self.account_id.clone();
+        let who = self.account.clone();
         let (lock, stored) = blocking(move || {
             let lock = store.lock()?;
-            let stored = store.read(&id)?;
+            let stored = store.read(&who)?;
             Ok((lock, stored))
         })
         .await?;
@@ -373,8 +399,8 @@ impl AccountSession {
         }
 
         let store = self.store.clone();
-        let id = self.account_id.clone();
-        let cleared = blocking(move || store.write(&id, None)).await;
+        let who = self.account.clone();
+        let cleared = blocking(move || store.write(&who, None)).await;
         drop(lock);
         tokens.access = None;
         tokens.generation += 1;
@@ -449,8 +475,88 @@ pub(crate) fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::fake::{file_store, list_connections, Env, PASSWORD};
+    use crate::server::accounts::ServerAccountInput;
+    use crate::server::fake::{file_store, list_connections, Env, KEY, PASSWORD, TENANT};
     use tonic::Code;
+
+    /// What another MQLens instance does when the user points this account at
+    /// a different user: the stored session belongs to the old one and goes.
+    fn change_identity(env: &Env) {
+        accounts::save_account(
+            &env.path,
+            &KEY,
+            ServerAccountInput {
+                id: Some(env.account.id.clone()),
+                name: env.account.name.clone(),
+                url: env.account.url.clone(),
+                tenant: TENANT.to_string(),
+                email: "dba@acme.test".to_string(),
+                allow_insecure_http: false,
+                extra_ca_pem: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn store_token(env: &Env, token: &str) {
+        accounts::update(&env.path, &KEY, |all| {
+            all.iter_mut()
+                .find(|a| a.id == env.account.id)
+                .unwrap()
+                .refresh_token = Some(token.to_string());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_account_edited_during_sign_in_keeps_no_token_from_the_old_identity() {
+        let env = Env::new().await;
+        env.fake
+            .with(|s| s.login_delay = Duration::from_millis(300));
+        let signing_in = {
+            let account = env.account.clone();
+            let store = env.store();
+            tokio::spawn(async move { AccountSession::sign_in(&account, PASSWORD, store).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        change_identity(&env);
+
+        match signing_in.await.unwrap() {
+            Ok(_) => panic!("signed in although the account changed to another user"),
+            Err(e) => assert!(e.contains("changed"), "{e}"),
+        }
+        assert_eq!(env.stored_token(), None);
+        // The login the old identity got is not left usable on the server.
+        env.fake.with(|s| {
+            assert_eq!(s.logouts, 1);
+            assert_eq!(s.live_families(), 0);
+        });
+    }
+
+    #[tokio::test]
+    async fn an_old_session_never_presents_another_identitys_token() {
+        let env = Env::new().await;
+        let old = signed_in(&env).await;
+        change_identity(&env);
+        store_token(&env, "refresh-for-the-new-identity");
+        env.fake.revoke_access_tokens();
+        let refreshes = env.fake.with(|s| s.refreshes);
+
+        let err = list_connections(&old).await.unwrap_err();
+        assert!(err.contains("Sign in again"), "{err}");
+        assert!(old.is_ended());
+        assert_eq!(
+            env.fake.with(|s| s.refreshes),
+            refreshes,
+            "the old session sent a refresh token that is not its own"
+        );
+        assert_eq!(
+            env.stored_token().as_deref(),
+            Some("refresh-for-the-new-identity"),
+            "the old session cleared the new identity's session"
+        );
+    }
 
     async fn signed_in(env: &Env) -> Arc<AccountSession> {
         match AccountSession::sign_in(&env.account, PASSWORD, env.store()).await {
@@ -718,14 +824,14 @@ mod tests {
         fn lock(&self) -> Result<Box<dyn Send>, String> {
             self.inner.lock()
         }
-        fn read(&self, account_id: &str) -> Result<Option<Zeroizing<String>>, String> {
-            self.inner.read(account_id)
+        fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String> {
+            self.inner.read(account)
         }
-        fn write(&self, account_id: &str, token: Option<&str>) -> Result<(), String> {
+        fn write(&self, account: &ServerAccount, token: Option<&str>) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err("disk full".to_string());
             }
-            self.inner.write(account_id, token)
+            self.inner.write(account, token)
         }
     }
 

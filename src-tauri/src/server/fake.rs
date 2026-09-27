@@ -49,6 +49,8 @@ pub(crate) struct FakeState {
     pub access_ttl_secs: i64,
     /// Held before a refresh examines its token, widening any race.
     pub refresh_delay: Duration,
+    /// Held before a login answers, so a test can act while it is in flight.
+    pub login_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
     pub refresh_failures: Vec<Code>,
     pub connections: Vec<ConnectionRef>,
@@ -146,6 +148,7 @@ impl Fake {
                 access: HashMap::new(),
                 access_ttl_secs: 3600,
                 refresh_delay: Duration::ZERO,
+                login_delay: Duration::ZERO,
                 refresh_failures: Vec::new(),
                 connections: vec![ConnectionRef {
                     id: "c1".to_string(),
@@ -200,6 +203,8 @@ impl AuthService for Fake {
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
+        let delay = self.with(|s| s.login_delay);
+        tokio::time::sleep(delay).await;
         let message = request.into_inner();
         let mut state = self.state.lock().unwrap();
         state.logins += 1;
