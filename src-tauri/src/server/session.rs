@@ -144,6 +144,9 @@ struct Tokens {
     /// rejected can tell whether someone has already replaced it.
     generation: u64,
     principal: Option<Principal>,
+    /// The refresh token this session last stored, so that ending it clears
+    /// the stored token only while it is still this session's own.
+    refresh: Option<Zeroizing<String>>,
 }
 
 pub(crate) struct AccountSession {
@@ -256,6 +259,7 @@ impl AccountSession {
 
     async fn adopt(&self, login: LoginResponse) {
         let mut tokens = self.tokens.lock().await;
+        tokens.refresh = Some(Zeroizing::new(login.refresh_token));
         tokens.access = Some(Zeroizing::new(login.access_token));
         tokens.expires_at = login.expires_at;
         if login.principal.is_some() {
@@ -355,6 +359,7 @@ impl AccountSession {
                 let successor = Zeroizing::new(fresh.refresh_token.clone());
                 match blocking(move || store.write(&who, Some(&successor))).await {
                     Ok(()) => {
+                        tokens.refresh = Some(Zeroizing::new(fresh.refresh_token));
                         tokens.access = Some(Zeroizing::new(fresh.access_token));
                         tokens.expires_at = fresh.expires_at;
                         if fresh.principal.is_some() {
@@ -401,11 +406,18 @@ impl AccountSession {
         self.ended.store(true, Ordering::SeqCst);
         tokens.access = None;
         tokens.generation += 1;
+        let ours = tokens.refresh.take();
         let store = self.store.clone();
         let who = self.account.clone();
         let _ = blocking(move || {
             let _lock = store.lock()?;
-            store.write(&who, None)
+            // Another sign-in, here or in another MQLens process, may have
+            // stored its own token since; that one is not this session's to
+            // clear.
+            if store.read(&who)?.as_deref() == ours.as_deref() {
+                store.write(&who, None)?;
+            }
+            Ok(())
         })
         .await;
         true
@@ -841,6 +853,40 @@ mod tests {
         assert!(env.stored_token().is_some());
         env.fake.with(|s| s.list_delay = Duration::ZERO);
         list_connections(&session).await.unwrap();
+    }
+
+    // Another MQLens process signs in to the same account while this session's
+    // retry is in flight. The new sign-in ends this session's family, so the
+    // retry is refused, but the stored token is now the other process's: this
+    // session ends without clearing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_refused_after_another_sign_in_keeps_its_token() {
+        let env = Env::new().await;
+        let session = signed_in(&env).await;
+        env.fake.revoke_access_tokens();
+        env.fake.with(|s| s.list_delay = Duration::from_millis(400));
+        let calling = {
+            let session = session.clone();
+            tokio::spawn(async move { list_connections(&session).await })
+        };
+        // After the call's own refresh, its retry is in flight.
+        while env.fake.with(|s| s.refreshes) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The other process: its own session object and store, same file.
+        let other = signed_in(&env).await;
+        let others_token = env.stored_token();
+        env.fake.revoke_access_tokens();
+
+        assert!(calling.await.unwrap().is_err());
+        assert_eq!(
+            env.stored_token(),
+            others_token,
+            "the refused retry cleared another sign-in's token"
+        );
+        env.fake.with(|s| s.list_delay = Duration::ZERO);
+        list_connections(&other).await.unwrap();
     }
 
     #[tokio::test]
