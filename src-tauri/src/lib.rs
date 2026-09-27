@@ -3623,19 +3623,24 @@ async fn vault_reset(
     // Removes vault.json and the MQLens Server accounts file together, under
     // the accounts file's cross-process lock, so an account write from any
     // MQLens process cannot recreate the accounts file under the discarded
-    // key. The stored server sessions are ended in the background: the reset
-    // does not wait on servers between removing vault.json and the rest.
+    // key. The stored server sessions are ended once the other vault files are
+    // gone, so the reset never waits on servers with the vault half removed.
     let server_accounts_path = connections::get_server_accounts_path(&app_handle);
-    server::commands::reset_accounts(&state, &server_accounts_path).await?;
-    for p in [
+    let sign_outs = server::commands::reset_accounts(&state, &server_accounts_path).await?;
+    let removed = [
         connections::get_vault_meta_path(&app_handle),
         connections::get_profiles_enc_path(&app_handle),
         connections::get_settings_enc_path(&app_handle),
-    ] {
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
-        }
-    }
+    ]
+    .into_iter()
+    .filter(|p| p.exists())
+    .try_for_each(|p| {
+        std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
+    });
+    // Their tokens are already deleted: these sessions are ended now or never,
+    // whether or not the rest of the reset went through.
+    sign_outs.finish().await;
+    removed?;
     *state.vault_key.lock_safe()? = None;
     // Same precondition as `vault_lock`: no key means no MCP server.
     mcp::stop_if_running(&state).await?;

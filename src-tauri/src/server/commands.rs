@@ -113,11 +113,9 @@ pub(crate) async fn sign_in_impl(
     let password = Zeroizing::new(password);
     let key = state.require_key()?;
     let account = accounts::find(path, &key, account_id)?;
-    // Signing in again replaces the stored session: end that one properly
-    // rather than leave it usable on the server.
-    if account.refresh_token.is_some() {
-        sign_out_account(state, path, &account).await;
-    }
+    // A session already stored stays until the new one replaces it, so a
+    // mistyped password or a failed login leaves the user signed in.
+    // `AccountSession::sign_in` ends the session it displaces on the server.
     let session = AccountSession::sign_in(&account, &password, token_store(state, path)).await?;
     state.server.insert(session).await;
     // The vault may have locked while the server answered; a session must not
@@ -175,20 +173,45 @@ pub(crate) async fn list_connections_impl(
 }
 
 /// The MQLens Server part of a vault reset: removes vault.json and the accounts
-/// file under the accounts lock, then ends every stored session in the
-/// background, each within its own time limit. Best effort: an unreachable
-/// server cannot hold up a reset, and sessions are dropped here regardless.
-pub(crate) async fn reset_accounts(state: &AppState, path: &Path) -> Result<(), String> {
+/// file under the accounts lock, and hands back the stored sessions still to
+/// be ended on their servers. Sessions are dropped here regardless.
+pub(crate) async fn reset_accounts(
+    state: &AppState,
+    path: &Path,
+) -> Result<PendingSignOuts, String> {
     reset_accounts_within(state, path, RESET_SIGN_OUT_TIMEOUT).await
 }
 
-/// Each account gets `limit` of its own, all at once, so one unreachable server
-/// cannot use up the time every other account needed.
+/// Sessions a vault reset took out of the accounts file and has yet to end on
+/// their servers. The reset finishes them once its other files are gone:
+/// their tokens exist nowhere else, so a task left running in the background
+/// would be cancelled with the app and leave those sessions live.
+#[must_use = "a reset must finish ending the sessions it took"]
+pub(crate) struct PendingSignOuts {
+    taken: Vec<(ServerAccount, String)>,
+    limit: Duration,
+}
+
+impl PendingSignOuts {
+    /// Ends every session, each within its own time limit and all at once, so
+    /// one unreachable server cannot use up the time every other one needed.
+    /// Best effort: an unreachable server cannot hold up a reset.
+    pub(crate) async fn finish(self) {
+        let limit = self.limit;
+        let revokes = self
+            .taken
+            .iter()
+            .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
+        futures::future::join_all(revokes).await;
+    }
+}
+
+/// Each account gets `limit` of its own when the sign-outs are finished.
 async fn reset_accounts_within(
     state: &AppState,
     path: &Path,
     limit: Duration,
-) -> Result<(), String> {
+) -> Result<PendingSignOuts, String> {
     state.server.clear().await;
     let key = state.require_key().ok();
     // One locked step takes every stored token and removes the vault metadata
@@ -214,26 +237,11 @@ async fn reset_accounts_within(
         Ok(taken)
     })
     .await?;
-    // Ended in the background, so the reset goes on at once. Waiting here would
-    // leave the vault half removed, vault.json gone and its other files still
-    // there, for as long as the slowest server: another window could set up a
-    // new vault in that gap and lose it to the rest of the reset.
-    tokio::spawn(async move {
-        let revokes = taken
-            .iter()
-            .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
-        futures::future::join_all(revokes).await;
-    });
-    Ok(())
-}
-
-/// Ends an account's session on the server and here, best effort. Returns
-/// whether the server confirmed it.
-async fn sign_out_account(state: &AppState, path: &Path, account: &ServerAccount) -> bool {
-    match current_session(state, path, account).await {
-        Ok(session) => session.sign_out().await.unwrap_or(false),
-        Err(_) => false,
-    }
+    // Not ended here: waiting on servers now would leave the vault half
+    // removed, vault.json gone and its other files still there, for as long as
+    // the slowest server, and another window could set up a new vault in that
+    // gap only to lose it to the rest of the reset.
+    Ok(PendingSignOuts { taken, limit })
 }
 
 /// The session to end for `account` as it is stored now, taken out of the
@@ -254,18 +262,6 @@ async fn current_session(
 mod tests {
     use super::*;
     use crate::server::fake::{file_store, write_vault_meta, Env, EMAIL, KEY, PASSWORD, TENANT};
-
-    /// Whether every session on the fake server has ended within `limit`.
-    async fn wait_until_no_live_sessions(env: &Env, limit: Duration) -> bool {
-        let deadline = std::time::Instant::now() + limit;
-        while std::time::Instant::now() < deadline {
-            if env.fake.with(|s| s.live_families()) == 0 {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        false
-    }
 
     fn unlocked() -> AppState {
         let state = AppState::new();
@@ -364,6 +360,24 @@ mod tests {
             assert_eq!(s.logouts, 1);
             assert_eq!(s.live_families(), 1);
         });
+        list_connections_impl(&state, &env.path, id).await.unwrap();
+    }
+
+    // A mistyped password, or a login that fails, must not cost the user the
+    // session they already have: it is replaced only once a new one exists.
+    #[tokio::test]
+    async fn a_failed_sign_in_keeps_the_current_session() {
+        let env = Env::new().await;
+        let state = unlocked();
+        let id = env.account.id.as_str();
+        sign_in_impl(&state, &env.path, id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        sign_in_impl(&state, &env.path, id, "nope".to_string())
+            .await
+            .unwrap_err();
+        assert!(account_list_impl(&state, &env.path).unwrap()[0].signed_in);
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
         list_connections_impl(&state, &env.path, id).await.unwrap();
     }
 
@@ -650,11 +664,16 @@ mod tests {
         let started = std::time::Instant::now();
         reset_accounts_within(&state, &env.path, Duration::from_millis(500))
             .await
-            .unwrap();
-        assert!(
-            wait_until_no_live_sessions(&env, Duration::from_secs(3)).await,
-            "the reachable server's session was never ended"
-        );
+            .unwrap()
+            .finish()
+            .await;
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the reachable server's session was never ended"
+            )
+        });
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -714,7 +733,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         reset_accounts_within(&state, &env.path, Duration::from_millis(500))
             .await
-            .unwrap();
+            .unwrap()
+            .finish()
+            .await;
 
         let result = signing_in.await.unwrap();
         assert!(
@@ -781,7 +802,7 @@ mod tests {
     // would look uninitialized for that long while its other files were still
     // there, and another window could set up a new vault in the gap only for
     // the rest of the reset to delete it. The step must hand the revocations
-    // off and return at once; they still reach every server.
+    // back and return at once; finishing them still reaches every server.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_reset_step_returns_without_waiting_on_servers() {
         let env = Env::new().await;
@@ -815,7 +836,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        reset_accounts_within(&state, &env.path, Duration::from_secs(3))
+        let pending = reset_accounts_within(&state, &env.path, Duration::from_secs(3))
             .await
             .unwrap();
         assert!(
@@ -824,7 +845,33 @@ mod tests {
             started.elapsed()
         );
         assert!(!env.path.exists());
-        assert!(wait_until_no_live_sessions(&env, Duration::from_secs(3)).await);
+        pending.finish().await;
+        env.fake.with(|s| assert_eq!(s.live_families(), 0));
+    }
+
+    // The reset hands the sign-outs back instead of leaving them to a
+    // background task, which closing the app right after would cancel with the
+    // tokens already deleted. Once finished, every reachable session is over.
+    #[tokio::test]
+    async fn a_reset_ends_every_session_before_it_finishes() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake
+            .with(|s| s.logout_delay = Duration::from_millis(300));
+
+        let pending = reset_accounts(&state, &env.path).await.unwrap();
+        assert!(!env.path.exists());
+        pending.finish().await;
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the reset finished with a session still live"
+            )
+        });
     }
 
     #[tokio::test]
@@ -835,15 +882,23 @@ mod tests {
             .await
             .unwrap();
 
-        reset_accounts(&state, &env.path).await.unwrap();
-        assert!(wait_until_no_live_sessions(&env, Duration::from_secs(3)).await);
+        reset_accounts(&state, &env.path)
+            .await
+            .unwrap()
+            .finish()
+            .await;
+        env.fake.with(|s| assert_eq!(s.live_families(), 0));
         assert!(!env.path.exists());
         assert!(!accounts::vault_meta_path(&env.path).exists());
 
         // Locked, there is no key to read tokens with; the files still go.
         let locked = AppState::new();
         write_vault_meta(&env.path, &KEY);
-        reset_accounts(&locked, &env.path).await.unwrap();
+        reset_accounts(&locked, &env.path)
+            .await
+            .unwrap()
+            .finish()
+            .await;
         assert!(!accounts::vault_meta_path(&env.path).exists());
     }
 }

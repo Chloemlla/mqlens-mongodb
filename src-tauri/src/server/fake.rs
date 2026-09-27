@@ -53,6 +53,8 @@ pub(crate) struct FakeState {
     pub login_delay: Duration,
     /// Held before ListConnections answers, to play a server that stalls.
     pub list_delay: Duration,
+    /// Held before a logout answers, to play a slow server.
+    pub logout_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
     pub refresh_failures: Vec<Code>,
     pub connections: Vec<ConnectionRef>,
@@ -152,6 +154,7 @@ impl Fake {
                 refresh_delay: Duration::ZERO,
                 login_delay: Duration::ZERO,
                 list_delay: Duration::ZERO,
+                logout_delay: Duration::ZERO,
                 refresh_failures: Vec::new(),
                 connections: vec![ConnectionRef {
                     id: "c1".to_string(),
@@ -257,6 +260,8 @@ impl AuthService for Fake {
         &self,
         request: Request<LogoutRequest>,
     ) -> Result<Response<LogoutResponse>, Status> {
+        let delay = self.with(|s| s.logout_delay);
+        tokio::time::sleep(delay).await;
         let mut state = self.state.lock().unwrap();
         state.authenticate(&request)?;
         state.logouts += 1;

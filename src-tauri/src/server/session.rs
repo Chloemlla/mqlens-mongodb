@@ -284,7 +284,7 @@ impl AccountSession {
             Err(status) if errors::is_unauthenticated(&status) => {}
             Err(status) => return Err(errors::describe(&status)),
         }
-        let (token, _) = self.access_token(Some(generation)).await?;
+        let (token, retried) = self.access_token(Some(generation)).await?;
         match rpc(
             self.channel.clone(),
             with_deadline(authorized(message, &token)?),
@@ -292,9 +292,14 @@ impl AccountSession {
         .await
         {
             Ok(response) => Ok(response.into_inner()),
+            // Another call may have replaced the refused token meanwhile; the
+            // refusal then says nothing about the session as it is now.
             Err(status) if errors::is_unauthenticated(&status) => {
-                self.end_locally().await;
-                Err(errors::with_correlation(SESSION_ENDED.to_string(), &status))
+                if self.end_unless_replaced(retried).await {
+                    Err(errors::with_correlation(SESSION_ENDED.to_string(), &status))
+                } else {
+                    Err(errors::describe(&status))
+                }
             }
             Err(status) => Err(errors::describe(&status)),
         }
@@ -385,10 +390,15 @@ impl AccountSession {
     }
 
     /// Ends the session here after the server refused a freshly refreshed
-    /// token, which only happens when the account itself has lost access.
-    async fn end_locally(&self) {
-        self.ended.store(true, Ordering::SeqCst);
+    /// token, which only happens when the account itself has lost access,
+    /// unless a newer access token has replaced that one since. Returns whether
+    /// the session ended.
+    async fn end_unless_replaced(&self, generation: u64) -> bool {
         let mut tokens = self.tokens.lock().await;
+        if generation != tokens.generation {
+            return false;
+        }
+        self.ended.store(true, Ordering::SeqCst);
         tokens.access = None;
         tokens.generation += 1;
         let store = self.store.clone();
@@ -398,6 +408,7 @@ impl AccountSession {
             store.write(&who, None)
         })
         .await;
+        true
     }
 
     /// Signs out: ends the session on the server when it can be reached, and
@@ -792,6 +803,36 @@ mod tests {
             assert_eq!(s.refreshes, 1);
             assert_eq!(s.list_calls, 1);
         });
+    }
+
+    // Two calls share a session. While one call's retry is in flight, another
+    // replaces the access token that retry carries. The retry being refused
+    // then says nothing about the new token, so the session must not end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_refused_after_another_call_refreshed_keeps_the_session() {
+        let env = Env::new().await;
+        let session = signed_in(&env).await;
+        env.fake.revoke_access_tokens();
+        env.fake.with(|s| s.list_delay = Duration::from_millis(400));
+        let calling = {
+            let session = session.clone();
+            tokio::spawn(async move { list_connections(&session).await })
+        };
+        // After the call's own refresh, its retry is in flight.
+        while env.fake.with(|s| s.refreshes) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The retry's token is refused, and another call replaces it.
+        env.fake.revoke_access_tokens();
+        let current = session.tokens.lock().await.generation;
+        session.access_token(Some(current)).await.unwrap();
+
+        let _ = calling.await.unwrap();
+        assert!(!session.is_ended(), "the newer token was thrown away");
+        assert!(env.stored_token().is_some());
+        env.fake.with(|s| s.list_delay = Duration::ZERO);
+        list_connections(&session).await.unwrap();
     }
 
     #[tokio::test]
