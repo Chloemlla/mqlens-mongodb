@@ -16,6 +16,14 @@ use std::path::Path;
 /// File name of the accounts store in the app config directory.
 pub(crate) const ACCOUNTS_FILE_NAME: &str = "server_accounts.json.enc";
 
+/// The vault's metadata file, which lives beside the accounts file in the app
+/// config directory (`connections::get_vault_meta_path`). Every MQLens process
+/// sees it, so it tells a process whether the vault it holds a key for still
+/// exists.
+pub(crate) fn vault_meta_path(accounts_path: &Path) -> std::path::PathBuf {
+    accounts_path.with_file_name("vault.json")
+}
+
 /// How an account signs in. Password sign-in is the only method until the
 /// server offers OIDC to desktop clients.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,10 +229,12 @@ pub(crate) fn update<T>(
     update_while(path, key, None, change)
 }
 
-/// `update`, going ahead only while `current` still yields `key`, checked under
+/// `update`, going ahead only while the vault still uses `key`, checked under
 /// the file lock. A command can wait on the network between reading the key
 /// and writing; if the vault is locked or reset meanwhile, writing with the
 /// captured key would recreate the file under a key no vault uses any more.
+/// `current` covers this process; the vault metadata covers another MQLens
+/// process resetting the vault, which removes that file under this same lock.
 fn update_while<T>(
     path: &Path,
     key: &[u8; 32],
@@ -233,9 +243,14 @@ fn update_while<T>(
 ) -> Result<T, String> {
     let _lock = lock(path)?;
     if let Some(current) = current {
-        match current() {
-            Ok(now) if now == *key => {}
-            _ => return Err(VAULT_CHANGED.to_string()),
+        let here = matches!(current(), Ok(now) if now == *key);
+        let everywhere = here
+            && crate::connections::read_vault_meta(&vault_meta_path(path))
+                .ok()
+                .flatten()
+                .is_some_and(|meta| crate::connections::key_matches_meta(&meta, key));
+        if !everywhere {
+            return Err(VAULT_CHANGED.to_string());
         }
     }
     let mut accounts = load(path, key)?;

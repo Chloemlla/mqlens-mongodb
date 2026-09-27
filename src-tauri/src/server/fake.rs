@@ -317,6 +317,7 @@ impl Env {
         let url = fake.serve().await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(accounts::ACCOUNTS_FILE_NAME);
+        write_vault_meta(&path, &KEY);
         let (account, _) = accounts::save_account(
             &path,
             &KEY,
@@ -351,6 +352,23 @@ impl Env {
     pub(crate) fn stored_token(&self) -> Option<String> {
         self.stored_account().refresh_token
     }
+}
+
+/// Writes, beside an accounts file, the vault metadata of a vault whose key is
+/// `key`, as the real vault keeps it in the same config directory.
+pub(crate) fn write_vault_meta(accounts_path: &Path, key: &[u8; 32]) {
+    use base64::Engine;
+    let verifier = crate::vault::encrypt(key, crate::vault::VERIFIER_PLAINTEXT).unwrap();
+    let meta = crate::connections::VaultMeta {
+        version: 1,
+        kdf_alg: "argon2id".to_string(),
+        kdf_m_kib: 8,
+        kdf_t: 1,
+        kdf_p: 1,
+        salt: base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+        verifier: base64::engine::general_purpose::STANDARD.encode(verifier),
+    };
+    crate::connections::write_vault_meta(&accounts::vault_meta_path(accounts_path), &meta).unwrap();
 }
 
 pub(crate) fn file_store(path: &Path) -> Arc<dyn TokenStore> {

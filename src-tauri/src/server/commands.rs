@@ -63,23 +63,20 @@ pub(crate) async fn account_save_impl(
     input: ServerAccountInput,
 ) -> Result<ServerAccountView, String> {
     let key = state.require_key()?;
-    let candidate = input.clone().into_account()?;
-    // An edit that changes who or where the account signs in ends its session
-    // first, while the stored token can still log it out on the server.
-    let existing = accounts::load(path, &key)?
-        .into_iter()
-        .find(|a| a.id == candidate.id);
-    if let Some(existing) = existing {
-        if existing.refresh_token.is_some() && !existing.same_identity(&candidate) {
-            sign_out_account(state, path, &existing).await;
-        }
-    }
     let file = path.to_path_buf();
     let current = key_source(state.vault_key.clone());
-    let (saved, _) =
+    let (saved, previous) =
         blocking(move || accounts::save_account_while(&file, &key, Some(&current), input)).await?;
+    // An edit to another server or user drops the stored session (see
+    // `save_account`). Ended now with the token the save actually replaced,
+    // including one a concurrent sign-in stored a moment before.
     if saved.refresh_token.is_none() {
         state.server.remove(&saved.id).await;
+        if let Some(previous) = previous {
+            if let Some(token) = previous.refresh_token.as_deref() {
+                session::revoke(&previous, token).await;
+            }
+        }
     }
     Ok(saved.view())
 }
@@ -180,37 +177,47 @@ pub(crate) async fn list_connections_impl(
 /// Ends every stored session before a vault reset makes the accounts file
 /// unreadable. Best effort and bounded: an unreachable server must not hold up
 /// a reset, and sessions are dropped here regardless.
-pub(crate) async fn sign_out_all_best_effort(state: &AppState, path: &Path) {
-    sign_out_all_within(state, path, RESET_SIGN_OUT_TIMEOUT).await
+pub(crate) async fn reset_accounts(state: &AppState, path: &Path) -> Result<(), String> {
+    reset_accounts_within(state, path, RESET_SIGN_OUT_TIMEOUT).await
 }
 
 /// Each account gets `limit` of its own, all at once, so one unreachable server
 /// cannot use up the time every other account needed.
-async fn sign_out_all_within(state: &AppState, path: &Path, limit: Duration) {
+async fn reset_accounts_within(
+    state: &AppState,
+    path: &Path,
+    limit: Duration,
+) -> Result<(), String> {
     state.server.clear().await;
-    let Ok(key) = state.require_key() else {
-        return;
-    };
-    // Every token is taken out of the file in one locked step, so no session,
-    // here or in another instance, presents one again while it is revoked,
-    // which would trip the server's reuse check. No lock is held across the
-    // network calls below.
+    let key = state.require_key().ok();
+    // One locked step takes every stored token and removes the vault metadata
+    // and the accounts file. After it, nothing can present one of these tokens
+    // again while it is revoked (which would trip the server's reuse check),
+    // a sign-in still in flight finds its account gone and ends its own
+    // session, and a write from any process sees the vault gone and is refused.
+    // No lock is held across the network calls below.
     let file = path.to_path_buf();
     let taken = blocking(move || {
-        accounts::update(&file, &key, |all| {
-            Ok(all
-                .iter_mut()
-                .filter_map(|a| a.refresh_token.take().map(|token| (a.clone(), token)))
-                .collect::<Vec<_>>())
-        })
+        let _lock = accounts::lock(&file)?;
+        let taken: Vec<(ServerAccount, String)> = key
+            .and_then(|key| accounts::load(&file, &key).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|a| a.refresh_token.clone().map(|token| (a, token)))
+            .collect();
+        for p in [accounts::vault_meta_path(&file), file.clone()] {
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+            }
+        }
+        Ok(taken)
     })
-    .await;
-    if let Ok(taken) = taken {
-        let revokes = taken
-            .iter()
-            .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
-        futures::future::join_all(revokes).await;
-    }
+    .await?;
+    let revokes = taken
+        .iter()
+        .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
+    futures::future::join_all(revokes).await;
+    Ok(())
 }
 
 /// Ends an account's session on the server and here, best effort. Returns
@@ -239,7 +246,7 @@ async fn current_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::fake::{file_store, Env, EMAIL, KEY, PASSWORD, TENANT};
+    use crate::server::fake::{file_store, write_vault_meta, Env, EMAIL, KEY, PASSWORD, TENANT};
 
     fn unlocked() -> AppState {
         let state = AppState::new();
@@ -513,36 +520,31 @@ mod tests {
         });
     }
 
-    // An edit waiting on the old identity's sign-out can outlive a vault reset
-    // in another window. It must not then write the accounts file under the
-    // key the reset discarded: the new vault could not read its own accounts.
+    // An edit waiting on the accounts lock can be overtaken by a vault reset in
+    // another window, and a new vault set up under another key. It must not then
+    // write the accounts file under the key the reset discarded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_edit_that_outlives_a_vault_reset_writes_nothing() {
         let env = Env::new().await;
         let state = Arc::new(unlocked());
-        // Signing out then needs a refresh, which the fake holds for a while.
-        env.fake.with(|s| s.access_ttl_secs = -1);
-        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
-            .await
-            .unwrap();
-        env.fake.with(|s| {
-            s.access_ttl_secs = 3600;
-            s.refresh_delay = Duration::from_millis(400);
-        });
 
+        let held = accounts::lock(&env.path).unwrap();
         let editing = {
             let state = state.clone();
             let path = env.path.clone();
-            let moved = ServerAccountInput {
-                email: "dba@acme.test".to_string(),
+            let renamed = ServerAccountInput {
+                name: "Renamed".to_string(),
                 ..form(&env)
             };
-            tokio::spawn(async move { account_save_impl(&state, &path, moved).await })
+            tokio::spawn(async move { account_save_impl(&state, &path, renamed).await })
         };
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        // Another window resets the vault and sets up a new one.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The reset, under the lock, and a new vault with another key.
+        std::fs::remove_file(accounts::vault_meta_path(&env.path)).unwrap();
         std::fs::remove_file(&env.path).unwrap();
         *state.vault_key.lock().unwrap() = Some([9; 32]);
+        write_vault_meta(&env.path, &[9; 32]);
+        drop(held);
 
         let result = editing.await.unwrap();
         assert!(result.is_err(), "the edit went through: {result:?}");
@@ -627,7 +629,9 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        sign_out_all_within(&state, &env.path, Duration::from_millis(500)).await;
+        reset_accounts_within(&state, &env.path, Duration::from_millis(500))
+            .await
+            .unwrap();
         env.fake.with(|s| {
             assert_eq!(
                 s.live_families(),
@@ -642,6 +646,121 @@ mod tests {
         );
     }
 
+    // Another MQLens process reset the vault while this one still holds the old
+    // key. Writing the accounts file with that key would leave the new vault a
+    // file it cannot read.
+    #[tokio::test]
+    async fn account_writes_are_refused_once_another_process_reset_the_vault() {
+        let env = Env::new().await;
+        let state = unlocked();
+        let fresh = ServerAccountInput {
+            id: None,
+            name: "Second".to_string(),
+            ..form(&env)
+        };
+        std::fs::remove_file(env.path.with_file_name("vault.json")).unwrap();
+        std::fs::remove_file(&env.path).unwrap();
+
+        let err = account_save_impl(&state, &env.path, fresh.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("locked or reset"), "{err}");
+        assert!(account_delete_impl(&state, &env.path, &env.account.id)
+            .await
+            .is_err());
+        assert!(
+            !env.path.exists(),
+            "a write recreated the accounts file under the discarded key"
+        );
+
+        // The other process then set up a new vault, under another key.
+        write_vault_meta(&env.path, &[9; 32]);
+        assert!(account_save_impl(&state, &env.path, fresh).await.is_err());
+        assert!(!env.path.exists());
+    }
+
+    // A sign-in can land while a reset is revoking the stored sessions. It must
+    // not leave a session the reset never saw, live on the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sign_in_landing_during_a_reset_leaves_no_live_session() {
+        let env = Env::new().await;
+        let state = Arc::new(unlocked());
+        env.fake
+            .with(|s| s.login_delay = Duration::from_millis(300));
+        let signing_in = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let id = env.account.id.clone();
+            tokio::spawn(
+                async move { sign_in_impl(&state, &path, &id, PASSWORD.to_string()).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reset_accounts_within(&state, &env.path, Duration::from_millis(500))
+            .await
+            .unwrap();
+
+        let result = signing_in.await.unwrap();
+        assert!(
+            result.is_err(),
+            "the sign-in went through during the reset: {result:?}"
+        );
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the sign-in left a session the reset never ended"
+            )
+        });
+    }
+
+    // An edit to another identity drops the stored session. When a sign-in
+    // stored one just before the edit's write, that is the session to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_identity_edit_ends_a_session_stored_while_it_waited() {
+        let env = Env::new().await;
+        let state = Arc::new(unlocked());
+
+        let other = tempfile::tempdir().unwrap();
+        let other_path = other.path().join(accounts::ACCOUNTS_FILE_NAME);
+        std::fs::copy(&env.path, &other_path).unwrap();
+        if let Err(e) =
+            AccountSession::sign_in(&env.account, PASSWORD, file_store(&other_path)).await
+        {
+            panic!("sign in failed: {e}");
+        }
+        let token = accounts::find(&other_path, &KEY, &env.account.id)
+            .unwrap()
+            .refresh_token
+            .unwrap();
+
+        let held = accounts::lock(&env.path).unwrap();
+        let editing = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let moved = ServerAccountInput {
+                email: "dba@acme.test".to_string(),
+                ..form(&env)
+            };
+            tokio::spawn(async move { account_save_impl(&state, &path, moved).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut all = accounts::load(&env.path, &KEY).unwrap();
+        all[0].refresh_token = Some(token);
+        accounts::save(&env.path, &KEY, &all).unwrap();
+        drop(held);
+
+        let view = editing.await.unwrap().unwrap();
+        assert!(!view.signed_in);
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                0,
+                "the session the edit displaced is still live on the server"
+            )
+        });
+    }
+
     #[tokio::test]
     async fn a_vault_reset_ends_stored_sessions_first() {
         let env = Env::new().await;
@@ -650,12 +769,15 @@ mod tests {
             .await
             .unwrap();
 
-        sign_out_all_best_effort(&state, &env.path).await;
+        reset_accounts(&state, &env.path).await.unwrap();
         env.fake.with(|s| assert_eq!(s.live_families(), 0));
-        assert!(!account_list_impl(&state, &env.path).unwrap()[0].signed_in);
+        assert!(!env.path.exists());
+        assert!(!accounts::vault_meta_path(&env.path).exists());
 
-        // Locked, there is nothing it can read; it still drops live sessions.
+        // Locked, there is no key to read tokens with; the files still go.
         let locked = AppState::new();
-        sign_out_all_best_effort(&locked, &env.path).await;
+        write_vault_meta(&env.path, &KEY);
+        reset_accounts(&locked, &env.path).await.unwrap();
+        assert!(!accounts::vault_meta_path(&env.path).exists());
     }
 }

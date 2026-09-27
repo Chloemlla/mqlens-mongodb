@@ -3620,16 +3620,17 @@ async fn vault_reset(
     // a replacement vault would start with a log its new key cannot authenticate,
     // so auditing would be sealed from the first unlock. Abort instead.
     audit::reset_store(&app_handle, &state)?;
-    // The accounts file is about to become unreadable: end its sessions on their
-    // servers while the key still opens it. Bounded, so an unreachable server
-    // cannot hold up a reset.
+    // Removes vault.json and the MQLens Server accounts file together, under
+    // the accounts file's cross-process lock, and ends the stored server
+    // sessions (bounded, so an unreachable server cannot hold up a reset).
+    // Doing both under that lock keeps an account write from any MQLens
+    // process from recreating the accounts file under the discarded key.
     let server_accounts_path = connections::get_server_accounts_path(&app_handle);
-    server::commands::sign_out_all_best_effort(&state, &server_accounts_path).await;
+    server::commands::reset_accounts(&state, &server_accounts_path).await?;
     for p in [
         connections::get_vault_meta_path(&app_handle),
         connections::get_profiles_enc_path(&app_handle),
         connections::get_settings_enc_path(&app_handle),
-        server_accounts_path,
     ] {
         if p.exists() {
             std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
