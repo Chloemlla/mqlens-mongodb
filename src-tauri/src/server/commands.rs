@@ -174,9 +174,10 @@ pub(crate) async fn list_connections_impl(
         .collect())
 }
 
-/// Ends every stored session before a vault reset makes the accounts file
-/// unreadable. Best effort and bounded: an unreachable server must not hold up
-/// a reset, and sessions are dropped here regardless.
+/// The MQLens Server part of a vault reset: removes vault.json and the accounts
+/// file under the accounts lock, then ends every stored session in the
+/// background, each within its own time limit. Best effort: an unreachable
+/// server cannot hold up a reset, and sessions are dropped here regardless.
 pub(crate) async fn reset_accounts(state: &AppState, path: &Path) -> Result<(), String> {
     reset_accounts_within(state, path, RESET_SIGN_OUT_TIMEOUT).await
 }
@@ -213,10 +214,16 @@ async fn reset_accounts_within(
         Ok(taken)
     })
     .await?;
-    let revokes = taken
-        .iter()
-        .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
-    futures::future::join_all(revokes).await;
+    // Ended in the background, so the reset goes on at once. Waiting here would
+    // leave the vault half removed, vault.json gone and its other files still
+    // there, for as long as the slowest server: another window could set up a
+    // new vault in that gap and lose it to the rest of the reset.
+    tokio::spawn(async move {
+        let revokes = taken
+            .iter()
+            .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
+        futures::future::join_all(revokes).await;
+    });
     Ok(())
 }
 
@@ -247,6 +254,18 @@ async fn current_session(
 mod tests {
     use super::*;
     use crate::server::fake::{file_store, write_vault_meta, Env, EMAIL, KEY, PASSWORD, TENANT};
+
+    /// Whether every session on the fake server has ended within `limit`.
+    async fn wait_until_no_live_sessions(env: &Env, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if env.fake.with(|s| s.live_families()) == 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
 
     fn unlocked() -> AppState {
         let state = AppState::new();
@@ -632,13 +651,10 @@ mod tests {
         reset_accounts_within(&state, &env.path, Duration::from_millis(500))
             .await
             .unwrap();
-        env.fake.with(|s| {
-            assert_eq!(
-                s.live_families(),
-                0,
-                "the reachable server's session was never ended"
-            )
-        });
+        assert!(
+            wait_until_no_live_sessions(&env, Duration::from_secs(3)).await,
+            "the reachable server's session was never ended"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -761,6 +777,56 @@ mod tests {
         });
     }
 
+    // The reset step removes vault.json. If it then waited on servers, the vault
+    // would look uninitialized for that long while its other files were still
+    // there, and another window could set up a new vault in the gap only for
+    // the rest of the reset to delete it. The step must hand the revocations
+    // off and return at once; they still reach every server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_reset_step_returns_without_waiting_on_servers() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_url = format!("http://{}", hung.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = hung.accept().await {
+                held.push(socket);
+            }
+        });
+        accounts::update(&env.path, &KEY, |all| {
+            let mut stuck = ServerAccountInput {
+                id: None,
+                name: "Hung".to_string(),
+                url: hung_url,
+                tenant: TENANT.to_string(),
+                email: EMAIL.to_string(),
+                allow_insecure_http: false,
+                extra_ca_pem: None,
+            }
+            .into_account()?;
+            stuck.refresh_token = Some("refresh-for-the-hung-server".to_string());
+            all.insert(0, stuck);
+            Ok(())
+        })
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        reset_accounts_within(&state, &env.path, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the reset step waited {:?} on servers",
+            started.elapsed()
+        );
+        assert!(!env.path.exists());
+        assert!(wait_until_no_live_sessions(&env, Duration::from_secs(3)).await);
+    }
+
     #[tokio::test]
     async fn a_vault_reset_ends_stored_sessions_first() {
         let env = Env::new().await;
@@ -770,7 +836,7 @@ mod tests {
             .unwrap();
 
         reset_accounts(&state, &env.path).await.unwrap();
-        env.fake.with(|s| assert_eq!(s.live_families(), 0));
+        assert!(wait_until_no_live_sessions(&env, Duration::from_secs(3)).await);
         assert!(!env.path.exists());
         assert!(!accounts::vault_meta_path(&env.path).exists());
 

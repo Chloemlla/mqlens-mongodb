@@ -3621,10 +3621,10 @@ async fn vault_reset(
     // so auditing would be sealed from the first unlock. Abort instead.
     audit::reset_store(&app_handle, &state)?;
     // Removes vault.json and the MQLens Server accounts file together, under
-    // the accounts file's cross-process lock, and ends the stored server
-    // sessions (bounded, so an unreachable server cannot hold up a reset).
-    // Doing both under that lock keeps an account write from any MQLens
-    // process from recreating the accounts file under the discarded key.
+    // the accounts file's cross-process lock, so an account write from any
+    // MQLens process cannot recreate the accounts file under the discarded
+    // key. The stored server sessions are ended in the background: the reset
+    // does not wait on servers between removing vault.json and the rest.
     let server_accounts_path = connections::get_server_accounts_path(&app_handle);
     server::commands::reset_accounts(&state, &server_accounts_path).await?;
     for p in [
