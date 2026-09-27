@@ -7467,3 +7467,51 @@ mod change_stream_tests {
     }
 }
 
+
+#[cfg(test)]
+mod vault_reset_tests {
+    use crate::server::fake::{Env, KEY, PASSWORD};
+    use crate::AppState;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // A reset waits on servers to end the stored sessions. The key it discards
+    // must be gone by then: a window saving a profile or the settings meanwhile
+    // would recreate those files under that key, and the next vault could not
+    // read them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vault_reset_drops_the_key_before_waiting_on_servers() {
+        let env = Env::new().await;
+        let state = Arc::new(AppState::new());
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        crate::server::commands::sign_in_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            PASSWORD.to_string(),
+        )
+        .await
+        .unwrap();
+        env.fake
+            .with(|s| s.logout_delay = Duration::from_millis(800));
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [
+            crate::server::accounts::vault_meta_path(&env.path),
+            dir.join("profiles.json.enc"),
+            dir.join("settings.json.enc"),
+        ];
+
+        let resetting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            tokio::spawn(async move { crate::reset_vault_files(&state, &path, files).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            state.require_key().is_err(),
+            "the discarded key was still usable while the reset waited on servers"
+        );
+        resetting.await.unwrap().unwrap();
+        env.fake.with(|s| assert_eq!(s.live_families(), 0));
+    }
+}

@@ -433,7 +433,15 @@ impl AccountSession {
                 .clone()
                 .filter(|_| tokens.expires_at > unix_now());
             ended_on_server = match live_access {
-                Some(access) => logout(&self.channel, &access, &refresh).await.is_ok(),
+                Some(access) => match logout(&self.channel, &access, &refresh).await {
+                    Ok(()) => true,
+                    // The access token lapsed or was refused on the way; the
+                    // refresh token, about to be dropped, can still end it.
+                    Err(status) if errors::is_unauthenticated(&status) => {
+                        logout_with_refresh_token(&self.channel, &refresh).await
+                    }
+                    Err(_) => false,
+                },
                 None => logout_with_refresh_token(&self.channel, &refresh).await,
             };
         }
@@ -870,6 +878,20 @@ mod tests {
         assert_eq!(env.stored_token(), Some(stored));
 
         list_connections(&session).await.unwrap();
+    }
+
+    // The access token can lapse, or be refused, between choosing it and the
+    // logout. The stored refresh token is the only way left to end the
+    // session, so it must be used before it is dropped.
+    #[tokio::test]
+    async fn signing_out_with_a_refused_access_token_still_ends_the_session() {
+        let env = Env::new().await;
+        let session = signed_in(&env).await;
+        env.fake.revoke_access_tokens();
+
+        assert!(session.sign_out().await.unwrap());
+        assert_eq!(env.stored_token(), None);
+        env.fake.with(|s| assert_eq!(s.live_families(), 0));
     }
 
     #[tokio::test]

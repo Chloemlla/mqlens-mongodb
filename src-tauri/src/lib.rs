@@ -3620,33 +3620,50 @@ async fn vault_reset(
     // a replacement vault would start with a log its new key cannot authenticate,
     // so auditing would be sealed from the first unlock. Abort instead.
     audit::reset_store(&app_handle, &state)?;
-    // Removes vault.json and the MQLens Server accounts file together, under
-    // the accounts file's cross-process lock, so an account write from any
-    // MQLens process cannot recreate the accounts file under the discarded
-    // key. The stored server sessions are ended once the other vault files are
-    // gone, so the reset never waits on servers with the vault half removed.
-    let server_accounts_path = connections::get_server_accounts_path(&app_handle);
-    let sign_outs = server::commands::reset_accounts(&state, &server_accounts_path).await?;
-    let removed = [
-        connections::get_vault_meta_path(&app_handle),
-        connections::get_profiles_enc_path(&app_handle),
-        connections::get_settings_enc_path(&app_handle),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .try_for_each(|p| {
-        std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
-    });
-    // Their tokens are already deleted: these sessions are ended now or never,
-    // whether or not the rest of the reset went through.
-    sign_outs.finish().await;
-    removed?;
-    *state.vault_key.lock_safe()? = None;
-    // Same precondition as `vault_lock`: no key means no MCP server.
-    mcp::stop_if_running(&state).await?;
+    reset_vault_files(
+        &state,
+        &connections::get_server_accounts_path(&app_handle),
+        [
+            connections::get_vault_meta_path(&app_handle),
+            connections::get_profiles_enc_path(&app_handle),
+            connections::get_settings_enc_path(&app_handle),
+        ],
+    )
+    .await?;
     // A reset invalidates the old key; forget any biometric copy too.
     let _ = biometric::remove_stored_key(&app_handle);
     Ok(())
+}
+
+/// The file part of `vault_reset`: removes the MQLens Server accounts file and
+/// `files` (vault.json and the other vault files), drops the key, and only
+/// then ends the stored server sessions.
+async fn reset_vault_files(
+    state: &AppState,
+    server_accounts_path: &std::path::Path,
+    files: [std::path::PathBuf; 3],
+) -> Result<(), String> {
+    // Removes vault.json and the MQLens Server accounts file together, under
+    // the accounts file's cross-process lock, so an account write from any
+    // MQLens process cannot recreate the accounts file under the discarded
+    // key. The stored server sessions are ended last, once the other vault
+    // files and the key are gone: the reset never waits on servers with the
+    // vault half removed, or with the discarded key still able to write
+    // profiles or settings.
+    let sign_outs = server::commands::reset_accounts(state, server_accounts_path).await?;
+    let rest = async {
+        files.into_iter().filter(|p| p.exists()).try_for_each(|p| {
+            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
+        })?;
+        *state.vault_key.lock_safe()? = None;
+        // Same precondition as `vault_lock`: no key means no MCP server.
+        mcp::stop_if_running(state).await
+    }
+    .await;
+    // Their tokens are already deleted: these sessions are ended now or never,
+    // whether or not the rest of the reset went through.
+    sign_outs.finish().await;
+    rest
 }
 
 #[tauri::command]
