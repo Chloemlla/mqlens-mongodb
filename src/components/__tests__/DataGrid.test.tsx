@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import React from 'react';
 import { render, screen, fireEvent, within, cleanup } from '@testing-library/react';
+import { ObjectId } from 'bson';
 
 // Monaco renders the Query Code panel; mock it as a plain textarea (same shape
 // as the other component tests) so assertions can read the generated code.
@@ -208,6 +209,27 @@ describe('DataGrid Component', () => {
     expect(screen.getAllByText('ObjectId').length).toBeGreaterThan(0);
     expect(screen.getAllByText('ISODate').length).toBeGreaterThan(0);
     expect(screen.getAllByText('NumberDecimal').length).toBeGreaterThan(0);
+  });
+
+  it('shows ObjectId timestamps and persists the Date timezone display preference', () => {
+    localStorage.removeItem('mqlens.dateDisplayTimezone');
+    render(<DataGrid documents={[{
+      _id: { $oid: '603d779f4f102e3a185c3220' },
+      created_at: { $date: '2025-05-18T14:32:00Z' },
+    }]} />);
+
+    expect(screen.getByText('ObjectId').parentElement).toHaveAttribute(
+      'title',
+      new ObjectId('603d779f4f102e3a185c3220').getTimestamp().toISOString(),
+    );
+    expect(screen.getByText('"2025-05-18T14:32:00.000Z"')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('date-timezone-toggle'));
+
+    expect(screen.getByTestId('date-timezone-toggle')).toHaveTextContent('Local');
+    expect(localStorage.getItem('mqlens.dateDisplayTimezone')).toBe('local');
+    expect(screen.queryByText('"2025-05-18T14:32:00.000Z"')).not.toBeInTheDocument();
+    localStorage.removeItem('mqlens.dateDisplayTimezone');
   });
 
   it('switches back to results tab automatically when documents list changes', () => {
