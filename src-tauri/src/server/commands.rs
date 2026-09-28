@@ -19,6 +19,13 @@ use zeroize::Zeroizing;
 /// How long a vault reset waits for its sessions to end on their servers.
 const RESET_SIGN_OUT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountDeleteResult {
+    pub deleted: bool,
+    pub session_revoked: Option<bool>,
+}
+
 /// One of the server's connections as the webview sees it: a reference, never
 /// a connection string or credential, and what the user may do there.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -70,22 +77,30 @@ pub(crate) async fn account_save_impl(
     // An edit to another server or user drops the stored session (see
     // `save_account`). Ended now with the token the save actually replaced,
     // including one a concurrent sign-in stored a moment before.
+    let mut warning = None;
     if saved.refresh_token.is_none() {
         state.server.remove(&saved.id).await;
         if let Some(previous) = previous {
             if let Some(token) = previous.refresh_token.as_deref() {
-                session::revoke(&previous, token).await;
+                if !session::revoke(&previous, token).await {
+                    warning = Some(
+                        "The previous server session could not be revoked and may still be active."
+                            .to_string(),
+                    );
+                }
             }
         }
     }
-    Ok(saved.view())
+    let mut view = saved.view();
+    view.warning = warning;
+    Ok(view)
 }
 
 pub(crate) async fn account_delete_impl(
     state: &AppState,
     path: &Path,
     account_id: &str,
-) -> Result<(), String> {
+) -> Result<AccountDeleteResult, String> {
     let key = state.require_key()?;
     // Removed first, under the file lock, so the session ended below is exactly
     // the one stored at that moment, including one a sign-in stored just before.
@@ -96,12 +111,13 @@ pub(crate) async fn account_delete_impl(
     let removed =
         blocking(move || accounts::delete_account_while(&file, &key, Some(&current), &id)).await?;
     state.server.remove(account_id).await;
-    if let Some(account) = removed {
+    let mut session_revoked = None;
+    if let Some(account) = &removed {
         if let Some(token) = account.refresh_token.as_deref() {
-            session::revoke(&account, token).await;
+            session_revoked = Some(session::revoke(account, token).await);
         }
     }
-    Ok(())
+    Ok(AccountDeleteResult { deleted: removed.is_some(), session_revoked })
 }
 
 pub(crate) async fn sign_in_impl(
@@ -144,6 +160,7 @@ pub(crate) async fn sign_in_impl(
     }
     let mut view = account.view();
     view.signed_in = true;
+    view.warning = session.displaced_session_warning().map(str::to_string);
     Ok(view)
 }
 
@@ -449,6 +466,27 @@ mod tests {
         list_connections_impl(&state, &env.path, id).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn signing_in_again_reports_when_the_previous_session_cannot_be_revoked() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake.with(|s| s.refresh_failures.push(tonic::Code::Unavailable));
+
+        let view = sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+
+        assert!(view.signed_in);
+        assert!(view
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("previous server session")));
+        env.fake.with(|s| assert_eq!(s.live_families(), 2));
+    }
+
     // A mistyped password, or a login that fails, must not cost the user the
     // session they already have: it is replaced only once a new one exists.
     #[tokio::test]
@@ -570,11 +608,35 @@ mod tests {
             .await
             .unwrap();
 
-        account_delete_impl(&state, &env.path, id).await.unwrap();
+        let result = account_delete_impl(&state, &env.path, id).await.unwrap();
+        assert!(result.deleted);
+        assert_eq!(result.session_revoked, Some(true));
         assert!(account_list_impl(&state, &env.path).unwrap().is_empty());
         env.fake.with(|s| assert_eq!(s.live_families(), 0));
         // Deleting what is already gone is fine.
-        account_delete_impl(&state, &env.path, id).await.unwrap();
+        assert!(!account_delete_impl(&state, &env.path, id)
+            .await
+            .unwrap()
+            .deleted);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_account_reports_when_its_session_cannot_be_revoked() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake.with(|s| s.refresh_failures.push(tonic::Code::Unavailable));
+
+        let result = account_delete_impl(&state, &env.path, &env.account.id)
+            .await
+            .unwrap();
+
+        assert!(result.deleted);
+        assert_eq!(result.session_revoked, Some(false));
+        assert!(account_list_impl(&state, &env.path).unwrap().is_empty());
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
     #[tokio::test]

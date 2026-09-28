@@ -105,6 +105,7 @@ impl ServerAccount {
             allow_insecure_http: self.allow_insecure_http,
             extra_ca_pem: self.extra_ca_pem.clone(),
             signed_in: self.refresh_token.is_some(),
+            warning: None,
         }
     }
 }
@@ -121,6 +122,8 @@ pub(crate) struct ServerAccountView {
     pub allow_insecure_http: bool,
     pub extra_ca_pem: Option<String>,
     pub signed_in: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// An account as the form submits it. `id` is absent for a new account.

@@ -157,6 +157,7 @@ pub(crate) struct AccountSession {
     store: Arc<dyn TokenStore>,
     tokens: tokio::sync::Mutex<Tokens>,
     ended: AtomicBool,
+    displaced_session_warning: Option<String>,
 }
 
 impl AccountSession {
@@ -170,6 +171,7 @@ impl AccountSession {
             store,
             tokens: tokio::sync::Mutex::new(Tokens::default()),
             ended: AtomicBool::new(false),
+            displaced_session_warning: None,
         })
     }
 
@@ -187,6 +189,10 @@ impl AccountSession {
     /// stored token was refused or could not be kept.
     pub(crate) fn is_ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn displaced_session_warning(&self) -> Option<&str> {
+        self.displaced_session_warning.as_deref()
     }
 
     pub(crate) async fn principal(&self) -> Option<Principal> {
@@ -215,7 +221,7 @@ impl AccountSession {
         if password.is_empty() {
             return Err("Enter your MQLens Server password".to_string());
         }
-        let session = Self::new(account, store)?;
+        let mut session = Self::new(account, store)?;
 
         let mut request = Request::new(LoginRequest {
             tenant: account.tenant.clone(),
@@ -244,7 +250,12 @@ impl AccountSession {
         match stored {
             Ok(Some(displaced)) => {
                 // A concurrent sign-in stored first; its session is ours to end.
-                let _ = logout_with_refresh_token(&session.channel, &displaced).await;
+                if !logout_with_refresh_token(&session.channel, &displaced).await {
+                    session.displaced_session_warning = Some(
+                        "A previous server session could not be revoked and may still be active."
+                            .to_string(),
+                    );
+                }
             }
             Ok(None) => {}
             Err(e) => {

@@ -3347,7 +3347,7 @@ async fn server_account_delete(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     id: String,
-) -> Result<(), String> {
+) -> Result<server::commands::AccountDeleteResult, String> {
     let started = Instant::now();
     let path = connections::get_server_accounts_path(&app_handle);
     let result = server::commands::account_delete_impl(&state, &path, &id).await;
