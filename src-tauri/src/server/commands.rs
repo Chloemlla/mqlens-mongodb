@@ -588,7 +588,13 @@ mod tests {
                 sign_in_impl(&state, &path, &id, PASSWORD.to_string()).await
             })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while env.fake.with(|s| s.login_starts == 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sign-in did not reach the server");
 
         let lock_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiting_for_lock = {

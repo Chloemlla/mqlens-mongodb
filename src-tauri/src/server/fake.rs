@@ -65,6 +65,7 @@ pub(crate) struct FakeState {
     pub logouts: u32,
     pub reuse_detected: u32,
     pub list_calls: u32,
+    pub login_starts: u32,
 }
 
 impl FakeState {
@@ -171,6 +172,7 @@ impl Fake {
                 logouts: 0,
                 reuse_detected: 0,
                 list_calls: 0,
+                login_starts: 0,
             })),
         }
     }
@@ -212,7 +214,10 @@ impl AuthService for Fake {
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
-        let delay = self.with(|s| s.login_delay);
+        let delay = self.with(|s| {
+            s.login_starts += 1;
+            s.login_delay
+        });
         tokio::time::sleep(delay).await;
         let message = request.into_inner();
         let mut state = self.state.lock().unwrap();
