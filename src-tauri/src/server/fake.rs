@@ -57,6 +57,8 @@ pub(crate) struct FakeState {
     pub logout_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
     pub refresh_failures: Vec<Code>,
+    /// Refresh RPCs that have started, including ones still waiting on delay.
+    pub refresh_starts: u32,
     /// Codes the next logouts fail with, before ending the session.
     pub logout_failures: Vec<Code>,
     pub connections: Vec<ConnectionRef>,
@@ -159,6 +161,7 @@ impl Fake {
                 list_delay: Duration::ZERO,
                 logout_delay: Duration::ZERO,
                 refresh_failures: Vec::new(),
+                refresh_starts: 0,
                 logout_failures: Vec::new(),
                 connections: vec![ConnectionRef {
                     id: "c1".to_string(),
@@ -240,7 +243,10 @@ impl AuthService for Fake {
         &self,
         request: Request<RefreshRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
-        let delay = self.with(|s| s.refresh_delay);
+        let delay = self.with(|s| {
+            s.refresh_starts += 1;
+            s.refresh_delay
+        });
         tokio::time::sleep(delay).await;
 
         let token = request.into_inner().refresh_token;

@@ -96,17 +96,51 @@ pub(crate) type KeySource = Arc<dyn Fn() -> Result<[u8; 32], String> + Send + Sy
 pub(crate) struct FileTokenStore {
     path: PathBuf,
     key: KeySource,
+    vault_operation_lock_held: Option<Arc<AtomicBool>>,
 }
 
 impl FileTokenStore {
     pub(crate) fn new(path: PathBuf, key: KeySource) -> Self {
-        Self { path, key }
+        Self {
+            path,
+            key,
+            vault_operation_lock_held: None,
+        }
+    }
+
+    /// The caller already holds `vault-operation.lock` for the full sign-in
+    /// transaction, through its final check in `sign_in_impl`.
+    pub(crate) fn new_with_vault_operation_lock_held(
+        path: PathBuf,
+        key: KeySource,
+        vault_operation_lock_held: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            path,
+            key,
+            vault_operation_lock_held: Some(vault_operation_lock_held),
+        }
     }
 }
 
 impl TokenStore for FileTokenStore {
     fn lock(&self) -> Result<Box<dyn Send>, String> {
-        Ok(Box::new(accounts::lock(&self.path)?))
+        // Match the lifecycle-before-file lock order used by reset and vault
+        // rotation, so vault_lock cannot clear the key midway through token
+        // rotation and leave only a spent refresh token on disk.
+        let vault_lock_is_held = self
+            .vault_operation_lock_held
+            .as_ref()
+            .is_some_and(|held| held.load(Ordering::SeqCst));
+        let vault_lock = if vault_lock_is_held {
+            None
+        } else {
+            Some(crate::connections::lock_vault_for_write(
+                &accounts::vault_meta_path(&self.path),
+            )?)
+        };
+        let accounts_lock = accounts::lock(&self.path)?;
+        Ok(Box::new((vault_lock, accounts_lock)))
     }
 
     fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String> {
@@ -771,6 +805,54 @@ mod tests {
             assert_eq!(s.refreshes, 1);
             assert_eq!(s.reuse_detected, 0);
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vault_lock_waits_for_refresh_to_finish_rotating_its_token() {
+        let env = Env::new().await;
+        let session = signed_in(&env).await;
+        let previous = env.stored_token().unwrap();
+        env.fake.revoke_access_tokens();
+        env.fake
+            .with(|s| s.refresh_delay = Duration::from_millis(300));
+
+        let refreshing = {
+            let session = session.clone();
+            tokio::spawn(async move { list_connections(&session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while env.fake.with(|s| s.refresh_starts == 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh did not reach the server");
+
+        let lock_acquired = Arc::new(AtomicBool::new(false));
+        let waiting_for_lock = {
+            let meta_path = accounts::vault_meta_path(&env.path);
+            let lock_acquired = lock_acquired.clone();
+            tokio::spawn(async move {
+                let lock = blocking(move || {
+                    crate::connections::lock_vault_for_write(&meta_path)
+                })
+                .await
+                .unwrap();
+                lock_acquired.store(true, Ordering::SeqCst);
+                lock
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !lock_acquired.load(Ordering::SeqCst),
+            "vault lock passed a refresh before its successor was stored"
+        );
+
+        refreshing.await.unwrap().unwrap();
+        let vault_lock = waiting_for_lock.await.unwrap();
+        drop(vault_lock);
+        assert_ne!(env.stored_token().as_deref(), Some(previous.as_str()));
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

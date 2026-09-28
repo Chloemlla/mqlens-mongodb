@@ -12,6 +12,7 @@ use crate::server::session::{self, blocking, AccountSession, FileTokenStore, Tok
 use crate::AppState;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -50,6 +51,18 @@ fn token_store(state: &AppState, path: &Path) -> Arc<dyn TokenStore> {
     Arc::new(FileTokenStore::new(
         path.to_path_buf(),
         key_source(state.vault_key.clone()),
+    ))
+}
+
+fn token_store_with_vault_operation_lock_held(
+    state: &AppState,
+    path: &Path,
+    vault_operation_lock_held: Arc<AtomicBool>,
+) -> Arc<dyn TokenStore> {
+    Arc::new(FileTokenStore::new_with_vault_operation_lock_held(
+        path.to_path_buf(),
+        key_source(state.vault_key.clone()),
+        vault_operation_lock_held,
     ))
 }
 
@@ -132,24 +145,37 @@ pub(crate) async fn sign_in_impl(
     let meta_path = accounts::vault_meta_path(path);
     let _vault_lock =
         blocking(move || crate::connections::lock_vault_for_write(&meta_path)).await?;
+    let vault_operation_lock_held = Arc::new(AtomicBool::new(true));
     let password = Zeroizing::new(password);
     let key = state.require_key()?;
     let account = accounts::find(path, &key, account_id)?;
     // A session already stored stays until the new one replaces it, so a
     // mistyped password or a failed login leaves the user signed in.
     // `AccountSession::sign_in` ends the session it displaces on the server.
-    let session = AccountSession::sign_in(&account, &password, token_store(state, path)).await?;
+    let session = AccountSession::sign_in(
+        &account,
+        &password,
+        token_store_with_vault_operation_lock_held(
+            state,
+            path,
+            vault_operation_lock_held.clone(),
+        ),
+    )
+    .await?;
     state.server.insert(session.clone()).await;
     // The vault may have locked while the server answered; a session must not
     // be left behind for a locked vault.
     if state.require_key().is_err() {
+        vault_operation_lock_held.store(false, Ordering::SeqCst);
         state.server.remove(account_id).await;
         return Err("vault is locked".to_string());
     }
     // Checked once the session is in the runtime, where a later sign-out or
     // delete finds it: one that came first, while this sign-in was still
     // ending the session it displaced, already ended this one.
-    match session.stored_token_is_ours().await {
+    let stored_token_is_ours = session.stored_token_is_ours().await;
+    vault_operation_lock_held.store(false, Ordering::SeqCst);
+    match stored_token_is_ours {
         Some(true) => {}
         // A concurrent sign-in stored its own and ended this one. The account
         // is signed in with that session, resumed from the store on next use.
