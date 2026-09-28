@@ -67,6 +67,10 @@ pub(crate) trait TokenStore: Send + Sync + 'static {
     /// Blocks until the caller holds the store's cross-process lock; released
     /// when the returned guard drops. Not re-entrant.
     fn lock(&self) -> Result<Box<dyn Send>, String>;
+    /// Locks the store when the caller already holds `vault-operation.lock`.
+    /// Only use this for the current operation while that outer guard is held;
+    /// the returned guard must still protect the token file itself.
+    fn lock_with_vault_operation_lock_held(&self) -> Result<Box<dyn Send>, String>;
     /// The stored refresh token. The caller holds the lock.
     fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String>;
     /// Replaces the stored refresh token. The caller holds the lock.
@@ -96,30 +100,11 @@ pub(crate) type KeySource = Arc<dyn Fn() -> Result<[u8; 32], String> + Send + Sy
 pub(crate) struct FileTokenStore {
     path: PathBuf,
     key: KeySource,
-    vault_operation_lock_held: Option<Arc<AtomicBool>>,
 }
 
 impl FileTokenStore {
     pub(crate) fn new(path: PathBuf, key: KeySource) -> Self {
-        Self {
-            path,
-            key,
-            vault_operation_lock_held: None,
-        }
-    }
-
-    /// The caller already holds `vault-operation.lock` for the full sign-in
-    /// transaction, through its final check in `sign_in_impl`.
-    pub(crate) fn new_with_vault_operation_lock_held(
-        path: PathBuf,
-        key: KeySource,
-        vault_operation_lock_held: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            path,
-            key,
-            vault_operation_lock_held: Some(vault_operation_lock_held),
-        }
+        Self { path, key }
     }
 }
 
@@ -128,19 +113,15 @@ impl TokenStore for FileTokenStore {
         // Match the lifecycle-before-file lock order used by reset and vault
         // rotation, so vault_lock cannot clear the key midway through token
         // rotation and leave only a spent refresh token on disk.
-        let vault_lock_is_held = self
-            .vault_operation_lock_held
-            .as_ref()
-            .is_some_and(|held| held.load(Ordering::SeqCst));
-        let vault_lock = if vault_lock_is_held {
-            None
-        } else {
-            Some(crate::connections::lock_vault_for_write(
-                &accounts::vault_meta_path(&self.path),
-            )?)
-        };
+        let vault_lock = crate::connections::lock_vault_for_write(
+            &accounts::vault_meta_path(&self.path),
+        )?;
         let accounts_lock = accounts::lock(&self.path)?;
         Ok(Box::new((vault_lock, accounts_lock)))
+    }
+
+    fn lock_with_vault_operation_lock_held(&self) -> Result<Box<dyn Send>, String> {
+        Ok(Box::new(accounts::lock(&self.path)?))
     }
 
     fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String> {
@@ -249,6 +230,26 @@ impl AccountSession {
         password: &str,
         store: Arc<dyn TokenStore>,
     ) -> Result<Arc<Self>, String> {
+        Self::sign_in_impl(account, password, store, false).await
+    }
+
+    /// Signs in while the caller holds `vault-operation.lock` across the
+    /// login and token commit. Only the commit's file-lock acquisition uses
+    /// that fact; the returned session continues to use normal lifecycle locks.
+    pub(crate) async fn sign_in_with_vault_operation_lock_held(
+        account: &ServerAccount,
+        password: &str,
+        store: Arc<dyn TokenStore>,
+    ) -> Result<Arc<Self>, String> {
+        Self::sign_in_impl(account, password, store, true).await
+    }
+
+    async fn sign_in_impl(
+        account: &ServerAccount,
+        password: &str,
+        store: Arc<dyn TokenStore>,
+        vault_operation_lock_held: bool,
+    ) -> Result<Arc<Self>, String> {
         if account.auth != AuthMethod::Password {
             return Err("This MQLens Server account does not sign in with a password".to_string());
         }
@@ -276,7 +277,11 @@ impl AccountSession {
             let who = session.account.clone();
             let refresh = Zeroizing::new(login.refresh_token.clone());
             blocking(move || {
-                let _lock = store.lock()?;
+                let _lock = if vault_operation_lock_held {
+                    store.lock_with_vault_operation_lock_held()?
+                } else {
+                    store.lock()?
+                };
                 store.replace(&who, &refresh)
             })
             .await
@@ -314,12 +319,15 @@ impl AccountSession {
     /// session last stored, or `None` if none is stored any more: another
     /// window or process signed out, deleted the account or changed who it
     /// signs in as. `Some(false)` means another sign-in stored its own.
-    pub(crate) async fn stored_token_is_ours(&self) -> Option<bool> {
+    /// Checks the stored token while the caller holds `vault-operation.lock`.
+    pub(crate) async fn stored_token_is_ours_with_vault_operation_lock_held(
+        &self,
+    ) -> Option<bool> {
         let ours = self.tokens.lock().await.refresh.clone();
         let store = self.store.clone();
         let who = self.account.clone();
         blocking(move || {
-            let _lock = store.lock()?;
+            let _lock = store.lock_with_vault_operation_lock_held()?;
             store.read(&who)
         })
         .await
@@ -810,7 +818,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn vault_lock_waits_for_refresh_to_finish_rotating_its_token() {
         let env = Env::new().await;
-        let session = signed_in(&env).await;
+        let meta_path = accounts::vault_meta_path(&env.path);
+        let vault_lock = blocking(move || crate::connections::lock_vault_for_write(&meta_path))
+            .await
+            .unwrap();
+        let session = AccountSession::sign_in_with_vault_operation_lock_held(
+            &env.account,
+            PASSWORD,
+            env.store(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .stored_token_is_ours_with_vault_operation_lock_held()
+                .await,
+            Some(true)
+        );
+        drop(vault_lock);
         let previous = env.stored_token().unwrap();
         env.fake.revoke_access_tokens();
         env.fake
@@ -1157,6 +1182,9 @@ mod tests {
     impl TokenStore for FailingWrites {
         fn lock(&self) -> Result<Box<dyn Send>, String> {
             self.inner.lock()
+        }
+        fn lock_with_vault_operation_lock_held(&self) -> Result<Box<dyn Send>, String> {
+            self.inner.lock_with_vault_operation_lock_held()
         }
         fn read(&self, account: &ServerAccount) -> Result<Option<Zeroizing<String>>, String> {
             self.inner.read(account)
