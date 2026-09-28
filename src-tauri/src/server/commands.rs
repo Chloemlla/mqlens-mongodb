@@ -196,7 +196,9 @@ pub(crate) async fn list_connections_impl(
 /// the vault key being discarded, taken by the caller before anything waits,
 /// or `None` when the vault is locked and the tokens cannot be read. A locked
 /// reset is rejected while the accounts file exists, because deleting it
-/// would discard the only credentials that can revoke those sessions.
+/// would discard the only credentials that can revoke those sessions. The
+/// forgotten-password recovery path may explicitly opt into that loss after
+/// warning the user.
 /// `other_files` are the vault's other files, removed first under the same
 /// lock.
 pub(crate) async fn reset_accounts(
@@ -205,7 +207,25 @@ pub(crate) async fn reset_accounts(
     key: Option<[u8; 32]>,
     other_files: Vec<std::path::PathBuf>,
 ) -> Result<PendingSignOuts, String> {
-    reset_accounts_within(state, path, key, other_files, RESET_SIGN_OUT_TIMEOUT).await
+    reset_accounts_with_policy(state, path, key, other_files, false).await
+}
+
+pub(crate) async fn reset_accounts_with_policy(
+    state: &AppState,
+    path: &Path,
+    key: Option<[u8; 32]>,
+    other_files: Vec<std::path::PathBuf>,
+    allow_unrevoked_server_sessions: bool,
+) -> Result<PendingSignOuts, String> {
+    reset_accounts_within(
+        state,
+        path,
+        key,
+        other_files,
+        allow_unrevoked_server_sessions,
+        RESET_SIGN_OUT_TIMEOUT,
+    )
+    .await
 }
 
 /// Sessions a vault reset took out of the accounts file and has yet to end on
@@ -246,6 +266,7 @@ async fn reset_accounts_within(
     path: &Path,
     key: Option<[u8; 32]>,
     other_files: Vec<std::path::PathBuf>,
+    allow_unrevoked_server_sessions: bool,
     limit: Duration,
 ) -> Result<PendingSignOuts, String> {
     state.server.clear().await;
@@ -261,7 +282,7 @@ async fn reset_accounts_within(
     let file = path.to_path_buf();
     let (taken, failed) = blocking(move || {
         let _lock = accounts::lock(&file)?;
-        if key.is_none() && file.exists() {
+        if key.is_none() && file.exists() && !allow_unrevoked_server_sessions {
             return Err("Unlock the vault before resetting its MQLens Server accounts.".to_string());
         }
         // The key was captured before this lock was free. A password change
@@ -769,6 +790,7 @@ mod tests {
             &env.path,
             Some(KEY),
             Vec::new(),
+            false,
             Duration::from_millis(500),
         )
         .await
@@ -845,6 +867,7 @@ mod tests {
             &env.path,
             Some(KEY),
             Vec::new(),
+            false,
             Duration::from_millis(500),
         )
         .await
@@ -957,6 +980,7 @@ mod tests {
             &env.path,
             Some(KEY),
             Vec::new(),
+            false,
             Duration::from_secs(3),
         )
         .await

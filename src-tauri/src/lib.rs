@@ -3712,14 +3712,16 @@ async fn vault_lock(
 async fn vault_reset(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    allow_unrevoked_server_sessions: bool,
 ) -> Result<(), String> {
-    reset_vault_files(
+    reset_vault_files_with_policy(
         &state,
         &connections::get_server_accounts_path(&app_handle),
         [
             connections::get_profiles_enc_path(&app_handle),
             connections::get_settings_enc_path(&app_handle),
         ],
+        allow_unrevoked_server_sessions,
         || audit::reset_store(&app_handle, &state),
     )
     .await?;
@@ -3731,12 +3733,23 @@ async fn vault_reset(
 /// The file part of `vault_reset`: runs `reset_audit`, drops the key, removes
 /// `files` (the vault files other than vault.json), then the MQLens Server
 /// accounts file and vault.json, all under the accounts lock, and only then
-/// ends the stored server sessions. An unlock in this process waits for all of
-/// it.
+/// ends the stored server sessions when the key is available. An explicit
+/// forgotten-password reset may discard unreadable sessions after warning the
+/// user. An unlock in this process waits for all of it.
 async fn reset_vault_files(
     state: &AppState,
     server_accounts_path: &std::path::Path,
     files: [std::path::PathBuf; 2],
+    reset_audit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    reset_vault_files_with_policy(state, server_accounts_path, files, false, reset_audit).await
+}
+
+async fn reset_vault_files_with_policy(
+    state: &AppState,
+    server_accounts_path: &std::path::Path,
+    files: [std::path::PathBuf; 2],
+    allow_unrevoked_server_sessions: bool,
     reset_audit: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let _no_unlock = state.vault_reset_lock.lock().await;
@@ -3762,7 +3775,10 @@ async fn reset_vault_files(
     // refresh tokens for live MQLens Server sessions. We cannot safely delete
     // it until the user unlocks and lets reset revoke those sessions. Check
     // before clearing audit data or dropping any process state.
-    if state.require_key().is_err() && server_accounts_path.exists() {
+    if state.require_key().is_err()
+        && server_accounts_path.exists()
+        && !allow_unrevoked_server_sessions
+    {
         return Err("Unlock the vault before resetting its MQLens Server accounts.".to_string());
     }
     // Before any core vault file is removed: if the audit log cannot be
@@ -3785,8 +3801,14 @@ async fn reset_vault_files(
     // holds that lock through its rotation, and an account write cannot
     // recreate the accounts file under the discarded key. vault.json goes
     // last, so a reset that fails part way leaves a vault that still opens.
-    let sign_outs =
-        server::commands::reset_accounts(state, server_accounts_path, key, files.into()).await;
+    let sign_outs = server::commands::reset_accounts_with_policy(
+        state,
+        server_accounts_path,
+        key,
+        files.into(),
+        allow_unrevoked_server_sessions,
+    )
+    .await;
     // Their tokens are already deleted: these sessions are ended now or never,
     // whether or not the rest of the reset went through.
     let finished = match sign_outs {

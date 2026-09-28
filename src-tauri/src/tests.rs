@@ -7698,6 +7698,44 @@ mod vault_reset_tests {
         env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
+    #[tokio::test]
+    async fn a_confirmed_forgotten_password_reset_can_discard_locked_server_accounts() {
+        let env = Env::new().await;
+        let state = AppState::new();
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        crate::server::commands::sign_in_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            PASSWORD.to_string(),
+        )
+        .await
+        .unwrap();
+        *state.vault_key.lock().unwrap() = None;
+        let audit_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let audit_called = audit_reset.clone();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        crate::reset_vault_files_with_policy(&state, &env.path, files, true, move || {
+            audit_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(audit_reset.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!env.path.exists());
+        assert!(!crate::server::accounts::vault_meta_path(&env.path).exists());
+        env.fake.with(|s| {
+            assert_eq!(
+                s.live_families(),
+                1,
+                "a forgotten-password reset cannot revoke sessions without the vault key"
+            )
+        });
+    }
+
     // Once the accounts file is gone its tokens exist nowhere else. If
     // vault.json then cannot be removed the reset fails, but it still ends
     // those sessions on their servers.

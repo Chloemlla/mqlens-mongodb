@@ -82,6 +82,18 @@ describe('VaultGate', () => {
     expect(screen.queryByTestId('vault-biometric-btn')).not.toBeInTheDocument();
   });
 
+  it('requires confirmation before allowing a locked recovery reset', async () => {
+    (vault.getVaultStatus as any).mockResolvedValue('locked');
+    (vault.resetVault as any).mockResolvedValue(undefined);
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<VaultGate><div>WORKSPACE</div></VaultGate>);
+
+    fireEvent.click(await screen.findByTestId('vault-reset-btn'));
+
+    await waitFor(() => expect(vault.resetVault).toHaveBeenCalledWith(true));
+    confirm.mockRestore();
+  });
+
   it('unlocks when the biometric retry button is clicked', async () => {
     (vault.getVaultStatus as any).mockResolvedValue('locked');
     (vault.biometricStatus as any).mockResolvedValue({
