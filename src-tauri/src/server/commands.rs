@@ -192,12 +192,15 @@ pub(crate) async fn list_connections_impl(
 
 /// The MQLens Server part of a vault reset: removes the accounts file and then
 /// vault.json under the accounts lock, and hands back the stored sessions still
-/// to be ended on their servers. Sessions are dropped here regardless.
+/// to be ended on their servers. Sessions are dropped here regardless. `key` is
+/// the vault key being discarded, taken by the caller before anything waits,
+/// or `None` when the vault is locked and the tokens cannot be read.
 pub(crate) async fn reset_accounts(
     state: &AppState,
     path: &Path,
+    key: Option<[u8; 32]>,
 ) -> Result<PendingSignOuts, String> {
-    reset_accounts_within(state, path, RESET_SIGN_OUT_TIMEOUT).await
+    reset_accounts_within(state, path, key, RESET_SIGN_OUT_TIMEOUT).await
 }
 
 /// Sessions a vault reset took out of the accounts file and has yet to end on
@@ -233,10 +236,10 @@ impl PendingSignOuts {
 async fn reset_accounts_within(
     state: &AppState,
     path: &Path,
+    key: Option<[u8; 32]>,
     limit: Duration,
 ) -> Result<PendingSignOuts, String> {
     state.server.clear().await;
-    let key = state.require_key().ok();
     // One locked step takes every stored token and removes the accounts file
     // and then the vault metadata, last, so a failure part way leaves a vault
     // that still opens. After it, nothing can present one of these tokens
@@ -729,7 +732,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        reset_accounts_within(&state, &env.path, Duration::from_millis(500))
+        reset_accounts_within(&state, &env.path, Some(KEY), Duration::from_millis(500))
             .await
             .unwrap()
             .finish()
@@ -799,7 +802,7 @@ mod tests {
             )
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        reset_accounts_within(&state, &env.path, Duration::from_millis(500))
+        reset_accounts_within(&state, &env.path, Some(KEY), Duration::from_millis(500))
             .await
             .unwrap()
             .finish()
@@ -905,7 +908,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        let pending = reset_accounts_within(&state, &env.path, Duration::from_secs(3))
+        let pending = reset_accounts_within(&state, &env.path, Some(KEY), Duration::from_secs(3))
             .await
             .unwrap();
         assert!(
@@ -931,7 +934,7 @@ mod tests {
         env.fake
             .with(|s| s.logout_delay = Duration::from_millis(300));
 
-        let pending = reset_accounts(&state, &env.path).await.unwrap();
+        let pending = reset_accounts(&state, &env.path, Some(KEY)).await.unwrap();
         assert!(!env.path.exists());
         pending.finish().await.unwrap();
         env.fake.with(|s| {
@@ -952,7 +955,7 @@ mod tests {
         std::fs::remove_file(&env.path).unwrap();
         std::fs::create_dir(&env.path).unwrap();
 
-        assert!(reset_accounts(&state, &env.path).await.is_err());
+        assert!(reset_accounts(&state, &env.path, Some(KEY)).await.is_err());
         assert!(
             accounts::vault_meta_path(&env.path).exists(),
             "vault.json went before the accounts file"
@@ -967,7 +970,7 @@ mod tests {
             .await
             .unwrap();
 
-        reset_accounts(&state, &env.path)
+        reset_accounts(&state, &env.path, Some(KEY))
             .await
             .unwrap()
             .finish()
@@ -980,7 +983,7 @@ mod tests {
         // Locked, there is no key to read tokens with; the files still go.
         let locked = AppState::new();
         write_vault_meta(&env.path, &KEY);
-        reset_accounts(&locked, &env.path)
+        reset_accounts(&locked, &env.path, None)
             .await
             .unwrap()
             .finish()

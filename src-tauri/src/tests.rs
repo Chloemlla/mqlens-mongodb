@@ -7537,6 +7537,34 @@ mod vault_reset_tests {
         });
     }
 
+    // A refresh can hold the accounts lock across a slow server call, and the
+    // reset waits for that lock after removing the profiles and settings. The
+    // key must be gone before then: a window saving meanwhile would recreate
+    // those files under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vault_reset_drops_the_key_before_waiting_for_the_accounts_lock() {
+        let env = Env::new().await;
+        let state = Arc::new(AppState::new());
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        let held = crate::server::accounts::lock(&env.path).unwrap();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        let resetting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            tokio::spawn(async move { crate::reset_vault_files(&state, &path, files).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let usable = state.require_key().is_ok();
+        drop(held);
+        resetting.await.unwrap().unwrap();
+        assert!(
+            !usable,
+            "the discarded key was still usable while the reset waited for the accounts lock"
+        );
+    }
+
     // A reset waits on servers to end the stored sessions. The key it discards
     // must be gone by then: a window saving a profile or the settings meanwhile
     // would recreate those files under that key, and the next vault could not
