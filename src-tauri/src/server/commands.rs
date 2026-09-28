@@ -126,6 +126,12 @@ pub(crate) async fn sign_in_impl(
     account_id: &str,
     password: String,
 ) -> Result<ServerAccountView, String> {
+    // Serialize the whole login-and-store operation with vault_lock and reset.
+    // Otherwise either can clear the key after the token store reads it but
+    // before the encrypted token is written or this command checks the key.
+    let meta_path = accounts::vault_meta_path(path);
+    let _vault_lock =
+        blocking(move || crate::connections::lock_vault_for_write(&meta_path)).await?;
     let password = Zeroizing::new(password);
     let key = state.require_key()?;
     let account = accounts::find(path, &key, account_id)?;
@@ -566,6 +572,51 @@ mod tests {
             result.is_err(),
             "reported signed in to a deleted account: {result:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vault_lock_waits_for_a_sign_in_to_finish_storing_its_token() {
+        let env = Env::new().await;
+        let state = Arc::new(unlocked());
+        env.fake
+            .with(|s| s.login_delay = Duration::from_millis(300));
+        let signing_in = {
+            let state = state.clone();
+            let path = env.path.clone();
+            let id = env.account.id.clone();
+            tokio::spawn(async move {
+                sign_in_impl(&state, &path, &id, PASSWORD.to_string()).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let lock_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting_for_lock = {
+            let path = accounts::vault_meta_path(&env.path);
+            let lock_acquired = lock_acquired.clone();
+            tokio::spawn(async move {
+                let lock = blocking(move || crate::connections::lock_vault_for_write(&path))
+                    .await
+                    .unwrap();
+                lock_acquired.store(true, std::sync::atomic::Ordering::SeqCst);
+                lock
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !lock_acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "vault lock passed a sign-in that had not committed yet"
+        );
+
+        let view = signing_in.await.unwrap().unwrap();
+        assert!(view.signed_in);
+        let vault_lock = waiting_for_lock.await.unwrap();
+        *state.vault_key.lock().unwrap() = None;
+        state.server.clear().await;
+        drop(vault_lock);
+
+        assert!(env.stored_token().is_some());
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
     #[tokio::test]
