@@ -265,16 +265,31 @@ pub async fn save_persisted(
     app_handle: &tauri::AppHandle,
     next: &McpPersisted,
 ) -> Result<(), String> {
+    let (_vault_lock, result) = save_persisted_with_vault_lock(state, app_handle, next).await?;
+    result
+}
+
+/// Persist MCP settings and return the vault-operation lock to the caller.
+/// The enable path keeps it until its server task is installed, ordering it
+/// against a concurrent lock or reset.
+async fn save_persisted_with_vault_lock(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+    next: &McpPersisted,
+) -> Result<(std::fs::File, Result<(), String>), String> {
     let meta_path = crate::connections::get_vault_meta_path(app_handle);
-    let (_vault_lock, key) = crate::lock_vault_and_get_key_async(state, &meta_path).await?;
+    let (vault_lock, key) = crate::lock_vault_and_get_key_async(state, &meta_path).await?;
     let path = crate::connections::get_settings_enc_path(app_handle);
-    let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
-    let _file_lock = crate::connections::lock_settings_for_write(&path)?;
-    let mut settings = crate::connections::load_settings_encrypted(&path, &key)?;
-    settings.mcp_enabled = next.enabled;
-    settings.mcp_port = next.port;
-    settings.mcp_token = next.token.clone();
-    crate::connections::save_settings_encrypted(&path, &key, &settings)
+    let result = (|| {
+        let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
+        let _file_lock = crate::connections::lock_settings_for_write(&path)?;
+        let mut settings = crate::connections::load_settings_encrypted(&path, &key)?;
+        settings.mcp_enabled = next.enabled;
+        settings.mcp_port = next.port;
+        settings.mcp_token = next.token.clone();
+        crate::connections::save_settings_encrypted(&path, &key, &settings)
+    })();
+    Ok((vault_lock, result))
 }
 
 /// Bring the server back up after the vault is unlocked, if it was left
@@ -391,6 +406,29 @@ pub async fn set_enabled_impl(
     // Kept for the write below: `token` itself is moved into `McpControl`.
     let token_for_disk = token.clone();
     let helper_token = new_token();
+
+    // Hold the vault lock from key validation through server-handle
+    // installation. A lock/reset that wins first makes persistence fail here
+    // and this call returns without spawning; one that waits sees a fully
+    // installed handle and stops that server after acquiring the lock.
+    let _vault_lock = if let Some(app) = &app_handle {
+        // After the bind succeeded, so a failed enable never records itself as
+        // the state to restore on the next unlock — and before `app_handle` is
+        // handed to the server task below.
+        let (lock, result) = save_persisted_with_vault_lock(
+            state,
+            app,
+            &McpPersisted { enabled: true, port, token: token_for_disk },
+        )
+        .await?;
+        // Keep the pre-existing best-effort policy for settings-file write
+        // failures. Vault acquisition/key validation errors above are fatal.
+        let _ = result;
+        Some(lock)
+    } else {
+        None
+    };
+
     {
         let mut control = state.mcp.lock_safe()?;
         control.enabled = true;
@@ -398,13 +436,6 @@ pub async fn set_enabled_impl(
         control.token = token;
         // Minted with it and, like it, distinct every time the server starts.
         control.helper_token = helper_token;
-    }
-
-    if let Some(app) = &app_handle {
-        // After the bind succeeded, so a failed enable never records itself as
-        // the state to restore on the next unlock — and before `app_handle` is
-        // handed to the server task below.
-        let _ = save_persisted(state, app, &McpPersisted { enabled: true, port, token: token_for_disk }).await;
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1431,6 +1462,27 @@ mod tests {
         assert!(
             !disable.contains("let _ = save_persisted"),
             "the disable branch discards a failed persist"
+        );
+    }
+
+    #[test]
+    fn enable_holds_the_vault_lock_until_its_server_handle_is_installed() {
+        let src = include_str!("mcp.rs");
+        let body = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        let enable = body
+            .split("if !enabled {")
+            .nth(1)
+            .and_then(|s| s.split("/// Stop the running server task").next())
+            .expect("the enable branch of set_enabled_impl");
+        let persisted = enable.find("save_persisted_with_vault_lock").unwrap();
+        let control = enable.find("control.enabled = true").unwrap();
+        let spawn = enable.find("tauri::async_runtime::spawn(run_server").unwrap();
+        let handle = enable.find("control.server = Some(ServerHandle").unwrap();
+
+        assert!(persisted < control && control < spawn && spawn < handle);
+        assert!(
+            enable.contains("let _vault_lock"),
+            "the file guard must live through listener startup"
         );
     }
 
