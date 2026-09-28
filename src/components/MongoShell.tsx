@@ -1136,6 +1136,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     const call = (name: string) => calls.find((candidate) => candidate.name === name);
     const filter = parseLoose(firstArg(op.argText), {}, t);
     const sort = call('sort') ? parseLoose(call('sort')!.argText, {}, t) : {};
+    const projection = call('projection') ? parseLoose(call('projection')!.argText, {}, t) : {};
     const skip = call('skip') ? Number.parseInt(call('skip')!.argText, 10) || 0 : 0;
     const limit = forceLimit ?? (call('limit') ? Number.parseInt(call('limit')!.argText, 10) || 50 : 50);
     const started = performance.now();
@@ -1145,6 +1146,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
       collection: collName,
       filter: JSON.stringify(filter),
       sort: JSON.stringify(sort),
+      projection: JSON.stringify(projection),
       limit,
       skip,
     });
