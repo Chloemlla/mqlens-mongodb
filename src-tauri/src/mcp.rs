@@ -265,7 +265,8 @@ pub fn save_persisted(
     app_handle: &tauri::AppHandle,
     next: &McpPersisted,
 ) -> Result<(), String> {
-    let key = state.require_key()?;
+    let meta_path = crate::connections::get_vault_meta_path(app_handle);
+    let (_vault_lock, key) = crate::lock_vault_and_get_key(state, &meta_path)?;
     let path = crate::connections::get_settings_enc_path(app_handle);
     let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
     let _file_lock = crate::connections::lock_settings_for_write(&path)?;

@@ -3271,7 +3271,8 @@ async fn save_connection_profile_inner(
     state: &AppState,
     profile: &mut connections::ConnectionProfile,
 ) -> Result<(), String> {
-    let key = state.require_key()?;
+    let meta_path = connections::get_vault_meta_path(app_handle);
+    let (_vault_lock, key) = lock_vault_and_get_key_async(state, &meta_path).await?;
     let path = connections::get_profiles_enc_path(app_handle);
     let mut profiles = connections::load_profiles_encrypted(&path, &key)?;
     profile.uri = connections::normalize_mongodb_uri_options(&profile.uri);
@@ -3298,7 +3299,8 @@ async fn delete_connection_profile(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let key = state.require_key()?;
+    let meta_path = connections::get_vault_meta_path(&app_handle);
+    let (_vault_lock, key) = lock_vault_and_get_key_async(&state, &meta_path).await?;
     let path = connections::get_profiles_enc_path(&app_handle);
     let mut profiles = connections::load_profiles_encrypted(&path, &key)?;
     profiles.retain(|p| p.id != id);
@@ -3475,7 +3477,8 @@ async fn patch_app_settings(
     state: tauri::State<'_, AppState>,
     patch: serde_json::Value,
 ) -> Result<connections::AppSettings, String> {
-    let key = state.require_key()?;
+    let meta_path = connections::get_vault_meta_path(&app_handle);
+    let (_vault_lock, key) = lock_vault_and_get_key_async(&state, &meta_path).await?;
     let path = connections::get_settings_enc_path(&app_handle);
     let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
     // The in-process mutex above orders this window's writers; this orders them
@@ -3505,7 +3508,8 @@ async fn save_app_settings(
     state: tauri::State<'_, AppState>,
     settings: connections::AppSettings,
 ) -> Result<(), String> {
-    let key = state.require_key()?;
+    let meta_path = connections::get_vault_meta_path(&app_handle);
+    let (_vault_lock, key) = lock_vault_and_get_key_async(&state, &meta_path).await?;
     // Same locks as `patch_app_settings`, so a whole-object save cannot
     // interleave with a field patch — in this process or another one.
     let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
@@ -3531,6 +3535,73 @@ async fn save_app_settings(
     Ok(())
 }
 
+/// Take the process-shared vault lock and capture a key that still matches
+/// vault.json. Callers hold the returned file through their complete write.
+pub(crate) fn lock_vault_and_get_key(
+    state: &AppState,
+    meta_path: &std::path::Path,
+) -> Result<(std::fs::File, [u8; 32]), String> {
+    let lock = connections::lock_vault_for_write(meta_path)?;
+    let key = state.require_key()?;
+    let meta = connections::read_vault_meta(meta_path)?
+        .ok_or_else(|| "vault is not initialized".to_string())?;
+    if !connections::key_matches_meta(&meta, &key) {
+        return Err(
+            "The vault changed while this operation was waiting. Unlock it and try again."
+                .to_string(),
+        );
+    }
+    Ok((lock, key))
+}
+
+async fn lock_vault_and_get_key_async(
+    state: &AppState,
+    meta_path: &std::path::Path,
+) -> Result<(std::fs::File, [u8; 32]), String> {
+    let path = meta_path.to_path_buf();
+    // Only the blocking file-lock acquisition moves to the worker.
+    let lock = server::session::blocking(move || connections::lock_vault_for_write(&path)).await?;
+    // Re-read after acquiring the cross-process lock. A reset or rotation that
+    // won the race invalidates the copied key and must prevent the write.
+    let key = state.require_key()?;
+    let meta = connections::read_vault_meta(meta_path)?
+        .ok_or_else(|| "vault is not initialized".to_string())?;
+    if !connections::key_matches_meta(&meta, &key) {
+        return Err(
+            "The vault changed while this operation was waiting. Unlock it and try again."
+                .to_string(),
+        );
+    }
+    Ok((lock, key))
+}
+
+async fn lock_vault_operation_async(meta_path: &std::path::Path) -> Result<std::fs::File, String> {
+    let path = meta_path.to_path_buf();
+    server::session::blocking(move || connections::lock_vault_for_write(&path)).await
+}
+
+/// Install a key returned by biometric verification only if the same vault is
+/// still present after the user completes the prompt. The guards prevent a
+/// reset in this process or another process from crossing the installation.
+pub(crate) async fn install_unlocked_key<'a>(
+    state: &'a AppState,
+    meta_path: &std::path::Path,
+    key: [u8; 32],
+) -> Result<(tokio::sync::MutexGuard<'a, ()>, std::fs::File), String> {
+    let no_reset = state.vault_reset_lock.lock().await;
+    let vault_lock = lock_vault_operation_async(meta_path).await?;
+    let meta = connections::read_vault_meta(meta_path)?
+        .ok_or_else(|| "vault is not initialized".to_string())?;
+    if !connections::key_matches_meta(&meta, &key) {
+        return Err(
+            "The vault changed while biometric unlock was in progress. Unlock it again."
+                .to_string(),
+        );
+    }
+    *state.vault_key.lock_safe()? = Some(key);
+    Ok((no_reset, vault_lock))
+}
+
 #[tauri::command]
 async fn vault_status(
     app_handle: tauri::AppHandle,
@@ -3554,6 +3625,8 @@ async fn vault_initialize(
     password: String,
 ) -> Result<(), String> {
     let meta_path = connections::get_vault_meta_path(&app_handle);
+    let _no_reset = state.vault_reset_lock.lock().await;
+    let _vault_lock = lock_vault_operation_async(&meta_path).await?;
     if connections::read_vault_meta(&meta_path)?.is_some() {
         return Err("vault already initialized".to_string());
     }
@@ -3586,9 +3659,9 @@ async fn vault_unlock(
     password: String,
 ) -> Result<connections::VaultStatus, String> {
     let meta_path = connections::get_vault_meta_path(&app_handle);
-    // Held to the end, so a reset starting now waits for the audit log and
-    // the MCP server too.
-    let (key, _no_reset) = unlock_vault_key(&state, &meta_path, &password).await?;
+    // Both guards stay live through audit/MCP restoration, so a reset cannot
+    // remove a vault while an unlock is installing its services.
+    let (key, _no_reset, _vault_lock) = unlock_vault_key(&state, &meta_path, &password).await?;
     let _ = audit::open_on_unlock(&app_handle, &state, key);
     // The MCP server needs the key, so this is the first moment it can come
     // back up. Best-effort by design — see `restore_on_unlock` (#350).
@@ -3603,17 +3676,23 @@ async fn unlock_vault_key<'a>(
     state: &'a AppState,
     meta_path: &std::path::Path,
     password: &str,
-) -> Result<([u8; 32], tokio::sync::MutexGuard<'a, ()>), String> {
+) -> Result<([u8; 32], tokio::sync::MutexGuard<'a, ()>, std::fs::File), String> {
     let no_reset = state.vault_reset_lock.lock().await;
+    let vault_lock = lock_vault_operation_async(meta_path).await?;
     let meta = connections::read_vault_meta(meta_path)?
         .ok_or_else(|| "vault is not initialized".to_string())?;
     let key = connections::unlock_key(&meta, password)?;
     *state.vault_key.lock_safe()? = Some(key);
-    Ok((key, no_reset))
+    Ok((key, no_reset, vault_lock))
 }
 
 #[tauri::command]
-async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn vault_lock(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let meta_path = connections::get_vault_meta_path(&app_handle);
+    let _vault_lock = lock_vault_operation_async(&meta_path).await?;
     let _ = audit::close_on_lock(&state);
     *state.vault_key.lock_safe()? = None;
     // A locked vault must never leave the embedded MCP server listening —
@@ -3658,6 +3737,24 @@ async fn reset_vault_files(
     reset_audit: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let _no_unlock = state.vault_reset_lock.lock().await;
+    let meta_path = server::accounts::vault_meta_path(server_accounts_path);
+    // Keep the cross-process lock through file deletion and remote revocation.
+    // Initialization and every file writer take this same lock.
+    let _vault_lock = lock_vault_operation_async(&meta_path).await?;
+    // Check the copied process key before touching the audit log. Another
+    // process may have rotated the vault while this process retained its old
+    // key; a reset must not erase the new vault's audit data before rejecting
+    // that stale reset request.
+    if let Some(key) = *state.vault_key.lock_safe()? {
+        if let Ok(Some(meta)) = connections::read_vault_meta(&meta_path) {
+            if !connections::key_matches_meta(&meta, &key) {
+                return Err(
+                    "The vault password changed while the vault was being reset. Nothing was removed; reset again."
+                        .to_string(),
+                );
+            }
+        }
+    }
     // Before any core vault file is removed: if the audit log cannot be
     // deleted, a replacement vault would start with a log its new key cannot
     // authenticate, so auditing would be sealed from the first unlock. Abort
@@ -3696,10 +3793,12 @@ async fn vault_change_password(
     old_password: String,
     new_password: String,
 ) -> Result<(), String> {
+    let _no_reset = state.vault_reset_lock.lock().await;
+    let meta_path = connections::get_vault_meta_path(&app_handle);
+    let _vault_lock = lock_vault_operation_async(&meta_path).await?;
     if new_password.is_empty() {
         return Err("new master password must not be empty".to_string());
     }
-    let meta_path = connections::get_vault_meta_path(&app_handle);
     let meta = connections::read_vault_meta(&meta_path)?
         .ok_or_else(|| "vault is not initialized".to_string())?;
     let old_key = connections::unlock_key(&meta, &old_password)?;

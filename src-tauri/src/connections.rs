@@ -867,6 +867,26 @@ pub fn lock_settings_for_write(settings_path: &Path) -> Result<fs::File, String>
     Ok(file)
 }
 
+/// Cross-process lock for vault lifecycle changes and every vault-backed
+/// writer. Unlike the per-file locks, this serializes reset/initialization
+/// with all files that share vault.json as their key authority.
+pub fn lock_vault_for_write(meta_path: &Path) -> Result<fs::File, String> {
+    use fs4::fs_std::FileExt;
+    let lock_path = meta_path.with_file_name("vault-operation.lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
+    FileExt::lock_exclusive(&file).map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    Ok(file)
+}
+
 /// Commit a whole vault key rotation, restoring the previous files if any write
 /// fails.
 ///

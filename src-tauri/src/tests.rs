@@ -7475,6 +7475,136 @@ mod vault_reset_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    // Initialization and reset must use the same cross-process vault lock. A
+    // process initializing after reset begins cannot have its new metadata
+    // deleted by the still-running reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_waits_for_vault_initialization_to_finish() {
+        let env = Env::new().await;
+        let state = Arc::new(AppState::new());
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        let meta_path = crate::server::accounts::vault_meta_path(&env.path);
+        let init_lock = crate::connections::lock_vault_for_write(&meta_path).unwrap();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        let resetting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            tokio::spawn(async move {
+                crate::reset_vault_files(&state, &path, files, || Ok(())).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            meta_path.exists(),
+            "reset removed metadata while initialization held the vault lock"
+        );
+
+        // The initialization transaction commits before releasing this guard.
+        let meta = crate::connections::build_vault_meta(
+            "new-vault",
+            crate::vault::KdfParams { m_kib: 8, t: 1, p: 1 },
+        )
+        .unwrap();
+        crate::connections::write_vault_meta(&meta_path, &meta).unwrap();
+        drop(init_lock);
+
+        assert!(resetting.await.unwrap().is_err());
+        assert!(
+            meta_path.exists(),
+            "reset deleted metadata committed by the preceding initialization"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn biometric_key_from_before_reset_cannot_unlock_the_removed_vault() {
+        let env = Env::new().await;
+        let state = Arc::new(AppState::new());
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        let meta_path = crate::server::accounts::vault_meta_path(&env.path);
+        let held = crate::server::accounts::lock(&env.path).unwrap();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        let resetting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            tokio::spawn(async move {
+                crate::reset_vault_files(&state, &path, files, || Ok(())).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.require_key().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reset never discarded the in-memory key");
+
+        let installing = {
+            let state = state.clone();
+            let meta_path = meta_path.clone();
+            tokio::spawn(async move {
+                crate::install_unlocked_key(&state, &meta_path, KEY)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        drop(held);
+        resetting.await.unwrap().unwrap();
+        assert!(installing.await.unwrap().is_err());
+        assert!(state.require_key().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_process_cannot_write_with_its_captured_key_during_reset() {
+        let env = Env::new().await;
+        let resetting_state = Arc::new(AppState::new());
+        *resetting_state.vault_key.lock().unwrap() = Some(KEY);
+        crate::server::commands::sign_in_impl(
+            &resetting_state,
+            &env.path,
+            &env.account.id,
+            PASSWORD.to_string(),
+        )
+        .await
+        .unwrap();
+        let other_process = Arc::new(AppState::new());
+        *other_process.vault_key.lock().unwrap() = Some(KEY);
+        env.fake
+            .with(|s| s.logout_delay = Duration::from_millis(500));
+        let meta_path = crate::server::accounts::vault_meta_path(&env.path);
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        let resetting = {
+            let state = resetting_state.clone();
+            let path = env.path.clone();
+            tokio::spawn(async move {
+                crate::reset_vault_files(&state, &path, files, || Ok(())).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while resetting_state.require_key().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reset never discarded the in-memory key");
+
+        let writer = {
+            let state = other_process.clone();
+            let path = meta_path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::lock_vault_and_get_key(&state, &path).map(|_| ())
+            })
+        };
+        resetting.await.unwrap().unwrap();
+        assert!(writer.await.unwrap().is_err());
+        assert!(other_process.require_key().is_ok());
+    }
+
     // A reset that fails part way must not leave this process holding the key,
     // nor have removed vault.json while other vault files are still there.
     #[tokio::test]
@@ -7626,10 +7756,9 @@ mod vault_reset_tests {
         );
     }
 
-    // A password change holds the accounts lock through its rotation, in this
+    // A password change holds the vault-wide lock through its rotation, in this
     // process or another. A reset starting meanwhile must find out the vault
-    // moved to another key before it removes anything: afterwards is too late
-    // for the profiles and settings.
+    // moved to another key before it clears audit data or removes files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reset_overtaken_by_a_password_change_removes_nothing() {
         let env = Env::new().await;
@@ -7638,23 +7767,33 @@ mod vault_reset_tests {
         let dir = env.path.parent().unwrap().to_path_buf();
         let profiles = dir.join("profiles.json.enc");
         std::fs::write(&profiles, b"profiles").unwrap();
-        let held = crate::server::accounts::lock(&env.path).unwrap();
+        let meta_path = crate::server::accounts::vault_meta_path(&env.path);
+        let held = crate::connections::lock_vault_for_write(&meta_path).unwrap();
+        let audit_reset_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let files = [profiles.clone(), dir.join("settings.json.enc")];
 
         let resetting = {
             let state = state.clone();
             let path = env.path.clone();
-            tokio::spawn(
-                async move { crate::reset_vault_files(&state, &path, files, || Ok(())).await },
-            )
+            let audit_reset_called = audit_reset_called.clone();
+            tokio::spawn(async move {
+                crate::reset_vault_files(&state, &path, files, || {
+                    audit_reset_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(200)).await;
-        // The password change commits its new key under the lock.
+        // The password change commits its new key under the same lock.
         std::fs::remove_file(&env.path).unwrap();
-        crate::server::fake::write_vault_meta(&env.path, &[9; 32]);
+        let rotated_key =
+            std::array::from_fn(|i| KEY[i].wrapping_add((i as u8).wrapping_mul(37)));
+        crate::server::fake::write_vault_meta(&env.path, &rotated_key);
         drop(held);
 
         assert!(resetting.await.unwrap().is_err());
+        assert!(!audit_reset_called.load(std::sync::atomic::Ordering::SeqCst));
         assert!(
             profiles.exists(),
             "the reset removed the profiles of a vault it did not hold the key for"
