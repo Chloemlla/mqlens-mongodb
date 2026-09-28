@@ -7488,9 +7488,11 @@ mod vault_reset_tests {
         std::fs::create_dir(&profiles).unwrap();
         let files = [profiles, dir.join("settings.json.enc")];
 
-        assert!(crate::reset_vault_files(&state, &env.path, files)
-            .await
-            .is_err());
+        assert!(
+            crate::reset_vault_files(&state, &env.path, files, || Ok(()))
+                .await
+                .is_err()
+        );
         assert!(
             state.require_key().is_err(),
             "the failed reset left the discarded key usable"
@@ -7524,9 +7526,11 @@ mod vault_reset_tests {
         let dir = env.path.parent().unwrap().to_path_buf();
         let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
 
-        assert!(crate::reset_vault_files(&state, &env.path, files)
-            .await
-            .is_err());
+        assert!(
+            crate::reset_vault_files(&state, &env.path, files, || Ok(()))
+                .await
+                .is_err()
+        );
         assert!(!env.path.exists());
         env.fake.with(|s| {
             assert_eq!(
@@ -7553,7 +7557,9 @@ mod vault_reset_tests {
         let resetting = {
             let state = state.clone();
             let path = env.path.clone();
-            tokio::spawn(async move { crate::reset_vault_files(&state, &path, files).await })
+            tokio::spawn(
+                async move { crate::reset_vault_files(&state, &path, files, || Ok(())).await },
+            )
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
         let usable = state.require_key().is_ok();
@@ -7562,6 +7568,61 @@ mod vault_reset_tests {
         assert!(
             !usable,
             "the discarded key was still usable while the reset waited for the accounts lock"
+        );
+    }
+
+    // An unlock landing while a reset is under way must not put the discarded
+    // key back: it waits for the reset, then finds no vault to unlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unlock_during_a_reset_does_not_restore_the_key() {
+        let env = Env::new().await;
+        let meta_path = crate::server::accounts::vault_meta_path(&env.path);
+        let fast = crate::vault::KdfParams {
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        };
+        let meta = crate::connections::build_vault_meta("pw", fast).unwrap();
+        crate::connections::write_vault_meta(&meta_path, &meta).unwrap();
+        // No accounts file: the one here is under the fake's key, not "pw"'s.
+        std::fs::remove_file(&env.path).unwrap();
+        let state = Arc::new(AppState::new());
+        *state.vault_key.lock().unwrap() =
+            Some(crate::connections::unlock_key(&meta, "pw").unwrap());
+        // Keeps the reset waiting, as a refresh across a slow server call would.
+        let held = crate::server::accounts::lock(&env.path).unwrap();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        let resetting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            tokio::spawn(
+                async move { crate::reset_vault_files(&state, &path, files, || Ok(())).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let unlocking = {
+            let state = state.clone();
+            let meta_path = meta_path.clone();
+            tokio::spawn(async move {
+                crate::unlock_vault_key(&state, &meta_path, "pw")
+                    .await
+                    .map(|_| ())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        resetting.await.unwrap().unwrap();
+
+        let unlocked = unlocking.await.unwrap();
+        assert!(
+            unlocked.is_err(),
+            "unlocked a vault the reset was removing: {unlocked:?}"
+        );
+        assert!(
+            state.require_key().is_err(),
+            "the reset ended with the discarded key live"
         );
     }
 
@@ -7590,7 +7651,9 @@ mod vault_reset_tests {
         let resetting = {
             let state = state.clone();
             let path = env.path.clone();
-            tokio::spawn(async move { crate::reset_vault_files(&state, &path, files).await })
+            tokio::spawn(
+                async move { crate::reset_vault_files(&state, &path, files, || Ok(())).await },
+            )
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(

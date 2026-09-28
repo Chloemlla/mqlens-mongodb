@@ -163,6 +163,9 @@ pub struct AppState {
     // a rotated refresh token (`server::key_source`), rather than a copy taken
     // earlier that a lock or a password change has since made wrong.
     pub vault_key: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Held for the whole of a vault reset, and by an unlock, so an unlock
+    /// cannot put back the key a reset is discarding.
+    pub(crate) vault_reset_lock: tokio::sync::Mutex<()>,
     /// Signed-in MQLens Server sessions (server mode).
     pub(crate) server: crate::server::ServerRuntime,
     /// Normalized connection URI (post-SSH-tunnel rewrite) retained per real
@@ -252,6 +255,7 @@ impl AppState {
             resource_pids: Mutex::new(Vec::new()),
             resource_tree_at: Mutex::new(Instant::now()),
             vault_key: Arc::new(Mutex::new(None)),
+            vault_reset_lock: tokio::sync::Mutex::new(()),
             server: Default::default(),
             conn_uris: Mutex::new(HashMap::new()),
             conn_oidc_id_token: Mutex::new(HashSet::new()),

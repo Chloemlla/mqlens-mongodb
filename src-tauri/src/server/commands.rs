@@ -232,6 +232,9 @@ impl PendingSignOuts {
     }
 }
 
+const RESET_KEY_CHANGED: &str =
+    "The vault password was changed while the vault was being reset. Nothing was removed; reset again.";
+
 /// Each account gets `limit` of its own when the sign-outs are finished.
 async fn reset_accounts_within(
     state: &AppState,
@@ -250,12 +253,27 @@ async fn reset_accounts_within(
     let file = path.to_path_buf();
     let (taken, failed) = blocking(move || {
         let _lock = accounts::lock(&file)?;
-        let taken: Vec<(ServerAccount, String)> = key
-            .and_then(|key| accounts::load(&file, &key).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|a| a.refresh_token.clone().map(|token| (a, token)))
-            .collect();
+        // The key was captured before this lock was free. A password change
+        // meanwhile, here or in another MQLens process, rotated the vault to
+        // another key: going on would read no tokens and delete a vault this
+        // reset never saw. An unreadable vault.json is left to the load below.
+        if let Some(key) = &key {
+            let meta = crate::connections::read_vault_meta(&accounts::vault_meta_path(&file));
+            if meta
+                .ok()
+                .flatten()
+                .is_some_and(|meta| !crate::connections::key_matches_meta(&meta, key))
+            {
+                return Err(RESET_KEY_CHANGED.to_string());
+            }
+        }
+        let taken: Vec<(ServerAccount, String)> = match key {
+            Some(key) => accounts::load(&file, &key)?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .filter_map(|a| a.refresh_token.clone().map(|token| (a, token)))
+        .collect();
         let remove = |p: &Path| match p.exists() {
             true => std::fs::remove_file(p).map_err(|e| format!("remove {}: {e}", p.display())),
             false => Ok(()),
@@ -960,6 +978,29 @@ mod tests {
             accounts::vault_meta_path(&env.path).exists(),
             "vault.json went before the accounts file"
         );
+    }
+
+    // A password change, here or in another process, can rotate the vault
+    // while the reset waits for the accounts lock. The key the reset captured
+    // then reads nothing, and it must not take that for "no sessions" and
+    // delete the rotated vault.
+    #[tokio::test]
+    async fn a_reset_with_a_key_the_vault_no_longer_uses_changes_nothing() {
+        let env = Env::new().await;
+        let state = unlocked();
+        let rotated = [9; 32];
+        std::fs::remove_file(&env.path).unwrap();
+        accounts::update(&env.path, &rotated, |all| {
+            all.push(env.account.clone());
+            Ok(())
+        })
+        .unwrap();
+        write_vault_meta(&env.path, &rotated);
+
+        let result = reset_accounts(&state, &env.path, Some(KEY)).await;
+        assert!(result.is_err(), "the reset went ahead with a stale key");
+        assert!(env.path.exists(), "the rotated accounts file was deleted");
+        assert!(accounts::vault_meta_path(&env.path).exists());
     }
 
     #[tokio::test]

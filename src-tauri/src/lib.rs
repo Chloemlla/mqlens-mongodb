@@ -3586,15 +3586,30 @@ async fn vault_unlock(
     password: String,
 ) -> Result<connections::VaultStatus, String> {
     let meta_path = connections::get_vault_meta_path(&app_handle);
-    let meta = connections::read_vault_meta(&meta_path)?
-        .ok_or_else(|| "vault is not initialized".to_string())?;
-    let key = connections::unlock_key(&meta, &password)?;
-    *state.vault_key.lock_safe()? = Some(key);
+    // Held to the end, so a reset starting now waits for the audit log and
+    // the MCP server too.
+    let (key, _no_reset) = unlock_vault_key(&state, &meta_path, &password).await?;
     let _ = audit::open_on_unlock(&app_handle, &state, key);
     // The MCP server needs the key, so this is the first moment it can come
     // back up. Best-effort by design — see `restore_on_unlock` (#350).
     mcp::restore_on_unlock(&state, app_handle).await;
     Ok(connections::VaultStatus::Unlocked)
+}
+
+/// The key step of `vault_unlock`: derives the key from `password` and
+/// makes it the live vault key. Waits for a reset under way, which then leaves
+/// no vault to unlock; the returned guard keeps a new one from starting.
+async fn unlock_vault_key<'a>(
+    state: &'a AppState,
+    meta_path: &std::path::Path,
+    password: &str,
+) -> Result<([u8; 32], tokio::sync::MutexGuard<'a, ()>), String> {
+    let no_reset = state.vault_reset_lock.lock().await;
+    let meta = connections::read_vault_meta(meta_path)?
+        .ok_or_else(|| "vault is not initialized".to_string())?;
+    let key = connections::unlock_key(&meta, password)?;
+    *state.vault_key.lock_safe()? = Some(key);
+    Ok((key, no_reset))
 }
 
 #[tauri::command]
@@ -3616,10 +3631,6 @@ async fn vault_reset(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Before any core vault file is removed: if the audit log cannot be deleted,
-    // a replacement vault would start with a log its new key cannot authenticate,
-    // so auditing would be sealed from the first unlock. Abort instead.
-    audit::reset_store(&app_handle, &state)?;
     reset_vault_files(
         &state,
         &connections::get_server_accounts_path(&app_handle),
@@ -3627,6 +3638,7 @@ async fn vault_reset(
             connections::get_profiles_enc_path(&app_handle),
             connections::get_settings_enc_path(&app_handle),
         ],
+        || audit::reset_store(&app_handle, &state),
     )
     .await?;
     // A reset invalidates the old key; forget any biometric copy too.
@@ -3634,14 +3646,22 @@ async fn vault_reset(
     Ok(())
 }
 
-/// The file part of `vault_reset`: drops the key, removes `files` (the vault
-/// files other than vault.json), then the MQLens Server accounts file and
-/// vault.json, and only then ends the stored server sessions.
+/// The file part of `vault_reset`: runs `reset_audit`, drops the key, removes
+/// `files` (the vault files other than vault.json), then the MQLens Server
+/// accounts file and vault.json, and only then ends the stored server
+/// sessions. An unlock in this process waits for all of it.
 async fn reset_vault_files(
     state: &AppState,
     server_accounts_path: &std::path::Path,
     files: [std::path::PathBuf; 2],
+    reset_audit: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    let _no_unlock = state.vault_reset_lock.lock().await;
+    // Before any core vault file is removed: if the audit log cannot be
+    // deleted, a replacement vault would start with a log its new key cannot
+    // authenticate, so auditing would be sealed from the first unlock. Abort
+    // instead, with nothing changed.
+    reset_audit()?;
     // The key goes first, before anything below waits: on the accounts lock,
     // which a refresh can hold across a server call, or on servers. No window
     // can write under it from here on. If the reset stops short of vault.json,
