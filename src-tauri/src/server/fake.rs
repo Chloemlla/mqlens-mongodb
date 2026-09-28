@@ -57,6 +57,8 @@ pub(crate) struct FakeState {
     pub logout_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
     pub refresh_failures: Vec<Code>,
+    /// Codes the next logouts fail with, before ending the session.
+    pub logout_failures: Vec<Code>,
     pub connections: Vec<ConnectionRef>,
     pub logins: u32,
     pub refreshes: u32,
@@ -156,6 +158,7 @@ impl Fake {
                 list_delay: Duration::ZERO,
                 logout_delay: Duration::ZERO,
                 refresh_failures: Vec::new(),
+                logout_failures: Vec::new(),
                 connections: vec![ConnectionRef {
                     id: "c1".to_string(),
                     name: "Orders".to_string(),
@@ -264,6 +267,10 @@ impl AuthService for Fake {
         tokio::time::sleep(delay).await;
         let mut state = self.state.lock().unwrap();
         state.authenticate(&request)?;
+        if !state.logout_failures.is_empty() {
+            let code = state.logout_failures.remove(0);
+            return Err(Status::new(code, "injected failure"));
+        }
         state.logouts += 1;
         if let Some(access) = bearer(&request).and_then(|t| state.access.get_mut(t)) {
             access.revoked = true;

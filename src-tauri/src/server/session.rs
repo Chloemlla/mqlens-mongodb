@@ -399,14 +399,22 @@ impl AccountSession {
                     }
                     Err(e) => {
                         // The stored token is spent and its successor cannot be
-                        // kept, so nothing could resume this session: end it on
-                        // the server too rather than leave it live and unheld.
-                        let _ =
-                            logout(&self.channel, &fresh.access_token, &fresh.refresh_token).await;
+                        // kept, so nothing could resume this session: try to end
+                        // it on the server rather than leave it live and unheld.
+                        let ended_on_server =
+                            logout(&self.channel, &fresh.access_token, &fresh.refresh_token)
+                                .await
+                                .is_ok();
                         self.ended.store(true, Ordering::SeqCst);
-                        Err(format!(
-                            "Could not save the refreshed MQLens Server session, so it was ended: {e}. Sign in again."
-                        ))
+                        if ended_on_server {
+                            Err(format!(
+                                "Could not save the refreshed MQLens Server session, so it was ended: {e}. Sign in again."
+                            ))
+                        } else {
+                            Err(format!(
+                                "Could not save the refreshed MQLens Server session ({e}) and could not confirm ending it. The server session may still be active; sign in again."
+                            ))
+                        }
                     }
                 }
             }
@@ -1078,5 +1086,32 @@ mod tests {
             assert_eq!(s.reuse_detected, 0);
             assert_eq!(s.live_families(), 0);
         });
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_session_reports_when_cleanup_logout_fails() {
+        let env = Env::new().await;
+        let store = Arc::new(FailingWrites {
+            inner: env.store(),
+            fail: AtomicBool::new(false),
+        });
+        let session = AccountSession::sign_in(
+            &env.account,
+            PASSWORD,
+            store.clone() as Arc<dyn TokenStore>,
+        )
+        .await
+        .unwrap();
+        store.fail.store(true, Ordering::SeqCst);
+        env.fake.revoke_access_tokens();
+        env.fake
+            .with(|s| s.logout_failures.push(Code::Unavailable));
+
+        let error = list_connections(&session).await.unwrap_err();
+
+        assert!(error.contains("could not confirm ending it"), "{error}");
+        assert!(error.contains("may still be active"), "{error}");
+        assert!(session.is_ended());
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 }

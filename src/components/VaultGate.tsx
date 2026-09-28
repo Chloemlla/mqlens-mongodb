@@ -138,10 +138,11 @@ export const VaultGate: React.FC<VaultGateProps> = ({ children }) => {
     try {
       // This is the forgotten-password recovery route. The vault key is
       // unavailable, so the backend cannot revoke any saved server sessions.
-      await resetVault(true);
+      const warning = await resetVault(true);
       setStatus('uninitialized');
       setPassword('');
       setConfirm('');
+      if (warning) setError(warning);
     } catch (e) {
       setError(String(e));
     }

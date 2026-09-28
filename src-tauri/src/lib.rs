@@ -3713,8 +3713,8 @@ async fn vault_reset(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     allow_unrevoked_server_sessions: bool,
-) -> Result<(), String> {
-    reset_vault_files_with_policy(
+) -> Result<Option<String>, String> {
+    let warning = reset_vault_files_with_policy(
         &state,
         &connections::get_server_accounts_path(&app_handle),
         [
@@ -3727,7 +3727,7 @@ async fn vault_reset(
     .await?;
     // A reset invalidates the old key; forget any biometric copy too.
     let _ = biometric::remove_stored_key(&app_handle);
-    Ok(())
+    Ok(warning)
 }
 
 /// The file part of `vault_reset`: runs `reset_audit`, drops the key, removes
@@ -3741,7 +3741,7 @@ async fn reset_vault_files(
     server_accounts_path: &std::path::Path,
     files: [std::path::PathBuf; 2],
     reset_audit: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     reset_vault_files_with_policy(state, server_accounts_path, files, false, reset_audit).await
 }
 
@@ -3751,7 +3751,7 @@ async fn reset_vault_files_with_policy(
     files: [std::path::PathBuf; 2],
     allow_unrevoked_server_sessions: bool,
     reset_audit: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let _no_unlock = state.vault_reset_lock.lock().await;
     let meta_path = server::accounts::vault_meta_path(server_accounts_path);
     // Keep the cross-process lock through file deletion and remote revocation.
@@ -3815,7 +3815,10 @@ async fn reset_vault_files_with_policy(
         Ok(sign_outs) => sign_outs.finish().await,
         Err(e) => Err(e),
     };
-    finished.and(locked).and(stopped)
+    let warning = finished?;
+    locked?;
+    stopped?;
+    Ok(warning)
 }
 
 #[tauri::command]

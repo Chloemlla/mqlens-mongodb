@@ -253,24 +253,50 @@ pub(crate) async fn reset_accounts_with_policy(
 pub(crate) struct PendingSignOuts {
     taken: Vec<(ServerAccount, String)>,
     limit: Duration,
-    /// Why the reset stopped short after the accounts file was gone. The
-    /// sessions are ended regardless: their tokens exist nowhere else.
+    /// Why removing the vault metadata failed after the accounts file was
+    /// gone. Revocations are attempted regardless: their tokens exist nowhere
+    /// else.
     failed: Option<String>,
 }
 
 impl PendingSignOuts {
     /// Ends every session, each within its own time limit and all at once, so
     /// one unreachable server cannot use up the time every other one needed.
-    /// Best effort: an unreachable server cannot hold up a reset. Returns the
-    /// reset's own failure, if it had one.
-    pub(crate) async fn finish(self) -> Result<(), String> {
+    /// An unreachable server cannot hold up a reset, but failed revocations
+    /// are reported because their tokens were already removed from the vault.
+    pub(crate) async fn finish(self) -> Result<Option<String>, String> {
         let limit = self.limit;
         let revokes = self
             .taken
             .iter()
             .map(|(account, token)| tokio::time::timeout(limit, session::revoke(account, token)));
-        futures::future::join_all(revokes).await;
-        self.failed.map_or(Ok(()), Err)
+        let unconfirmed = futures::future::join_all(revokes)
+            .await
+            .into_iter()
+            .filter(|result| !matches!(result, Ok(true)))
+            .count();
+
+        let revocation_warning = (unconfirmed > 0).then(|| {
+            let sessions = if unconfirmed == 1 {
+                "session"
+            } else {
+                "sessions"
+            };
+            format!(
+                "Could not confirm revocation of {unconfirmed} MQLens Server {sessions}; they may still be active."
+            )
+        });
+        if let Some(failed) = self.failed {
+            let mut failures = vec![failed];
+            if let Some(warning) = revocation_warning {
+                failures.push(warning);
+            }
+            Err(failures.join(" "))
+        } else if let Some(warning) = revocation_warning {
+            Ok(Some(format!("Vault reset completed, but {warning}")))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -847,7 +873,7 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        reset_accounts_within(
+        let warning = reset_accounts_within(
             &state,
             &env.path,
             Some(KEY),
@@ -859,7 +885,10 @@ mod tests {
         .unwrap()
         .finish()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the timed out revocation must be reported");
+        assert!(warning.contains("1 MQLens Server session"), "{warning}");
+        assert!(warning.contains("may still be active"), "{warning}");
         env.fake.with(|s| {
             assert_eq!(
                 s.live_families(),
@@ -1082,6 +1111,31 @@ mod tests {
                 "the reset finished with a session still live"
             )
         });
+    }
+
+    #[tokio::test]
+    async fn a_reset_reports_when_a_server_cannot_confirm_revocation() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        env.fake
+            .with(|s| s.refresh_failures.push(tonic::Code::Unavailable));
+
+        let pending = reset_accounts(&state, &env.path, Some(KEY), Vec::new())
+            .await
+            .unwrap();
+        let warning = pending
+            .finish()
+            .await
+            .unwrap()
+            .expect("the failed revocation must be reported");
+
+        assert!(warning.contains("1 MQLens Server session"), "{warning}");
+        assert!(warning.contains("may still be active"), "{warning}");
+        assert!(!env.path.exists());
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
     // vault.json is what makes the other files a vault, so it goes last: a
