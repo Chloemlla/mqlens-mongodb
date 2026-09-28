@@ -126,6 +126,7 @@ pub async fn biometric_unlock(
             let (_no_reset, _vault_lock) =
                 crate::install_unlocked_key(&state, &meta_path, key).await?;
             let _ = crate::audit::open_on_unlock(&app, &state, key);
+            drop(_vault_lock);
             // Same restore as the password path: unlocking by fingerprint must
             // not leave the MCP server down when the user left it on (#350).
             crate::mcp::restore_on_unlock(&state, app).await;

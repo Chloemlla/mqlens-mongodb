@@ -3659,10 +3659,13 @@ async fn vault_unlock(
     password: String,
 ) -> Result<connections::VaultStatus, String> {
     let meta_path = connections::get_vault_meta_path(&app_handle);
-    // Both guards stay live through audit/MCP restoration, so a reset cannot
-    // remove a vault while an unlock is installing its services.
+    // The in-process reset guard stays live through audit/MCP restoration. The
+    // file lock protects metadata/key installation and audit opening, then must
+    // be released before MCP restoration, which may persist settings through
+    // the same non-reentrant lock.
     let (key, _no_reset, _vault_lock) = unlock_vault_key(&state, &meta_path, &password).await?;
     let _ = audit::open_on_unlock(&app_handle, &state, key);
+    drop(_vault_lock);
     // The MCP server needs the key, so this is the first moment it can come
     // back up. Best-effort by design — see `restore_on_unlock` (#350).
     mcp::restore_on_unlock(&state, app_handle).await;

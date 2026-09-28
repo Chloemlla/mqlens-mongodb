@@ -7475,6 +7475,39 @@ mod vault_reset_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[test]
+    fn unlock_paths_release_the_vault_lock_before_restoring_mcp() {
+        let lib = include_str!("lib.rs");
+        let password_unlock = lib
+            .split("async fn vault_unlock(")
+            .nth(1)
+            .unwrap()
+            .split("async fn unlock_vault_key(")
+            .next()
+            .unwrap();
+        let biometric = include_str!("biometric.rs");
+        let biometric_unlock = biometric
+            .split("pub async fn biometric_unlock(")
+            .nth(1)
+            .unwrap()
+            .split("/// Forget the stored key")
+            .next()
+            .unwrap();
+
+        for (name, body) in [
+            ("password", password_unlock),
+            ("biometric", biometric_unlock),
+        ] {
+            let release = body
+                .find("drop(_vault_lock);")
+                .unwrap_or_else(|| panic!("{name} unlock does not release the vault lock"));
+            let restore = body
+                .find("mcp::restore_on_unlock")
+                .unwrap_or_else(|| panic!("{name} unlock does not restore MCP"));
+            assert!(release < restore, "{name} unlock restores MCP under the vault lock");
+        }
+    }
+
     // Initialization and reset must use the same cross-process vault lock. A
     // process initializing after reset begins cannot have its new metadata
     // deleted by the still-running reset.
