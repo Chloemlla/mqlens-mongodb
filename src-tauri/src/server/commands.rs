@@ -195,12 +195,15 @@ pub(crate) async fn list_connections_impl(
 /// to be ended on their servers. Sessions are dropped here regardless. `key` is
 /// the vault key being discarded, taken by the caller before anything waits,
 /// or `None` when the vault is locked and the tokens cannot be read.
+/// `other_files` are the vault's other files, removed first under the same
+/// lock.
 pub(crate) async fn reset_accounts(
     state: &AppState,
     path: &Path,
     key: Option<[u8; 32]>,
+    other_files: Vec<std::path::PathBuf>,
 ) -> Result<PendingSignOuts, String> {
-    reset_accounts_within(state, path, key, RESET_SIGN_OUT_TIMEOUT).await
+    reset_accounts_within(state, path, key, other_files, RESET_SIGN_OUT_TIMEOUT).await
 }
 
 /// Sessions a vault reset took out of the accounts file and has yet to end on
@@ -240,12 +243,15 @@ async fn reset_accounts_within(
     state: &AppState,
     path: &Path,
     key: Option<[u8; 32]>,
+    other_files: Vec<std::path::PathBuf>,
     limit: Duration,
 ) -> Result<PendingSignOuts, String> {
     state.server.clear().await;
-    // One locked step takes every stored token and removes the accounts file
-    // and then the vault metadata, last, so a failure part way leaves a vault
-    // that still opens. After it, nothing can present one of these tokens
+    // One locked step checks the key, takes every stored token and removes the
+    // vault's other files, the accounts file and then the vault metadata, last,
+    // so a failure part way leaves a vault that still opens. A password change
+    // holds this lock through its rotation, in any MQLens process, so it runs
+    // wholly before or after. After it, nothing can present one of these tokens
     // again while it is revoked (which would trip the server's reuse check),
     // a sign-in still in flight finds its account gone and ends its own
     // session, and a write from any process sees the vault gone and is refused.
@@ -279,7 +285,10 @@ async fn reset_accounts_within(
             false => Ok(()),
         };
         // Still in the file, the tokens need no ending: the reset failed and
-        // the vault is as it was.
+        // the vault still opens.
+        for p in &other_files {
+            remove(p)?;
+        }
         remove(&file)?;
         Ok((taken, remove(&accounts::vault_meta_path(&file)).err()))
     })
@@ -750,12 +759,18 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        reset_accounts_within(&state, &env.path, Some(KEY), Duration::from_millis(500))
-            .await
-            .unwrap()
-            .finish()
-            .await
-            .unwrap();
+        reset_accounts_within(
+            &state,
+            &env.path,
+            Some(KEY),
+            Vec::new(),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
         env.fake.with(|s| {
             assert_eq!(
                 s.live_families(),
@@ -820,12 +835,18 @@ mod tests {
             )
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        reset_accounts_within(&state, &env.path, Some(KEY), Duration::from_millis(500))
-            .await
-            .unwrap()
-            .finish()
-            .await
-            .unwrap();
+        reset_accounts_within(
+            &state,
+            &env.path,
+            Some(KEY),
+            Vec::new(),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
 
         let result = signing_in.await.unwrap();
         assert!(
@@ -926,9 +947,15 @@ mod tests {
         .unwrap();
 
         let started = std::time::Instant::now();
-        let pending = reset_accounts_within(&state, &env.path, Some(KEY), Duration::from_secs(3))
-            .await
-            .unwrap();
+        let pending = reset_accounts_within(
+            &state,
+            &env.path,
+            Some(KEY),
+            Vec::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the reset step waited {:?} on servers",
@@ -952,7 +979,9 @@ mod tests {
         env.fake
             .with(|s| s.logout_delay = Duration::from_millis(300));
 
-        let pending = reset_accounts(&state, &env.path, Some(KEY)).await.unwrap();
+        let pending = reset_accounts(&state, &env.path, Some(KEY), Vec::new())
+            .await
+            .unwrap();
         assert!(!env.path.exists());
         pending.finish().await.unwrap();
         env.fake.with(|s| {
@@ -973,7 +1002,9 @@ mod tests {
         std::fs::remove_file(&env.path).unwrap();
         std::fs::create_dir(&env.path).unwrap();
 
-        assert!(reset_accounts(&state, &env.path, Some(KEY)).await.is_err());
+        assert!(reset_accounts(&state, &env.path, Some(KEY), Vec::new())
+            .await
+            .is_err());
         assert!(
             accounts::vault_meta_path(&env.path).exists(),
             "vault.json went before the accounts file"
@@ -997,7 +1028,7 @@ mod tests {
         .unwrap();
         write_vault_meta(&env.path, &rotated);
 
-        let result = reset_accounts(&state, &env.path, Some(KEY)).await;
+        let result = reset_accounts(&state, &env.path, Some(KEY), Vec::new()).await;
         assert!(result.is_err(), "the reset went ahead with a stale key");
         assert!(env.path.exists(), "the rotated accounts file was deleted");
         assert!(accounts::vault_meta_path(&env.path).exists());
@@ -1011,7 +1042,7 @@ mod tests {
             .await
             .unwrap();
 
-        reset_accounts(&state, &env.path, Some(KEY))
+        reset_accounts(&state, &env.path, Some(KEY), Vec::new())
             .await
             .unwrap()
             .finish()
@@ -1024,7 +1055,7 @@ mod tests {
         // Locked, there is no key to read tokens with; the files still go.
         let locked = AppState::new();
         write_vault_meta(&env.path, &KEY);
-        reset_accounts(&locked, &env.path, None)
+        reset_accounts(&locked, &env.path, None, Vec::new())
             .await
             .unwrap()
             .finish()

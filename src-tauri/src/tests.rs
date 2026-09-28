@@ -7626,6 +7626,41 @@ mod vault_reset_tests {
         );
     }
 
+    // A password change holds the accounts lock through its rotation, in this
+    // process or another. A reset starting meanwhile must find out the vault
+    // moved to another key before it removes anything: afterwards is too late
+    // for the profiles and settings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_overtaken_by_a_password_change_removes_nothing() {
+        let env = Env::new().await;
+        let state = Arc::new(AppState::new());
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let profiles = dir.join("profiles.json.enc");
+        std::fs::write(&profiles, b"profiles").unwrap();
+        let held = crate::server::accounts::lock(&env.path).unwrap();
+        let files = [profiles.clone(), dir.join("settings.json.enc")];
+
+        let resetting = {
+            let state = state.clone();
+            let path = env.path.clone();
+            tokio::spawn(
+                async move { crate::reset_vault_files(&state, &path, files, || Ok(())).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The password change commits its new key under the lock.
+        std::fs::remove_file(&env.path).unwrap();
+        crate::server::fake::write_vault_meta(&env.path, &[9; 32]);
+        drop(held);
+
+        assert!(resetting.await.unwrap().is_err());
+        assert!(
+            profiles.exists(),
+            "the reset removed the profiles of a vault it did not hold the key for"
+        );
+    }
+
     // A reset waits on servers to end the stored sessions. The key it discards
     // must be gone by then: a window saving a profile or the settings meanwhile
     // would recreate those files under that key, and the next vault could not

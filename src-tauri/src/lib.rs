@@ -3648,8 +3648,9 @@ async fn vault_reset(
 
 /// The file part of `vault_reset`: runs `reset_audit`, drops the key, removes
 /// `files` (the vault files other than vault.json), then the MQLens Server
-/// accounts file and vault.json, and only then ends the stored server
-/// sessions. An unlock in this process waits for all of it.
+/// accounts file and vault.json, all under the accounts lock, and only then
+/// ends the stored server sessions. An unlock in this process waits for all of
+/// it.
 async fn reset_vault_files(
     state: &AppState,
     server_accounts_path: &std::path::Path,
@@ -3672,18 +3673,13 @@ async fn reset_vault_files(
     };
     // Same precondition as `vault_lock`: no key means no MCP server.
     let stopped = mcp::stop_if_running(state).await;
-    // vault.json is what makes the other files a vault, so it goes last: a
-    // reset that fails part way leaves a vault that still opens. It goes with
-    // the accounts file, under that file's cross-process lock, so an account
-    // write from any MQLens process cannot recreate the accounts file under
-    // the discarded key.
-    let removed = files.into_iter().filter(|p| p.exists()).try_for_each(|p| {
-        std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
-    });
-    let sign_outs = match removed {
-        Ok(()) => server::commands::reset_accounts(state, server_accounts_path, key).await,
-        Err(e) => Err(e),
-    };
+    // Every file goes under the accounts file's cross-process lock, once the
+    // key is confirmed as the vault's: a password change in any MQLens process
+    // holds that lock through its rotation, and an account write cannot
+    // recreate the accounts file under the discarded key. vault.json goes
+    // last, so a reset that fails part way leaves a vault that still opens.
+    let sign_outs =
+        server::commands::reset_accounts(state, server_accounts_path, key, files.into()).await;
     // Their tokens are already deleted: these sessions are ended now or never,
     // whether or not the rest of the reset went through.
     let finished = match sign_outs {
