@@ -260,8 +260,16 @@ impl AccountSession {
             Ok(None) => {}
             Err(e) => {
                 // A session nobody holds must not stay usable on the server.
-                let _ = logout(&session.channel, &login.access_token, &login.refresh_token).await;
-                return Err(format!("Could not save the MQLens Server session: {e}"));
+                let ended_on_server =
+                    logout(&session.channel, &login.access_token, &login.refresh_token)
+                        .await
+                        .is_ok();
+                if ended_on_server {
+                    return Err(format!("Could not save the MQLens Server session: {e}"));
+                }
+                return Err(format!(
+                    "Could not save the MQLens Server session ({e}) and could not confirm ending it. The server session may still be active."
+                ));
             }
         }
         session.adopt(login).await;
@@ -1037,6 +1045,26 @@ mod tests {
             assert_eq!(s.logouts, 1);
             assert_eq!(s.live_families(), 0);
         });
+    }
+
+    #[tokio::test]
+    async fn a_session_that_cannot_be_stored_reports_when_cleanup_logout_fails() {
+        let env = Env::new().await;
+        let locked: Arc<dyn TokenStore> = Arc::new(FileTokenStore::new(
+            env.path.clone(),
+            Arc::new(|| Err("vault is locked".to_string())),
+        ));
+        env.fake
+            .with(|s| s.logout_failures.push(Code::Unavailable));
+
+        let error = match AccountSession::sign_in(&env.account, PASSWORD, locked).await {
+            Err(error) => error,
+            Ok(_) => panic!("signed in even though the vault could not store the session"),
+        };
+
+        assert!(error.contains("could not confirm ending it"), "{error}");
+        assert!(error.contains("may still be active"), "{error}");
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
     struct FailingWrites {
