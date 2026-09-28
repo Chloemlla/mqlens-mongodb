@@ -260,13 +260,13 @@ pub fn load_persisted(state: &AppState, app_handle: &tauri::AppHandle) -> McpPer
 /// Merge the MCP fields into the stored settings under the same in-process and
 /// cross-process write locks `patch_app_settings` uses, so a settings edit in
 /// another window (or another MQLens) cannot lose this write, or be lost by it.
-pub fn save_persisted(
+pub async fn save_persisted(
     state: &AppState,
     app_handle: &tauri::AppHandle,
     next: &McpPersisted,
 ) -> Result<(), String> {
     let meta_path = crate::connections::get_vault_meta_path(app_handle);
-    let (_vault_lock, key) = crate::lock_vault_and_get_key(state, &meta_path)?;
+    let (_vault_lock, key) = crate::lock_vault_and_get_key_async(state, &meta_path).await?;
     let path = crate::connections::get_settings_enc_path(app_handle);
     let _guard = state.settings_write.lock().map_err(|e| e.to_string())?;
     let _file_lock = crate::connections::lock_settings_for_write(&path)?;
@@ -341,7 +341,7 @@ pub async fn set_enabled_impl(
             // `mcp_enabled = true` on disk, so the next unlock starts the server
             // again — silently undoing an explicit disable. The user has to be
             // told that one did not stick (#350 review).
-            save_persisted(state, app, &persisted)?;
+            save_persisted(state, app, &persisted).await?;
         }
         return get_status_impl(state);
     }
@@ -404,7 +404,7 @@ pub async fn set_enabled_impl(
         // After the bind succeeded, so a failed enable never records itself as
         // the state to restore on the next unlock — and before `app_handle` is
         // handed to the server task below.
-        let _ = save_persisted(state, app, &McpPersisted { enabled: true, port, token: token_for_disk });
+        let _ = save_persisted(state, app, &McpPersisted { enabled: true, port, token: token_for_disk }).await;
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -469,7 +469,7 @@ pub async fn stop_if_running(state: &AppState) -> Result<(), String> {
 /// disabled server can still have a stale token sitting in state from a
 /// previous session, and regenerating it before the next enable is a
 /// reasonable thing for a user to want.
-pub fn regenerate_token_impl(
+pub async fn regenerate_token_impl(
     state: &AppState,
     app_handle: Option<&tauri::AppHandle>,
 ) -> Result<McpStatusUi, String> {
@@ -485,7 +485,7 @@ pub fn regenerate_token_impl(
         // just replaced — which is the one the user asked to stop honouring.
         let mut persisted = load_persisted(state, app);
         persisted.token = status.token.clone();
-        save_persisted(state, app, &persisted)?;
+        save_persisted(state, app, &persisted).await?;
     }
     Ok(status)
 }
@@ -1425,7 +1425,7 @@ mod tests {
             .and_then(|s| s.split("return get_status_impl(state);").next())
             .expect("the disable branch of set_enabled_impl");
         assert!(
-            disable.contains("save_persisted(state, app, &persisted)?"),
+            disable.contains("save_persisted(state, app, &persisted).await?"),
             "the disable branch must propagate a failed persist"
         );
         assert!(
@@ -2049,7 +2049,7 @@ mod tests {
         let status = set_enabled_impl(&state, true, Some(0), None).await.unwrap();
         let original = status.token;
 
-        let regenerated = regenerate_token_impl(&state, None).unwrap();
+        let regenerated = regenerate_token_impl(&state, None).await.unwrap();
         assert_ne!(regenerated.token, original);
         assert!(regenerated.enabled, "regenerating must not touch enablement");
 
@@ -2062,9 +2062,9 @@ mod tests {
     #[tokio::test]
     async fn regenerate_token_works_while_disabled() {
         let state = AppState::new();
-        let first = regenerate_token_impl(&state, None).unwrap();
+        let first = regenerate_token_impl(&state, None).await.unwrap();
         assert!(!first.token.is_empty());
-        let second = regenerate_token_impl(&state, None).unwrap();
+        let second = regenerate_token_impl(&state, None).await.unwrap();
         assert_ne!(first.token, second.token);
         assert!(!second.enabled);
     }
@@ -2231,7 +2231,7 @@ mod tests {
         let mut client = TestClient::new(status.port, &old_token);
         client.initialize().await; // works with the original token
 
-        let regenerated = regenerate_token_impl(&state, None).unwrap();
+        let regenerated = regenerate_token_impl(&state, None).await.unwrap();
         assert_ne!(regenerated.token, old_token);
 
         // Same client, same (now-stale) captured token: the *next* request must 401.

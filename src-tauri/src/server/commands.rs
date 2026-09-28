@@ -194,7 +194,9 @@ pub(crate) async fn list_connections_impl(
 /// vault.json under the accounts lock, and hands back the stored sessions still
 /// to be ended on their servers. Sessions are dropped here regardless. `key` is
 /// the vault key being discarded, taken by the caller before anything waits,
-/// or `None` when the vault is locked and the tokens cannot be read.
+/// or `None` when the vault is locked and the tokens cannot be read. A locked
+/// reset is rejected while the accounts file exists, because deleting it
+/// would discard the only credentials that can revoke those sessions.
 /// `other_files` are the vault's other files, removed first under the same
 /// lock.
 pub(crate) async fn reset_accounts(
@@ -259,6 +261,9 @@ async fn reset_accounts_within(
     let file = path.to_path_buf();
     let (taken, failed) = blocking(move || {
         let _lock = accounts::lock(&file)?;
+        if key.is_none() && file.exists() {
+            return Err("Unlock the vault before resetting its MQLens Server accounts.".to_string());
+        }
         // The key was captured before this lock was free. A password change
         // meanwhile, here or in another MQLens process, rotated the vault to
         // another key: going on would read no tokens and delete a vault this
@@ -1062,5 +1067,29 @@ mod tests {
             .await
             .unwrap();
         assert!(!accounts::vault_meta_path(&env.path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_locked_vault_reset_keeps_server_tokens_until_they_can_be_revoked() {
+        let env = Env::new().await;
+        let state = unlocked();
+        sign_in_impl(&state, &env.path, &env.account.id, PASSWORD.to_string())
+            .await
+            .unwrap();
+        *state.vault_key.lock().unwrap() = None;
+
+        let error = reset_accounts(&state, &env.path, None, Vec::new())
+            .await
+            .err()
+            .expect("a locked reset must not delete unrecoverable refresh tokens");
+        assert!(error.contains("Unlock the vault"), "unexpected error: {error}");
+        assert!(env.path.exists(), "the accounts file was deleted while locked");
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
+
+        let pending = reset_accounts(&state, &env.path, Some(KEY), Vec::new())
+            .await
+            .unwrap();
+        pending.finish().await.unwrap();
+        env.fake.with(|s| assert_eq!(s.live_families(), 0));
     }
 }

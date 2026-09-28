@@ -7536,7 +7536,7 @@ mod vault_reset_tests {
 
         // The initialization transaction commits before releasing this guard.
         let meta = crate::connections::build_vault_meta(
-            "new-vault",
+            &uuid::Uuid::new_v4().to_string(),
             crate::vault::KdfParams { m_kib: 8, t: 1, p: 1 },
         )
         .unwrap();
@@ -7664,6 +7664,38 @@ mod vault_reset_tests {
             crate::server::accounts::vault_meta_path(&env.path).exists(),
             "vault.json went before the files it describes"
         );
+    }
+
+    #[tokio::test]
+    async fn a_locked_reset_with_server_accounts_preserves_the_vault_and_audit() {
+        let env = Env::new().await;
+        let state = AppState::new();
+        *state.vault_key.lock().unwrap() = Some(KEY);
+        crate::server::commands::sign_in_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            PASSWORD.to_string(),
+        )
+        .await
+        .unwrap();
+        *state.vault_key.lock().unwrap() = None;
+        let reset_audit_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let was_called = reset_audit_called.clone();
+        let dir = env.path.parent().unwrap().to_path_buf();
+        let files = [dir.join("profiles.json.enc"), dir.join("settings.json.enc")];
+
+        let result = crate::reset_vault_files(&state, &env.path, files, move || {
+            was_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(result.unwrap_err().contains("Unlock the vault"));
+        assert!(!reset_audit_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(env.path.exists(), "locked reset deleted the accounts file");
+        assert!(crate::server::accounts::vault_meta_path(&env.path).exists());
+        env.fake.with(|s| assert_eq!(s.live_families(), 1));
     }
 
     // Once the accounts file is gone its tokens exist nowhere else. If

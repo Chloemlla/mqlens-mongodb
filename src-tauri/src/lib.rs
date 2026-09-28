@@ -3554,7 +3554,7 @@ pub(crate) fn lock_vault_and_get_key(
     Ok((lock, key))
 }
 
-async fn lock_vault_and_get_key_async(
+pub(crate) async fn lock_vault_and_get_key_async(
     state: &AppState,
     meta_path: &std::path::Path,
 ) -> Result<(std::fs::File, [u8; 32]), String> {
@@ -3757,6 +3757,13 @@ async fn reset_vault_files(
                 );
             }
         }
+    }
+    // A locked vault's encrypted account file may be the only place holding
+    // refresh tokens for live MQLens Server sessions. We cannot safely delete
+    // it until the user unlocks and lets reset revoke those sessions. Check
+    // before clearing audit data or dropping any process state.
+    if state.require_key().is_err() && server_accounts_path.exists() {
+        return Err("Unlock the vault before resetting its MQLens Server accounts.".to_string());
     }
     // Before any core vault file is removed: if the audit log cannot be
     // deleted, a replacement vault would start with a log its new key cannot
@@ -4028,7 +4035,7 @@ async fn mcp_regenerate_token(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<mcp::McpStatusUi, String> {
-    mcp::regenerate_token_impl(&state, Some(&app_handle))
+    mcp::regenerate_token_impl(&state, Some(&app_handle)).await
 }
 
 /// Append a frontend crash report to a log file the user can find and attach.
