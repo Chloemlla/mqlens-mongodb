@@ -499,7 +499,7 @@
       "generic": "Biometrie verwenden",
       "touchId": "Touch ID verwenden"
     },
-    "confirmReset": "Zurücksetzen löscht ALLE gespeicherten Verbindungen und API-Schlüssel. Fortfahren?",
+    "confirmReset": "Beim Zurücksetzen werden ALLE gespeicherten Verbindungen, API-Schlüssel und verschlüsselten MQLens-Server-Sitzungstoken gelöscht. Da der Tresor gesperrt ist, können aktive Serversitzungen nicht widerrufen werden und möglicherweise aktiv bleiben. Fortfahren?",
     "descriptions": {
       "setup": "Deine gespeicherten Verbindungen und API-Schlüssel werden mit diesem Passwort verschlüsselt. Es gibt keine Wiederherstellung, wenn du es vergisst.",
       "unlock": "Gib dein Master-Passwort ein, um deine gespeicherten Zugangsdaten zu entschlüsseln."

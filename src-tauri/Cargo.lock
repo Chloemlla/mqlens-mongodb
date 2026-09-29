@@ -6565,6 +6565,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "uuid",
+ "zeroize",
  "zip 8.6.0",
 ]
 
