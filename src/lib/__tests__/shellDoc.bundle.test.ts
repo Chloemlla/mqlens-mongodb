@@ -47,6 +47,7 @@ describe('shellDoc, bundled and minified', () => {
         `    outDir: ${JSON.stringify(dir)},`,
         `    emptyOutDir: false,`,
         `    lib: { entry: ${JSON.stringify(path.join(dir, 'entry.mjs'))}, formats: ['es'], fileName: 'bundle' },`,
+        `    minify: 'esbuild',`,
         `    target: 'es2021',`,
         `  },`,
         `});`,

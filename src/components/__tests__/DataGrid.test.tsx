@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import React from 'react';
 import { render, screen, fireEvent, within, cleanup } from '@testing-library/react';
 import { ObjectId } from 'bson';
@@ -45,6 +45,14 @@ const collectNames = (node: any): string[] => [
   node.name,
   ...(node.children || []).flatMap(collectNames),
 ];
+
+beforeEach(() => {
+  localStorage.removeItem('mqlens.dateDisplayTimezone');
+});
+
+afterEach(() => {
+  localStorage.removeItem('mqlens.dateDisplayTimezone');
+});
 
 describe('getExplainTree (M1)', () => {
   it('parses the find explain shape (queryPlanner.winningPlan)', () => {
@@ -212,7 +220,6 @@ describe('DataGrid Component', () => {
   });
 
   it('shows ObjectId timestamps and persists the Date timezone display preference', () => {
-    localStorage.removeItem('mqlens.dateDisplayTimezone');
     render(<DataGrid documents={[{
       _id: { $oid: '603d779f4f102e3a185c3220' },
       created_at: { $date: '2025-05-18T14:32:00Z' },
@@ -229,7 +236,34 @@ describe('DataGrid Component', () => {
     expect(screen.getByTestId('date-timezone-toggle')).toHaveTextContent('Local');
     expect(localStorage.getItem('mqlens.dateDisplayTimezone')).toBe('local');
     expect(screen.queryByText('"2025-05-18T14:32:00.000Z"')).not.toBeInTheDocument();
-    localStorage.removeItem('mqlens.dateDisplayTimezone');
+
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(screen.getByTestId('date-timezone-toggle')).toHaveTextContent('Local');
+    expect(screen.queryByText('2025-05-18T14:32:00.000Z')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+    expect(screen.getByTestId('date-timezone-toggle')).toHaveTextContent('Local');
+    expect(screen.queryByText('"2025-05-18T14:32:00.000Z"')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('date-timezone-toggle'));
+    expect(screen.getByTestId('date-timezone-toggle')).toHaveTextContent('UTC');
+    expect(screen.getByText('"2025-05-18T14:32:00.000Z"')).toBeInTheDocument();
+  });
+
+  it('keeps mounted grids synchronized when the timezone changes', () => {
+    const documents = [{ created_at: { $date: '2025-05-18T14:32:00Z' } }];
+    render(
+      <>
+        <DataGrid documents={documents} />
+        <DataGrid documents={documents} />
+      </>
+    );
+
+    const toggles = screen.getAllByTestId('date-timezone-toggle');
+    expect(toggles).toHaveLength(2);
+    fireEvent.click(toggles[0]);
+    expect(toggles[0]).toHaveTextContent('Local');
+    expect(toggles[1]).toHaveTextContent('Local');
   });
 
   it('switches back to results tab automatically when documents list changes', () => {

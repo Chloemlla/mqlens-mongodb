@@ -949,12 +949,25 @@ export const DataGrid: React.FC<DataGridProps> = ({
       return 'utc';
     }
   });
+  useEffect(() => {
+    const syncDateTimezone = () => {
+      try {
+        setDateTimezone(localStorage.getItem('mqlens.dateDisplayTimezone') === 'local' ? 'local' : 'utc');
+      } catch {
+        setDateTimezone('utc');
+      }
+    };
+    window.addEventListener('mqlens:date-timezone-changed', syncDateTimezone);
+    return () => window.removeEventListener('mqlens:date-timezone-changed', syncDateTimezone);
+  }, []);
+
   const bsonDisplayOptions = { dateTimezone };
   const toggleDateTimezone = () => {
     const next: DateDisplayTimezone = dateTimezone === 'utc' ? 'local' : 'utc';
     setDateTimezone(next);
     try {
       localStorage.setItem('mqlens.dateDisplayTimezone', next);
+      window.dispatchEvent(new Event('mqlens:date-timezone-changed'));
     } catch {
       // Display preference is best-effort only.
     }

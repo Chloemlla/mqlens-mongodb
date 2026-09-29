@@ -41,12 +41,13 @@ export interface BsonDisplayOptions {
 }
 
 function displayDate(value: Date, timezone: DateDisplayTimezone = "utc"): string {
+  if (Number.isNaN(value.getTime())) return "";
   if (timezone === "utc") return value.toISOString();
   const pad = (n: number, width = 2) => String(n).padStart(width, "0");
   const offsetMinutes = -value.getTimezoneOffset();
   const sign = offsetMinutes >= 0 ? "+" : "-";
   const absoluteOffset = Math.abs(offsetMinutes);
-  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}T${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}.${pad(value.getMilliseconds(), 3)}${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
+  return `${pad(value.getFullYear(), 4)}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}T${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}.${pad(value.getMilliseconds(), 3)}${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
 }
 
 /**
@@ -83,10 +84,10 @@ const BSON_KINDS: readonly BsonKind[] = [
   {
     label: "ObjectId",
     matches: (v) => v instanceof ObjectId,
-    call: (v: ObjectId) => ({
+    call: (v: ObjectId, options) => ({
       ctor: "ObjectId",
       args: [{ text: jsonStringLiteral(v.toString()), kind: "string" }],
-      title: v.getTimestamp().toISOString(),
+      title: displayDate(v.getTimestamp(), options?.dateTimezone),
     }),
   },
   {
@@ -221,7 +222,10 @@ export function plainBsonShape(val: Record<string, any>, options?: BsonDisplayOp
       return {
         text: val.$oid,
         kind: "string",
-        title: ObjectId.createFromHexString(val.$oid).getTimestamp().toISOString(),
+        title: displayDate(
+          ObjectId.createFromHexString(val.$oid).getTimestamp(),
+          options?.dateTimezone,
+        ),
       };
     } catch {
       return { text: val.$oid, kind: "string" };
@@ -229,10 +233,14 @@ export function plainBsonShape(val: Record<string, any>, options?: BsonDisplayOp
   }
   if (val.$date !== undefined) {
     if (typeof val.$date === "string") {
-      return { text: displayDate(new Date(val.$date), options?.dateTimezone), kind: "string" };
+      const date = new Date(val.$date);
+      const text = displayDate(date, options?.dateTimezone);
+      return { text: text || val.$date, kind: "string" };
     }
     if (val.$date?.$numberLong) {
-      return { text: displayDate(new Date(Number(val.$date.$numberLong)), options?.dateTimezone), kind: "string" };
+      const raw = String(val.$date.$numberLong);
+      const text = displayDate(new Date(Number(raw)), options?.dateTimezone);
+      return { text: text || raw, kind: "string" };
     }
     return { text: JSON.stringify(val.$date), kind: "string" };
   }

@@ -69,6 +69,8 @@ describe('bsonCallOf', () => {
       args: [{ text: '"507f1f77bcf86cd799439011"', kind: 'string' }],
       title: '2012-10-17T21:13:27.000Z',
     });
+    expect(bsonCallOf(new ObjectId('507f1f77bcf86cd799439011'), { dateTimezone: 'local' })?.title)
+      .toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000[+-]\d{2}:\d{2}$/);
     expect(bsonCallOf(Long.fromString('42'))).toEqual({
       ctor: 'NumberLong',
       args: [{ text: '42', kind: 'number' }],
@@ -121,6 +123,26 @@ describe('plainBsonShape — the table view’s extended-JSON shapes', () => {
     expect(plainBsonShape({ $numberDouble: '1.5' })).toEqual({ text: '1.5', kind: 'number' });
   });
 
+  it('formats table dates locally and falls back safely for malformed dates', () => {
+    const localString = plainBsonShape(
+      { $date: '2026-08-27T10:00:00.000Z' },
+      { dateTimezone: 'local' },
+    );
+    expect(localString?.text).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000[+-]\d{2}:\d{2}$/);
+
+    const localLong = plainBsonShape(
+      { $date: { $numberLong: '0' } },
+      { dateTimezone: 'local' },
+    );
+    expect(localLong?.text).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000[+-]\d{2}:\d{2}$/);
+
+    expect(plainBsonShape({ $date: 'invalid' })).toEqual({ text: 'invalid', kind: 'string' });
+    expect(plainBsonShape({ $date: { $numberLong: 'abc' } })).toEqual({
+      text: 'abc',
+      kind: 'string',
+    });
+  });
+
   it('is null for an ordinary object', () => {
     expect(plainBsonShape({ city: 'Pforzheim' })).toBeNull();
   });
@@ -138,6 +160,15 @@ describe('tableValueText — what the table view displays', () => {
     expect(tableValueText({ $oid: '507f1f77bcf86cd799439011' })).toBe(
       '507f1f77bcf86cd799439011',
     );
+  });
+
+  it('uses the local date display for table text too', () => {
+    expect(
+      tableValueText(
+        { $date: '2026-08-27T10:00:00.000Z' },
+        { dateTimezone: 'local' },
+      ),
+    ).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000[+-]\d{2}:\d{2}$/);
   });
 
   it('still calls a constructor when the value is a real BSON instance', () => {
