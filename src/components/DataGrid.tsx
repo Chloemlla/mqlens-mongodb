@@ -27,6 +27,7 @@ import {
   jsonStringLiteral,
   plainBsonShape,
   tableValueText,
+  type DateDisplayTimezone,
 } from '../lib/bsonDisplay';
 import type { ListImperativeAPI } from 'react-window';
 import { Button } from '@/components/ui/button';
@@ -941,6 +942,37 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const [dateTimezone, setDateTimezone] = useState<DateDisplayTimezone>(() => {
+    try {
+      return localStorage.getItem('mqlens.dateDisplayTimezone') === 'local' ? 'local' : 'utc';
+    } catch {
+      return 'utc';
+    }
+  });
+  useEffect(() => {
+    const syncDateTimezone = () => {
+      try {
+        setDateTimezone(localStorage.getItem('mqlens.dateDisplayTimezone') === 'local' ? 'local' : 'utc');
+      } catch {
+        setDateTimezone('utc');
+      }
+    };
+    window.addEventListener('mqlens:date-timezone-changed', syncDateTimezone);
+    return () => window.removeEventListener('mqlens:date-timezone-changed', syncDateTimezone);
+  }, []);
+
+  const bsonDisplayOptions = { dateTimezone };
+  const toggleDateTimezone = () => {
+    const next: DateDisplayTimezone = dateTimezone === 'utc' ? 'local' : 'utc';
+    setDateTimezone(next);
+    try {
+      localStorage.setItem('mqlens.dateDisplayTimezone', next);
+      window.dispatchEvent(new Event('mqlens:date-timezone-changed'));
+    } catch {
+      // Display preference is best-effort only.
+    }
+  };
+
   // Parse documents as rich BSON-typed objects once
   const parsedDocs = useMemo(() => {
     return documents.map(doc => {
@@ -978,10 +1010,10 @@ export const DataGrid: React.FC<DataGridProps> = ({
       return <span className="text-syntax-string">{printableJsonString(val)}</span>;
     }
 
-    const call = bsonCallOf(val);
+    const call = bsonCallOf(val, bsonDisplayOptions);
     if (call) {
       return (
-        <>
+        <span title={call.title}>
           <span className="text-syntax-boolean">{call.ctor}</span>(
           {call.args.map((arg, i) => (
             <React.Fragment key={i}>
@@ -992,7 +1024,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
             </React.Fragment>
           ))}
           )
-        </>
+        </span>
       );
     }
     return <span>{String(val)}</span>;
@@ -1007,11 +1039,12 @@ export const DataGrid: React.FC<DataGridProps> = ({
     if (typeof val === 'boolean') return <span className="text-syntax-boolean font-bold">{val ? 'true' : 'false'}</span>;
     if (typeof val === 'object') {
       if (isBsonInstance(val)) return renderBsonValueNode(val);
-      const plain = plainBsonShape(val);
+      const plain = plainBsonShape(val, bsonDisplayOptions);
       if (plain) {
         return (
           <span
             className={plain.kind === 'number' ? 'text-syntax-number' : 'text-syntax-string'}
+            title={plain.title}
           >
             {plain.text}
           </span>
@@ -1030,7 +1063,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
     if (v !== null && typeof v === 'object' && !isBsonObject(v)) return 12;
     // Exact rather than estimated: the displayed text is now available, so the
     // per-type guesses (40 for an ObjectId, 64 for any Binary) are gone.
-    return bsonValueText(v).length;
+    return bsonValueText(v, bsonDisplayOptions).length;
   };
 
   const { jsonLines, jsonMaxWidthPx } = useMemo<{ jsonLines: JsonLine[]; jsonMaxWidthPx: number }>(() => {
@@ -1109,7 +1142,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
     const maxWidthPx = Math.max(320, 68 + Math.ceil(maxChars * 7.2));
     return { jsonLines: lines, jsonMaxWidthPx: maxWidthPx };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [parsedDocs, documents]);
+  }, [parsedDocs, documents, dateTimezone]);
 
   // The result's identity: what was asked for — the query, the page — and the
   // shape of what came back: its documents in order, then every foldable
@@ -1218,7 +1251,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
     const comma = line.hasComma ? ',' : '';
     switch (line.kind) {
       case 'scalar':
-        return `${key}${bsonValueText(line.value)}${comma}`;
+        return `${key}${bsonValueText(line.value, bsonDisplayOptions)}${comma}`;
       case 'open':
         return `${key}${line.bracket || '{'}`;
       case 'empty':
@@ -1639,7 +1672,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
   const treeRowText = (row: TreeRow): string => {
     const value =
       row.kind === 'scalar'
-        ? bsonValueText(row.value)
+        ? bsonValueText(row.value, bsonDisplayOptions)
         : row.kind === 'array'
           ? t('dataGrid.labels.elements', { count: row.childCount })
           : t('dataGrid.labels.fields', { count: row.childCount });
@@ -1685,7 +1718,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
           columns.map((col) => ({
             rowIndex: index,
             columnKey: col,
-            text: tableValueText((doc as Record<string, unknown>)?.[col]),
+            text: tableValueText((doc as Record<string, unknown>)?.[col], bsonDisplayOptions),
           }))
         )
       );
@@ -1695,7 +1728,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
     // jsonLineText/treeRowText are recreated each render but read only the rows
     // and the translator, both of which are already dependencies.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [findOpen, viewMode, jsonLines, treeRows, documents, columns, t]);
+  }, [findOpen, viewMode, jsonLines, treeRows, documents, columns, t, dateTimezone]);
 
   const findMatchList = useMemo(() => findMatches(findCells, findQuery), [findCells, findQuery]);
 
@@ -2152,6 +2185,16 @@ export const DataGrid: React.FC<DataGridProps> = ({
             </Button>
           )}
           {activeTab === 'results' ? (
+            <>
+            <button
+              type="button"
+              onClick={toggleDateTimezone}
+              className="rounded-md border border-border bg-background px-2 py-1 text-[11px] font-medium text-muted-foreground hover:text-foreground"
+              title={t('dataGrid.tooltips.dateTimezone')}
+              data-testid="date-timezone-toggle"
+            >
+              {dateTimezone === 'utc' ? t('dataGrid.labels.utc') : t('dataGrid.labels.local')}
+            </button>
             <div className="flex items-center rounded-md border border-border bg-background p-0.5">
               <button
                 role="button"
@@ -2205,6 +2248,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
                 <span>{t('dataGrid.viewModes.chart')}</span>
               </button>
             </div>
+            </>
           ) : activeTab === 'explain' ? (
             explainResult && (
               <Button
