@@ -143,7 +143,9 @@
       "showingRange": "显示第 {{from}}–{{to}} 条",
       "streamingDocuments": "正在异步加载文档…",
       "type": "类型",
-      "value": "值"
+      "value": "值",
+      "utc": "UTC",
+      "local": "本地"
     },
     "tabs": {
       "explainPlan": "执行计划",
@@ -165,7 +167,8 @@
       "insert": "插入新文档",
       "readOnly": "该连接为只读",
       "resizeColumn": "调整“{{label}}”列宽",
-      "updateMany": "更新所有匹配当前筛选条件的文档"
+      "updateMany": "更新所有匹配当前筛选条件的文档",
+      "dateTimezone": "切换日期显示时区"
     },
     "viewModes": {
       "chart": "图表",

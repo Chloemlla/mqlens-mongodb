@@ -555,7 +555,7 @@
       "generic": "Use biometrics",
       "touchId": "Use Touch ID"
     },
-    "confirmReset": "Reset deletes ALL saved connections and API keys. Continue?",
+    "confirmReset": "Reset deletes ALL saved connections, API keys, and encrypted MQLens Server session tokens. Because the vault is locked, active server sessions cannot be revoked and may remain active. Continue?",
     "descriptions": {
       "setup": "Your saved connections and API keys are encrypted with this password. There is no recovery if you forget it.",
       "unlock": "Enter your master password to decrypt your saved credentials."
