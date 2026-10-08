@@ -16,23 +16,59 @@ use crate::server::pb::mqlens::v1::connection_service_client::ConnectionServiceC
 use crate::server::pb::mqlens::v1::connection_service_server::{
     ConnectionService, ConnectionServiceServer,
 };
+use crate::server::pb::mqlens::v1::data_service_server::{DataService, DataServiceServer};
+use crate::server::pb::mqlens::v1::ddl_service_server::{DdlService, DdlServiceServer};
+use crate::server::pb::mqlens::v1::deployment_user_service_server::{
+    DeploymentUserService, DeploymentUserServiceServer,
+};
 use crate::server::pb::mqlens::v1::metadata_service_server::{
     MetadataService, MetadataServiceServer,
 };
+use crate::server::pb::mqlens::v1::monitoring_service_server::{
+    MonitoringService, MonitoringServiceServer,
+};
+use crate::server::pb::mqlens::v1::stats_service_server::{StatsService, StatsServiceServer};
 use crate::server::pb::mqlens::v1::{
     login_request, ConnectionRef, GetConnectionRequest, ListConnectionsRequest,
     ListConnectionsResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Principal,
     RefreshRequest, WhoAmIRequest, WhoAmIResponse,
 };
 use crate::server::pb::mqlens::v1::{
-    ConnectionCapabilities, CreateIndexRequest, DropIndexRequest, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest,
-    ListDatabasesResponse, ListIndexesRequest, ListIndexesResponse, MetadataAck,
-    MongoVersionRequest, MongoVersionResponse,
+    AggregateRequest, CountRequest, CountResponse, ExplainRequest, ExplainResponse, FindBatch,
+    FindRequest,
+};
+use crate::server::pb::mqlens::v1::{
+    CacheStats as PbCacheStats, CurrentOpsRequest, CurrentOpsResponse, GetProfilingStatusRequest,
+    KillOpRequest, MonitoringAck, OpCounters as PbOpCounters, ProfilingStatus as PbProfilingStatus,
+    ReadProfileRequest, ReadProfileResponse, ReplSetMember as PbReplSetMember,
+    ReplSetStatusRequest, ReplSetStatusResponse, ServerConnections, ServerMemory, ServerNetwork,
+    ServerStatusRequest, ServerStatusResponse, SetProfilingLevelRequest,
+};
+use crate::server::pb::mqlens::v1::{
+    CollStatsRequest, CollStatsResponse, DbStatsRequest, DbStatsResponse, IndexStat,
+    IndexStatsRequest, IndexStatsResponse,
+};
+use crate::server::pb::mqlens::v1::{
+    CollectionInfo as PbCollectionInfo, ConnectionCapabilities, CreateIndexRequest,
+    DropIndexRequest, GetCapabilitiesRequest, GetCapabilitiesResponse, IndexInfo as PbIndexInfo,
+    ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
+    ListIndexesRequest, ListIndexesResponse, MetadataAck, MongoVersionRequest,
+    MongoVersionResponse,
+};
+use crate::server::pb::mqlens::v1::{
+    CollectionValidation as PbCollectionValidation, CreateCollectionRequest,
+    CreateDeploymentUserRequest, CreateViewRequest, DdlAck, DeploymentRole, DeploymentUser,
+    DeploymentUserAck, DropCollectionRequest, DropDatabaseRequest, DropDeploymentUserRequest,
+    GetCollectionOptionsRequest, ListDeploymentRolesRequest, ListDeploymentRolesResponse,
+    ListDeploymentUsersRequest, ListDeploymentUsersResponse, RenameCollectionRequest,
+    RenameDatabaseRequest, RoleSpec as PbRoleSpec, SetValidatorRequest,
+    UpdateDeploymentUserRequest,
 };
 use crate::server::session::{unix_now, AccountSession, FileTokenStore, TokenStore};
+use mongodb::bson::{doc, Document};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::{Code, Request, Response, Status};
@@ -78,6 +114,37 @@ pub(crate) struct FakeState {
     pub features: Vec<String>,
     /// A code MongoVersion fails with, to play an unreachable deployment.
     pub version_failure: Option<Code>,
+    /// Procedures GetCapabilities announces.
+    pub procedures: Vec<String>,
+    /// What the metadata procedures answer, for any connection the caller
+    /// can reach.
+    pub databases: Vec<String>,
+    pub collections: Vec<PbCollectionInfo>,
+    pub indexes: Vec<PbIndexInfo>,
+    /// The documents Find and Aggregate stream, in batches of `batch_size`.
+    pub documents: Vec<Document>,
+    pub batch_size: usize,
+    /// Held before each batch, to play a server that stalls mid-stream.
+    pub batch_delay: Duration,
+    pub last_find: Option<FindRequest>,
+    pub last_aggregate: Option<AggregateRequest>,
+    pub data_calls: u32,
+    /// Streams the client stopped reading before the end.
+    pub streams_abandoned: u32,
+    /// What the stats procedures answer.
+    pub db_stats: DbStatsResponse,
+    pub coll_stats: CollStatsResponse,
+    pub index_stats: Vec<IndexStat>,
+    /// What the read-class monitoring procedures answer.
+    pub server_status: ServerStatusResponse,
+    pub repl_set_status: ReplSetStatusResponse,
+    pub profiling_status: PbProfilingStatus,
+    /// What GetCollectionOptions, ListUsers and ListRoles answer.
+    pub collection_options: PbCollectionValidation,
+    pub users: Vec<DeploymentUser>,
+    pub roles: Vec<DeploymentRole>,
+    /// The database the last ListUsers asked about; empty means all.
+    pub last_users_database: Option<String>,
     pub logins: u32,
     pub refreshes: u32,
     pub logouts: u32,
@@ -127,6 +194,20 @@ impl FakeState {
     fn revoke_family(&mut self, family: u64) {
         for record in self.refresh.values_mut().filter(|r| r.family == family) {
             record.revoked = true;
+        }
+    }
+
+    /// A signed-in caller asking about a connection it can reach.
+    fn authorize_connection<T>(
+        &self,
+        request: &Request<T>,
+        connection_id: &str,
+    ) -> Result<(), Status> {
+        self.authenticate(request)?;
+        if self.connections.iter().any(|c| c.id == connection_id) {
+            Ok(())
+        } else {
+            Err(Status::not_found("connection not found"))
         }
     }
 
@@ -188,6 +269,210 @@ impl Fake {
                 }],
                 features: vec!["documents.raw_bson".to_string()],
                 version_failure: None,
+                procedures: [
+                    "MetadataService/ListDatabases",
+                    "MetadataService/ListCollections",
+                    "MetadataService/ListIndexes",
+                    "MetadataService/MongoVersion",
+                    "DataService/Find",
+                    "DataService/Aggregate",
+                    "StatsService/DbStats",
+                    "StatsService/CollStats",
+                    "StatsService/IndexStats",
+                    "MonitoringService/ServerStatus",
+                    "MonitoringService/ReplSetStatus",
+                    "MonitoringService/GetProfilingStatus",
+                    "DdlService/GetCollectionOptions",
+                    "DeploymentUserService/ListUsers",
+                    "DeploymentUserService/ListRoles",
+                ]
+                .iter()
+                .map(|p| format!("/mqlens.v1.{p}"))
+                .collect(),
+                databases: vec!["admin".to_string(), "orders".to_string()],
+                collections: [
+                    ("customers", "collection"),
+                    ("recent", "view"),
+                    ("metrics", "timeseries"),
+                    // A server that could not tell the type.
+                    ("legacy", ""),
+                ]
+                .iter()
+                .map(|(name, kind)| PbCollectionInfo {
+                    name: name.to_string(),
+                    r#type: kind.to_string(),
+                })
+                .collect(),
+                indexes: vec![
+                    PbIndexInfo {
+                        name: "_id_".to_string(),
+                        keys_json: r#"{"_id":{"$numberInt":"1"}}"#.to_string(),
+                        unique: false,
+                        sparse: false,
+                    },
+                    PbIndexInfo {
+                        name: "z_1_a_-1".to_string(),
+                        keys_json: r#"{"z":{"$numberInt":"1"},"a":{"$numberInt":"-1"}}"#
+                            .to_string(),
+                        unique: true,
+                        sparse: true,
+                    },
+                    PbIndexInfo {
+                        name: "loc_2dsphere".to_string(),
+                        keys_json: r#"{"loc":"2dsphere"}"#.to_string(),
+                        unique: false,
+                        sparse: false,
+                    },
+                ],
+                documents: vec![
+                    doc! { "_id": 1, "name": "Ada", "total": 12.5 },
+                    // Keys that look like an Extended JSON wrapper, stored as
+                    // a plain sub-document.
+                    doc! { "_id": 2, "nested": { "$numberLong": "7", "other": 1 } },
+                    doc! { "_id": 3, "big": 9_007_199_254_740_993_i64 },
+                ],
+                batch_size: 100,
+                batch_delay: Duration::ZERO,
+                last_find: None,
+                last_aggregate: None,
+                data_calls: 0,
+                streams_abandoned: 0,
+                db_stats: DbStatsResponse {
+                    collections: 4,
+                    views: 1,
+                    objects: 12_345,
+                    avg_obj_size: 512.5,
+                    data_size: 6_327_000,
+                    storage_size: 8_192_000,
+                    indexes: 9,
+                    total_index_size: 1_048_576,
+                },
+                coll_stats: CollStatsResponse {
+                    count: 3_000,
+                    avg_obj_size: 128.25,
+                    size: 384_750,
+                    storage_size: 409_600,
+                    nindexes: 3,
+                    total_index_size: 98_304,
+                    capped: true,
+                },
+                server_status: ServerStatusResponse {
+                    host: "db-1.acme.internal:27017".to_string(),
+                    version: "8.0.4".to_string(),
+                    uptime_seconds: 86_400.5,
+                    connections: Some(ServerConnections {
+                        current: 12,
+                        available: 838_848,
+                        total_created: 345,
+                    }),
+                    opcounters: Some(PbOpCounters {
+                        insert: 1,
+                        query: 2,
+                        update: 3,
+                        delete: 4,
+                        getmore: 5,
+                        command: 6,
+                    }),
+                    memory: Some(ServerMemory {
+                        resident_mb: 512,
+                        virtual_mb: 2_048,
+                    }),
+                    network: Some(ServerNetwork {
+                        bytes_in: 1_000,
+                        bytes_out: 2_000,
+                        num_requests: 30,
+                    }),
+                    cache: Some(PbCacheStats {
+                        bytes_in_cache: 7,
+                        max_bytes: 8,
+                        dirty_bytes: 9,
+                    }),
+                    repl_set: Some("rs0".to_string()),
+                },
+                repl_set_status: ReplSetStatusResponse {
+                    is_replica_set: true,
+                    cluster_type: "replicaSet".to_string(),
+                    set: "rs0".to_string(),
+                    my_state_str: "PRIMARY".to_string(),
+                    mongo_version: "8.0.4".to_string(),
+                    members: vec![
+                        PbReplSetMember {
+                            name: "db-1:27017".to_string(),
+                            state_str: "PRIMARY".to_string(),
+                            health: 1,
+                            self_: true,
+                            uptime_secs: 86_400,
+                            optime_date_ms: 1_700_000_000_000,
+                            ping_ms: None,
+                            sync_source: String::new(),
+                            lag_secs: None,
+                        },
+                        PbReplSetMember {
+                            name: "db-2:27017".to_string(),
+                            state_str: "SECONDARY".to_string(),
+                            health: 1,
+                            self_: false,
+                            uptime_secs: 86_000,
+                            optime_date_ms: 1_699_999_999_000,
+                            ping_ms: Some(3),
+                            sync_source: "db-1:27017".to_string(),
+                            lag_secs: Some(1.5),
+                        },
+                    ],
+                },
+                profiling_status: PbProfilingStatus {
+                    level: 1,
+                    slow_ms: 250,
+                },
+                collection_options: PbCollectionValidation {
+                    validator: r#"{"$jsonSchema":{"required":["email"],"properties":{"age":{"minimum":0}}}}"#
+                        .to_string(),
+                    validation_level: "strict".to_string(),
+                    validation_action: "error".to_string(),
+                },
+                users: vec![DeploymentUser {
+                    user: "app".to_string(),
+                    db: "orders".to_string(),
+                    roles: vec![PbRoleSpec {
+                        role: "readWrite".to_string(),
+                        db: "orders".to_string(),
+                    }],
+                    mechanisms: vec!["SCRAM-SHA-256".to_string()],
+                }],
+                roles: vec![
+                    DeploymentRole {
+                        role: "read".to_string(),
+                        db: "orders".to_string(),
+                        is_builtin: true,
+                    },
+                    DeploymentRole {
+                        role: "reporting".to_string(),
+                        db: "orders".to_string(),
+                        is_builtin: false,
+                    },
+                ],
+                last_users_database: None,
+                // Not in size order: local mode sorts them, largest first.
+                index_stats: vec![
+                    IndexStat {
+                        name: "_id_".to_string(),
+                        size_bytes: 4_096,
+                        ops: 10,
+                        since_ms: 1_700_000_000_000,
+                    },
+                    IndexStat {
+                        name: "email_1".to_string(),
+                        size_bytes: 65_536,
+                        ops: 900,
+                        since_ms: 1_700_000_100_000,
+                    },
+                    IndexStat {
+                        name: "created_-1".to_string(),
+                        size_bytes: 16_384,
+                        ops: 0,
+                        since_ms: 0,
+                    },
+                ],
                 logins: 0,
                 refreshes: 0,
                 logouts: 0,
@@ -208,6 +493,11 @@ impl Fake {
                 .add_service(ConnectionServiceServer::new(self.clone()))
                 .add_service(CapabilityServiceServer::new(self.clone()))
                 .add_service(MetadataServiceServer::new(self.clone()))
+                .add_service(DataServiceServer::new(self.clone()))
+                .add_service(StatsServiceServer::new(self.clone()))
+                .add_service(MonitoringServiceServer::new(self.clone()))
+                .add_service(DdlServiceServer::new(self.clone()))
+                .add_service(DeploymentUserServiceServer::new(self.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
         format!("http://{addr}")
@@ -376,7 +666,7 @@ impl CapabilityService for Fake {
             .collect();
         Ok(Response::new(GetCapabilitiesResponse {
             server_version: "fake".to_string(),
-            procedures: Vec::new(),
+            procedures: state.procedures.clone(),
             features: state.features.clone(),
             principal: Some(principal()),
             connections,
@@ -389,16 +679,24 @@ impl CapabilityService for Fake {
 impl MetadataService for Fake {
     async fn list_databases(
         &self,
-        _request: Request<ListDatabasesRequest>,
+        request: Request<ListDatabasesRequest>,
     ) -> Result<Response<ListDatabasesResponse>, Status> {
-        Err(Status::unimplemented("ListDatabases is not implemented"))
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(ListDatabasesResponse {
+            databases: state.databases.clone(),
+        }))
     }
 
     async fn list_collections(
         &self,
-        _request: Request<ListCollectionsRequest>,
+        request: Request<ListCollectionsRequest>,
     ) -> Result<Response<ListCollectionsResponse>, Status> {
-        Err(Status::unimplemented("ListCollections is not implemented"))
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(ListCollectionsResponse {
+            collections: state.collections.clone(),
+        }))
     }
 
     async fn mongo_version(
@@ -424,9 +722,13 @@ impl MetadataService for Fake {
 
     async fn list_indexes(
         &self,
-        _request: Request<ListIndexesRequest>,
+        request: Request<ListIndexesRequest>,
     ) -> Result<Response<ListIndexesResponse>, Status> {
-        Err(Status::unimplemented("ListIndexes is not implemented"))
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(ListIndexesResponse {
+            indexes: state.indexes.clone(),
+        }))
     }
 
     async fn create_index(
@@ -441,6 +743,289 @@ impl MetadataService for Fake {
         _request: Request<DropIndexRequest>,
     ) -> Result<Response<MetadataAck>, Status> {
         Err(Status::unimplemented("DropIndex is not implemented"))
+    }
+}
+
+type Batches = Pin<Box<dyn tokio_stream::Stream<Item = Result<FindBatch, Status>> + Send>>;
+
+impl Fake {
+    /// The stored documents as raw BSON, in batches, each after
+    /// `batch_delay`. Counts a stream the client drops before the end.
+    fn batches(&self) -> Batches {
+        let (documents, size, delay) =
+            self.with(|s| (s.documents.clone(), s.batch_size.max(1), s.batch_delay));
+        let state = self.state.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            for chunk in documents.chunks(size) {
+                tokio::time::sleep(delay).await;
+                let batch = FindBatch {
+                    documents_ejson: Vec::new(),
+                    documents_bson: chunk
+                        .iter()
+                        .map(|d| {
+                            let mut bytes = Vec::new();
+                            d.to_writer(&mut bytes).unwrap();
+                            bytes.into()
+                        })
+                        .collect(),
+                };
+                if tx.send(Ok(batch)).await.is_err() {
+                    state.lock().unwrap().streams_abandoned += 1;
+                    return;
+                }
+            }
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+#[tonic::async_trait]
+impl DataService for Fake {
+    type FindStream = Batches;
+    type AggregateStream = Batches;
+
+    async fn find(
+        &self,
+        request: Request<FindRequest>,
+    ) -> Result<Response<Self::FindStream>, Status> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.authorize_connection(&request, &request.get_ref().connection_id)?;
+            state.data_calls += 1;
+            state.last_find = Some(request.get_ref().clone());
+        }
+        Ok(Response::new(self.batches()))
+    }
+
+    async fn aggregate(
+        &self,
+        request: Request<AggregateRequest>,
+    ) -> Result<Response<Self::AggregateStream>, Status> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.authorize_connection(&request, &request.get_ref().connection_id)?;
+            state.data_calls += 1;
+            state.last_aggregate = Some(request.get_ref().clone());
+        }
+        Ok(Response::new(self.batches()))
+    }
+
+    async fn count(
+        &self,
+        _request: Request<CountRequest>,
+    ) -> Result<Response<CountResponse>, Status> {
+        Err(Status::unimplemented("Count is not implemented"))
+    }
+
+    async fn explain(
+        &self,
+        _request: Request<ExplainRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        Err(Status::unimplemented("Explain is not implemented"))
+    }
+}
+
+#[tonic::async_trait]
+impl StatsService for Fake {
+    async fn db_stats(
+        &self,
+        request: Request<DbStatsRequest>,
+    ) -> Result<Response<DbStatsResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(state.db_stats))
+    }
+
+    async fn coll_stats(
+        &self,
+        request: Request<CollStatsRequest>,
+    ) -> Result<Response<CollStatsResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(state.coll_stats))
+    }
+
+    async fn index_stats(
+        &self,
+        request: Request<IndexStatsRequest>,
+    ) -> Result<Response<IndexStatsResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(IndexStatsResponse {
+            indexes: state.index_stats.clone(),
+        }))
+    }
+}
+
+/// The read-class monitoring procedures; the admin ones come with D5.
+#[tonic::async_trait]
+impl MonitoringService for Fake {
+    async fn server_status(
+        &self,
+        request: Request<ServerStatusRequest>,
+    ) -> Result<Response<ServerStatusResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(state.server_status.clone()))
+    }
+
+    async fn current_ops(
+        &self,
+        _request: Request<CurrentOpsRequest>,
+    ) -> Result<Response<CurrentOpsResponse>, Status> {
+        Err(Status::unimplemented("CurrentOps is not implemented"))
+    }
+
+    async fn repl_set_status(
+        &self,
+        request: Request<ReplSetStatusRequest>,
+    ) -> Result<Response<ReplSetStatusResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(state.repl_set_status.clone()))
+    }
+
+    async fn kill_op(
+        &self,
+        _request: Request<KillOpRequest>,
+    ) -> Result<Response<MonitoringAck>, Status> {
+        Err(Status::unimplemented("KillOp is not implemented"))
+    }
+
+    async fn get_profiling_status(
+        &self,
+        request: Request<GetProfilingStatusRequest>,
+    ) -> Result<Response<PbProfilingStatus>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(state.profiling_status))
+    }
+
+    async fn set_profiling_level(
+        &self,
+        _request: Request<SetProfilingLevelRequest>,
+    ) -> Result<Response<PbProfilingStatus>, Status> {
+        Err(Status::unimplemented(
+            "SetProfilingLevel is not implemented",
+        ))
+    }
+
+    async fn read_profile(
+        &self,
+        _request: Request<ReadProfileRequest>,
+    ) -> Result<Response<ReadProfileResponse>, Status> {
+        Err(Status::unimplemented("ReadProfile is not implemented"))
+    }
+}
+
+/// Only GetCollectionOptions; the DDL writes come with D5.
+#[tonic::async_trait]
+impl DdlService for Fake {
+    async fn create_collection(
+        &self,
+        _request: Request<CreateCollectionRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("CreateCollection is not implemented"))
+    }
+
+    async fn drop_collection(
+        &self,
+        _request: Request<DropCollectionRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("DropCollection is not implemented"))
+    }
+
+    async fn rename_collection(
+        &self,
+        _request: Request<RenameCollectionRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("RenameCollection is not implemented"))
+    }
+
+    async fn create_view(
+        &self,
+        _request: Request<CreateViewRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("CreateView is not implemented"))
+    }
+
+    async fn drop_database(
+        &self,
+        _request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("DropDatabase is not implemented"))
+    }
+
+    async fn rename_database(
+        &self,
+        _request: Request<RenameDatabaseRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("RenameDatabase is not implemented"))
+    }
+
+    async fn get_collection_options(
+        &self,
+        request: Request<GetCollectionOptionsRequest>,
+    ) -> Result<Response<PbCollectionValidation>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(state.collection_options.clone()))
+    }
+
+    async fn set_validator(
+        &self,
+        _request: Request<SetValidatorRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        Err(Status::unimplemented("SetValidator is not implemented"))
+    }
+}
+
+/// Only the listings; creating, updating and dropping users come with D5.
+#[tonic::async_trait]
+impl DeploymentUserService for Fake {
+    async fn list_users(
+        &self,
+        request: Request<ListDeploymentUsersRequest>,
+    ) -> Result<Response<ListDeploymentUsersResponse>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state.last_users_database = Some(request.get_ref().database.clone());
+        Ok(Response::new(ListDeploymentUsersResponse {
+            users: state.users.clone(),
+        }))
+    }
+
+    async fn list_roles(
+        &self,
+        request: Request<ListDeploymentRolesRequest>,
+    ) -> Result<Response<ListDeploymentRolesResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(ListDeploymentRolesResponse {
+            roles: state.roles.clone(),
+        }))
+    }
+
+    async fn create_user(
+        &self,
+        _request: Request<CreateDeploymentUserRequest>,
+    ) -> Result<Response<DeploymentUserAck>, Status> {
+        Err(Status::unimplemented("CreateUser is not implemented"))
+    }
+
+    async fn update_user(
+        &self,
+        _request: Request<UpdateDeploymentUserRequest>,
+    ) -> Result<Response<DeploymentUserAck>, Status> {
+        Err(Status::unimplemented("UpdateUser is not implemented"))
+    }
+
+    async fn drop_user(
+        &self,
+        _request: Request<DropDeploymentUserRequest>,
+    ) -> Result<Response<DeploymentUserAck>, Status> {
+        Err(Status::unimplemented("DropUser is not implemented"))
     }
 }
 

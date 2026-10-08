@@ -109,7 +109,16 @@ async fn execute_aggregate_inner(
         return Err("Aggregation pipelines are not supported on mock connections".to_string());
     }
 
-    let client = crate::require_real_client(state, id)?;
+    let client = match crate::server::remote::route(state, id)? {
+        crate::server::remote::Route::Local(client) => client,
+        crate::server::remote::Route::Remote(conn) => {
+            let writes = stages_val.iter().any(stage_is_disallowed);
+            return crate::server::ops::query::aggregate(
+                state, &conn, database, collection, &stages, writes,
+            )
+            .await;
+        }
+    };
 
     let coll = client
         .database(database)
