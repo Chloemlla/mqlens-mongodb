@@ -65,6 +65,7 @@ use crate::server::pb::mqlens::v1::{
     RenameDatabaseDetailedRequest, RenameDatabaseRequest, RenameDatabaseResult,
     RoleSpec as PbRoleSpec, SetValidatorRequest, UpdateDeploymentUserRequest,
 };
+use crate::server::pb::mqlens::v1::{CurrentOp as PbCurrentOp, ProfileEntry as PbProfileEntry};
 use crate::server::pb::mqlens::v1::{
     DeleteDocumentRequest, DeleteManyRequest, InsertDocumentRequest, InsertDocumentResponse,
     ReplaceDocumentRequest, UpdateDocumentRequest, UpdateManyRequest, WriteResult,
@@ -141,6 +142,8 @@ pub(crate) struct FakeState {
     pub writes: Vec<FakeWrite>,
     /// What the document writes answer.
     pub write_result: WriteResult,
+    /// What RenameDatabaseDetailed reports.
+    pub rename_result: RenameDatabaseResult,
     /// The id InsertDocument reports.
     pub inserted_id: mongodb::bson::Bson,
     /// The plan Explain answers, and the last request it got.
@@ -157,6 +160,11 @@ pub(crate) struct FakeState {
     pub server_status: ServerStatusResponse,
     pub repl_set_status: ReplSetStatusResponse,
     pub profiling_status: PbProfilingStatus,
+    /// What CurrentOps and ReadProfile answer.
+    pub current_ops: Vec<PbCurrentOp>,
+    pub profile: Vec<PbProfileEntry>,
+    /// The admin monitoring calls received, in order.
+    pub admin_calls: Vec<FakeAdmin>,
     /// What GetCollectionOptions, ListUsers and ListRoles answer.
     pub collection_options: PbCollectionValidation,
     pub users: Vec<DeploymentUser>,
@@ -361,6 +369,10 @@ impl Fake {
                     deleted_count: 1,
                     upserted_id_json: String::new(),
                 },
+                rename_result: RenameDatabaseResult {
+                    collections: 2,
+                    documents: 40,
+                },
                 inserted_id: mongodb::bson::Bson::ObjectId(
                     mongodb::bson::oid::ObjectId::parse_str("64b7f0c2a1b2c3d4e5f60718").unwrap(),
                 ),
@@ -456,6 +468,9 @@ impl Fake {
                     level: 1,
                     slow_ms: 250,
                 },
+                current_ops: Vec::new(),
+                profile: Vec::new(),
+                admin_calls: Vec::new(),
                 collection_options: PbCollectionValidation {
                     validator: r#"{"$jsonSchema":{"required":["email"],"properties":{"age":{"minimum":0}}}}"#
                         .to_string(),
@@ -800,6 +815,13 @@ pub(crate) enum FakeWrite {
     DeleteMany(DeleteManyRequest),
     CreateIndex(CreateIndexRequest),
     DropIndex(DropIndexRequest),
+    CreateCollection(CreateCollectionRequest),
+    DropCollection(DropCollectionRequest),
+    RenameCollection(RenameCollectionRequest),
+    CreateView(CreateViewRequest),
+    DropDatabase(DropDatabaseRequest),
+    RenameDatabase(RenameDatabaseDetailedRequest),
+    SetValidator(SetValidatorRequest),
 }
 
 impl Fake {
@@ -1009,9 +1031,14 @@ impl MonitoringService for Fake {
 
     async fn current_ops(
         &self,
-        _request: Request<CurrentOpsRequest>,
+        request: Request<CurrentOpsRequest>,
     ) -> Result<Response<CurrentOpsResponse>, Status> {
-        Err(Status::unimplemented("CurrentOps is not implemented"))
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(CurrentOpsResponse {
+            ops: state.current_ops.clone(),
+            truncated: false,
+        }))
     }
 
     async fn repl_set_status(
@@ -1025,9 +1052,14 @@ impl MonitoringService for Fake {
 
     async fn kill_op(
         &self,
-        _request: Request<KillOpRequest>,
+        request: Request<KillOpRequest>,
     ) -> Result<Response<MonitoringAck>, Status> {
-        Err(Status::unimplemented("KillOp is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::KillOp(request.into_inner()));
+        Ok(Response::new(MonitoringAck {}))
     }
 
     async fn get_profiling_status(
@@ -1041,19 +1073,40 @@ impl MonitoringService for Fake {
 
     async fn set_profiling_level(
         &self,
-        _request: Request<SetProfilingLevelRequest>,
+        request: Request<SetProfilingLevelRequest>,
     ) -> Result<Response<PbProfilingStatus>, Status> {
-        Err(Status::unimplemented(
-            "SetProfilingLevel is not implemented",
-        ))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        let set = request.into_inner();
+        state.profiling_status = PbProfilingStatus {
+            level: set.level.into(),
+            slow_ms: set.slow_ms.into(),
+        };
+        state.admin_calls.push(FakeAdmin::SetProfilingLevel(set));
+        Ok(Response::new(state.profiling_status))
     }
 
     async fn read_profile(
         &self,
-        _request: Request<ReadProfileRequest>,
+        request: Request<ReadProfileRequest>,
     ) -> Result<Response<ReadProfileResponse>, Status> {
-        Err(Status::unimplemented("ReadProfile is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::ReadProfile(request.into_inner()));
+        Ok(Response::new(ReadProfileResponse {
+            entries: state.profile.clone(),
+        }))
     }
+}
+
+/// An admin monitoring call the fake received.
+#[derive(Clone, Debug)]
+pub(crate) enum FakeAdmin {
+    KillOp(KillOpRequest),
+    SetProfilingLevel(SetProfilingLevelRequest),
+    ReadProfile(ReadProfileRequest),
 }
 
 /// Only GetCollectionOptions; the DDL writes come with D5.
@@ -1061,37 +1114,62 @@ impl MonitoringService for Fake {
 impl DdlService for Fake {
     async fn create_collection(
         &self,
-        _request: Request<CreateCollectionRequest>,
+        request: Request<CreateCollectionRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("CreateCollection is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::CreateCollection(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn drop_collection(
         &self,
-        _request: Request<DropCollectionRequest>,
+        request: Request<DropCollectionRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("DropCollection is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::DropCollection(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn rename_collection(
         &self,
-        _request: Request<RenameCollectionRequest>,
+        request: Request<RenameCollectionRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("RenameCollection is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::RenameCollection(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn create_view(
         &self,
-        _request: Request<CreateViewRequest>,
+        request: Request<CreateViewRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("CreateView is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::CreateView(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn drop_database(
         &self,
-        _request: Request<DropDatabaseRequest>,
+        request: Request<DropDatabaseRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("DropDatabase is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::DropDatabase(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn rename_database(
@@ -1103,11 +1181,14 @@ impl DdlService for Fake {
 
     async fn rename_database_detailed(
         &self,
-        _request: Request<RenameDatabaseDetailedRequest>,
+        request: Request<RenameDatabaseDetailedRequest>,
     ) -> Result<Response<RenameDatabaseResult>, Status> {
-        Err(Status::unimplemented(
-            "RenameDatabaseDetailed is not implemented",
-        ))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::RenameDatabase(request.into_inner()));
+        Ok(Response::new(state.rename_result.clone()))
     }
 
     async fn get_collection_options(
@@ -1121,9 +1202,14 @@ impl DdlService for Fake {
 
     async fn set_validator(
         &self,
-        _request: Request<SetValidatorRequest>,
+        request: Request<SetValidatorRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("SetValidator is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::SetValidator(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 }
 

@@ -259,7 +259,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DdlService/CreateCollection"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -268,7 +268,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DdlService/CreateView"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -277,7 +277,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DdlService/DropCollection"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -286,7 +286,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DdlService/RenameCollection"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -295,7 +295,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DdlService/SetValidator"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -304,16 +304,16 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DdlService/DropDatabase"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
         command: "rename_database",
         serve: Serve::Rpc {
-            procedures: &["/mqlens.v1.DdlService/RenameDatabase"],
+            procedures: &["/mqlens.v1.DdlService/RenameDatabaseDetailed"],
             class: OpClass::Ddl,
             since: 2,
-            adapter: false,
+            adapter: true,
         },
     },
     // Statistics
@@ -415,7 +415,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.MonitoringService/CurrentOps"],
             class: OpClass::Admin,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -424,7 +424,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.MonitoringService/KillOp"],
             class: OpClass::Admin,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -433,7 +433,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.MonitoringService/ReadProfile"],
             class: OpClass::Admin,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -442,7 +442,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.MonitoringService/SetProfilingLevel"],
             class: OpClass::Admin,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     // Deployment users
