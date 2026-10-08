@@ -233,3 +233,32 @@ describe('MonitoringView', () => {
     expect(screen.queryByTestId('cluster-members-table')).toBeNull();
   });
 });
+
+describe('MonitoringView: commands a server connection cannot run', () => {
+  const BLOCKED = ['current_ops', 'kill_op', 'read_profile', 'set_profiling_level'];
+
+  it('does not ask for them, and says why', async () => {
+    render(<MonitoringView connectionId="c1" blockedCommands={BLOCKED} />);
+
+    const ops = await screen.findByTestId('mon-panel-ops');
+    await waitFor(() => expect(ops).toHaveTextContent('Not available on MQLens Server yet'));
+    fireEvent.click(screen.getByTestId('mon-tab-profiler'));
+    expect(await screen.findByTestId('profiler-level-1')).toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId('mon-panel-profiler')).toHaveTextContent('Not available on MQLens Server yet'));
+    const called = mockInvoke.mock.calls.map((c) => c[0]);
+    expect(called.filter((c) => BLOCKED.includes(c))).toEqual([]);
+  });
+});
+
+describe('MonitoringView: a server connection without the metrics', () => {
+  it('does not ask for server status, replica set status or profiling status when blocked', async () => {
+    const BLOCKED = ['server_status', 'repl_set_status', 'get_profiling_status'];
+    render(<MonitoringView connectionId="c1" blockedCommands={BLOCKED} />);
+
+    fireEvent.click(await screen.findByTestId('mon-tab-profiler'));
+    await screen.findByTestId('mon-panel-profiler');
+    await new Promise((r) => setTimeout(r, 50));
+    const called = mockInvoke.mock.calls.map((c) => c[0]);
+    expect(called.filter((c) => BLOCKED.includes(c))).toEqual([]);
+  });
+});
