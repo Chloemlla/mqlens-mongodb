@@ -28,6 +28,7 @@ use crate::server::pb::mqlens::v1::monitoring_service_server::{
     MonitoringService, MonitoringServiceServer,
 };
 use crate::server::pb::mqlens::v1::stats_service_server::{StatsService, StatsServiceServer};
+use crate::server::pb::mqlens::v1::write_service_server::{WriteService, WriteServiceServer};
 use crate::server::pb::mqlens::v1::{
     login_request, ConnectionRef, GetConnectionRequest, ListConnectionsRequest,
     ListConnectionsResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Principal,
@@ -63,6 +64,10 @@ use crate::server::pb::mqlens::v1::{
     ListDeploymentUsersRequest, ListDeploymentUsersResponse, RenameCollectionRequest,
     RenameDatabaseDetailedRequest, RenameDatabaseRequest, RenameDatabaseResult,
     RoleSpec as PbRoleSpec, SetValidatorRequest, UpdateDeploymentUserRequest,
+};
+use crate::server::pb::mqlens::v1::{
+    DeleteDocumentRequest, DeleteManyRequest, InsertDocumentRequest, InsertDocumentResponse,
+    ReplaceDocumentRequest, UpdateDocumentRequest, UpdateManyRequest, WriteResult,
 };
 use crate::server::session::{unix_now, AccountSession, FileTokenStore, TokenStore};
 use mongodb::bson::{doc, Document};
@@ -132,6 +137,12 @@ pub(crate) struct FakeState {
     /// What Count answers, and the last request it got.
     pub count_result: i64,
     pub last_count: Option<CountRequest>,
+    /// Every write and index change received, in order.
+    pub writes: Vec<FakeWrite>,
+    /// What the document writes answer.
+    pub write_result: WriteResult,
+    /// The id InsertDocument reports.
+    pub inserted_id: mongodb::bson::Bson,
     /// The plan Explain answers, and the last request it got.
     pub explain_plan: Document,
     pub last_explain: Option<ExplainRequest>,
@@ -343,6 +354,16 @@ impl Fake {
                 last_find: None,
                 last_aggregate: None,
                 count_result: 0,
+                writes: Vec::new(),
+                write_result: WriteResult {
+                    matched_count: 1,
+                    modified_count: 1,
+                    deleted_count: 1,
+                    upserted_id_json: String::new(),
+                },
+                inserted_id: mongodb::bson::Bson::ObjectId(
+                    mongodb::bson::oid::ObjectId::parse_str("64b7f0c2a1b2c3d4e5f60718").unwrap(),
+                ),
                 last_count: None,
                 explain_plan: Document::new(),
                 last_explain: None,
@@ -508,6 +529,7 @@ impl Fake {
                 .add_service(StatsServiceServer::new(self.clone()))
                 .add_service(MonitoringServiceServer::new(self.clone()))
                 .add_service(DdlServiceServer::new(self.clone()))
+                .add_service(WriteServiceServer::new(self.clone()))
                 .add_service(DeploymentUserServiceServer::new(self.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
@@ -744,16 +766,108 @@ impl MetadataService for Fake {
 
     async fn create_index(
         &self,
-        _request: Request<CreateIndexRequest>,
+        request: Request<CreateIndexRequest>,
     ) -> Result<Response<MetadataAck>, Status> {
-        Err(Status::unimplemented("CreateIndex is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::CreateIndex(request.into_inner()));
+        Ok(Response::new(MetadataAck {}))
     }
 
     async fn drop_index(
         &self,
-        _request: Request<DropIndexRequest>,
+        request: Request<DropIndexRequest>,
     ) -> Result<Response<MetadataAck>, Status> {
-        Err(Status::unimplemented("DropIndex is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::DropIndex(request.into_inner()));
+        Ok(Response::new(MetadataAck {}))
+    }
+}
+
+/// A write or index change the fake received.
+#[derive(Clone, Debug)]
+pub(crate) enum FakeWrite {
+    Insert(InsertDocumentRequest),
+    Update(UpdateDocumentRequest),
+    Replace(ReplaceDocumentRequest),
+    Delete(DeleteDocumentRequest),
+    UpdateMany(UpdateManyRequest),
+    DeleteMany(DeleteManyRequest),
+    CreateIndex(CreateIndexRequest),
+    DropIndex(DropIndexRequest),
+}
+
+impl Fake {
+    /// Records a write and answers it with the configured result.
+    fn write<T>(
+        &self,
+        request: Request<T>,
+        connection_id: impl Fn(&T) -> &str,
+        record: impl FnOnce(T) -> FakeWrite,
+    ) -> Result<Response<WriteResult>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, connection_id(request.get_ref()))?;
+        state.writes.push(record(request.into_inner()));
+        Ok(Response::new(state.write_result.clone()))
+    }
+}
+
+#[tonic::async_trait]
+impl WriteService for Fake {
+    async fn insert_document(
+        &self,
+        request: Request<InsertDocumentRequest>,
+    ) -> Result<Response<InsertDocumentResponse>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state.writes.push(FakeWrite::Insert(request.into_inner()));
+        Ok(Response::new(InsertDocumentResponse {
+            inserted_id_json: state
+                .inserted_id
+                .clone()
+                .into_canonical_extjson()
+                .to_string(),
+        }))
+    }
+
+    async fn update_document(
+        &self,
+        request: Request<UpdateDocumentRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::Update)
+    }
+
+    async fn replace_document(
+        &self,
+        request: Request<ReplaceDocumentRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::Replace)
+    }
+
+    async fn delete_document(
+        &self,
+        request: Request<DeleteDocumentRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::Delete)
+    }
+
+    async fn update_many(
+        &self,
+        request: Request<UpdateManyRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::UpdateMany)
+    }
+
+    async fn delete_many(
+        &self,
+        request: Request<DeleteManyRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::DeleteMany)
     }
 }
 

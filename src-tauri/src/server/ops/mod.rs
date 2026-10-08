@@ -7,6 +7,7 @@ pub(crate) mod monitoring;
 pub(crate) mod query;
 pub(crate) mod stats;
 pub(crate) mod users;
+pub(crate) mod write;
 
 use crate::server::accounts;
 use crate::server::remote::RemoteConn;
