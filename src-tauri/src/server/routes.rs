@@ -94,7 +94,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.MetadataService/CreateIndex"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -103,7 +103,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.MetadataService/DropIndex"],
             class: OpClass::Ddl,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     // Documents
@@ -167,7 +167,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.WriteService/InsertDocument"],
             class: OpClass::Write,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -176,7 +176,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.WriteService/UpdateDocument", "/mqlens.v1.WriteService/ReplaceDocument"],
             class: OpClass::Write,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -185,7 +185,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.WriteService/UpdateMany"],
             class: OpClass::Write,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -194,7 +194,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.WriteService/DeleteDocument"],
             class: OpClass::Write,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -203,7 +203,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.WriteService/DeleteMany"],
             class: OpClass::Write,
             since: 1,
-            adapter: false,
+            adapter: true,
         },
     },
     // Export
