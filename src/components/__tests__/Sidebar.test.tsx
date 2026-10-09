@@ -11,6 +11,12 @@ vi.mock('../theme/ThemePicker', () => ({
 // Sidebar now uses the in-app dialog system, so it must render inside a provider.
 const render = (ui: ReactElement) => rtlRender(<DialogProvider>{ui}</DialogProvider>);
 
+const openManageMenu = async () => {
+  const trigger = await screen.findByRole('menuitem', { name: 'Manage' });
+  fireEvent.keyDown(trigger, { key: 'ArrowRight' });
+  return trigger;
+};
+
 // Mock Tauri invoke function
 const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
@@ -235,11 +241,13 @@ describe('Sidebar Component', () => {
     const handleDisconnect = vi.fn();
 
     const handleSelectIndex = vi.fn();
+    const handleDeleteIndex = vi.fn();
 
     render(
       <Sidebar
         onSelectCollection={handleSelectCollection}
         onSelectIndex={handleSelectIndex}
+        onDeleteIndex={handleDeleteIndex}
         activeCollection={null}
         activeConnections={activeConnections}
         onOpenConnectionManager={() => {}}
@@ -294,6 +302,15 @@ describe('Sidebar Component', () => {
     const indexNode = screen.getByText('email_1');
     fireEvent.click(indexNode);
     expect(handleSelectIndex).toHaveBeenCalledWith('conn-1', 'sales_db', 'customers', 'email_1');
+
+    // Irreversible index deletion is nested, while the safe copy action stays
+    // directly available from the first menu level.
+    fireEvent.contextMenu(indexNode);
+    expect(screen.getByText('Copy Index Name')).toBeInTheDocument();
+    expect(screen.queryByText('Delete Index')).toBeNull();
+    await openManageMenu();
+    fireEvent.click(await screen.findByText('Delete Index'));
+    expect(handleDeleteIndex).toHaveBeenCalledWith('conn-1', 'sales_db', 'customers', 'email_1');
 
     // Test disconnect click
     const disconnectBtns = screen.getAllByRole('button', { name: /disconnect/i });
@@ -958,12 +975,13 @@ describe('Sidebar Component', () => {
 
     // Right-click collection to drop it
     fireEvent.contextMenu(newCollNode);
-    const dropCollOption = screen.getByText('Drop Collection');
-    expect(dropCollOption).toBeInTheDocument();
+    expect(screen.queryByText('Drop Collection')).toBeNull();
+    await openManageMenu();
+    const dropCollOption = await screen.findByText('Drop Collection');
     fireEvent.click(dropCollOption);
 
-    // Confirm the drop via the in-app dialog; collection node is removed
-    fireEvent.click(await screen.findByTestId('dialog-confirm'));
+    // The final drop stays disabled until the exact collection name is typed.
+    await submitPrompt('created_collection');
     await waitFor(() => {
       expect(screen.queryByText('created_collection')).not.toBeInTheDocument();
     });
@@ -1188,6 +1206,10 @@ describe('Sidebar Component', () => {
     fireEvent.contextMenu(viewNode);
     expect(screen.queryByText('Validation Rules')).not.toBeInTheDocument();
     expect(screen.getByText('Analyze Schema')).toBeInTheDocument();
+    expect(screen.queryByText('Drop View')).toBeNull();
+    await openManageMenu();
+    expect(await screen.findByText('Drop View')).toBeInTheDocument();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
     fireEvent.keyDown(document.body, { key: 'Escape' });
 
     // Regular collection still offers it.
@@ -1364,8 +1386,10 @@ describe('Sidebar Component', () => {
     });
 
     fireEvent.contextMenu(ordersNode);
-    fireEvent.click(screen.getByText('Drop Collection'));
-    await clickConfirm();
+    expect(screen.queryByText('Drop Collection')).toBeNull();
+    await openManageMenu();
+    fireEvent.click(await screen.findByText('Drop Collection'));
+    await submitPrompt('orders');
     await waitFor(() => {
       const d = calls.find((x) => x.cmd === 'drop_collection');
       expect(d).toBeTruthy();
@@ -1390,8 +1414,10 @@ describe('Sidebar Component', () => {
     });
 
     fireEvent.contextMenu(dbNode);
-    fireEvent.click(screen.getByText('Drop Database'));
-    await clickConfirm();
+    expect(screen.queryByText('Drop Database')).toBeNull();
+    await openManageMenu();
+    fireEvent.click(await screen.findByText('Drop Database'));
+    await submitPrompt('shop');
     await waitFor(() => {
       const d = calls.find((x) => x.cmd === 'drop_database');
       expect(d).toBeTruthy();
@@ -1467,7 +1493,9 @@ describe('Sidebar Component', () => {
     // Drop Collection: wrong typed name -> no invoke; exact name -> invoke
     // with confirmed:true.
     fireEvent.contextMenu(ordersNode);
-    fireEvent.click(screen.getByText('Drop Collection'));
+    expect(screen.queryByText('Drop Collection')).toBeNull();
+    await openManageMenu();
+    fireEvent.click(await screen.findByText('Drop Collection'));
     await typeAndSubmit('not_orders');
     expect(await screen.findByTestId('dialog-error')).toHaveTextContent('Name does not match');
     expect(calls.find((x) => x.cmd === 'drop_collection')).toBeFalsy();
@@ -1502,7 +1530,9 @@ describe('Sidebar Component', () => {
     // Drop Database: wrong typed name -> no invoke; exact name -> invoke
     // with confirmed:true.
     fireEvent.contextMenu(dbNode);
-    fireEvent.click(screen.getByText('Drop Database'));
+    expect(screen.queryByText('Drop Database')).toBeNull();
+    await openManageMenu();
+    fireEvent.click(await screen.findByText('Drop Database'));
     await typeAndSubmit('wrong_db');
     expect(await screen.findByTestId('dialog-error')).toHaveTextContent('Name does not match');
     expect(calls.find((x) => x.cmd === 'drop_database')).toBeFalsy();
@@ -2216,7 +2246,8 @@ describe('Sidebar: commands a server connection cannot run', () => {
     const dump = screen.getByTestId('ctx-dump-db-conn-1-sales_db');
     expect(dump).toHaveAttribute('data-disabled');
     expect(dump).toHaveAttribute('title', 'Not available on MQLens Server yet');
-    expect(screen.getByRole('menuitem', { name: /Drop Database/i })).toHaveAttribute('data-disabled');
+    await openManageMenu();
+    expect(await screen.findByRole('menuitem', { name: /Drop Database/i })).toHaveAttribute('data-disabled');
     expect(screen.getByTestId('ctx-generate-db-conn-1-sales_db')).not.toHaveAttribute('data-disabled');
     fireEvent.click(dump);
     expect(handleOpenDump).not.toHaveBeenCalled();

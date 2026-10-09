@@ -2596,6 +2596,12 @@ function Workspace() {
   };
 
   const handleDeleteIndex = async (connectionId: string, dbName: string, collName: string, indexName: string) => {
+    if (!(await confirmByTypedName(prompt, {
+      title: t('admin:indexViewer.confirm.deleteTitle'),
+      kind: 'index',
+      expectedName: indexName,
+      destructive: true,
+    }, t))) return;
     try {
       await invoke('delete_index', {
         id: connectionId,
@@ -2610,6 +2616,7 @@ function Workspace() {
 
       // Trigger sidebar refresh
       setIndexMutationTrigger(prev => prev + 1);
+      toast(t('toast.deleteIndexSuccess', { name: indexName }), 'success');
     } catch (err: any) {
       toast(t('toast.failedToDeleteIndex', { detail: err }), 'error');
     }

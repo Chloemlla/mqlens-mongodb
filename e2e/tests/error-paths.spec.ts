@@ -3,6 +3,7 @@ import { test, expect, type App } from '../fixtures';
 import { SAMPLE_SERVER, type Seed } from '../harness/seed';
 import {
   STAGING_URI,
+  confirmTypedName,
   connectStaging,
   dismissHoverCards,
   expandCollections,
@@ -96,11 +97,13 @@ test.describe('Writes', () => {
     await expect(toast(page, 'Failed to delete document: document is locked')).toBeVisible();
 
     await app.failNext('delete_many', 'not authorized to remove');
-    await view(page).getByTestId('delete-many-btn').click();
+    await view(page).getByTestId('bulk-write-menu-btn').click();
+    await page.getByTestId('delete-many-btn').click();
     await page.getByTestId('dialog-confirm').click();
     await expect(toast(page, 'not authorized to remove')).toBeVisible();
 
-    await view(page).getByTestId('update-many-btn').click();
+    await view(page).getByTestId('bulk-write-menu-btn').click();
+    await page.getByTestId('update-many-btn').click();
     await page.getByTestId('dialog-input').fill('[]');
     await page.getByTestId('dialog-confirm').click();
     await expect(page.getByTestId('dialog-error')).toContainText('Update must be a JSON object');
@@ -147,7 +150,7 @@ test.describe('Writes', () => {
 
     await app.failNext('delete_index', 'index is in use by a running query');
     await view(page).getByTestId('delete-index-btn').click();
-    await page.getByTestId('dialog-confirm').click();
+    await confirmTypedName(page, 'email_1');
     await expect(toast(page, 'Failed to delete index: index is in use by a running query')).toBeVisible();
   });
 });
