@@ -290,6 +290,60 @@ mod tests {
         }
     }
 
+    // An edit of a document holding a wrapper-shaped sub-document is refused
+    // through the server as locally, with nothing written.
+    #[tokio::test]
+    async fn an_edit_of_a_wrapper_shaped_document_is_refused() {
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.documents = vec![doc! { "_id": 1, "money": { "$numberLong": "7" }, "name": "Ada" }]
+        });
+        let (state, id) = connected(&env).await;
+
+        let err = update_document_impl(
+            &state,
+            &id,
+            "orders",
+            "customers",
+            r#"{"_id": 1}"#,
+            r#"{"_id": 1, "money": {"$numberLong": "7"}, "name": "Ada"}"#,
+            r#"{"_id": 1, "money": {"$numberLong": "7"}, "name": "Bo"}"#,
+            Some("{}"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("Extended JSON"), "{err}");
+        assert!(writes(&env).is_empty());
+    }
+
+    // A `$`-prefixed key that no Extended JSON type uses does not block an
+    // edit through the server either.
+    #[tokio::test]
+    async fn an_edit_beside_a_dollar_key_that_is_no_type_wrapper_goes_through() {
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.documents = vec![doc! { "_id": 1, "meta": { "$weird": 1 }, "name": "Ada" }]
+        });
+        let (state, id) = connected(&env).await;
+
+        let modified = update_document_impl(
+            &state,
+            &id,
+            "orders",
+            "customers",
+            r#"{"_id": 1}"#,
+            r#"{"_id": 1, "meta": {"$weird": 1}, "name": "Ada"}"#,
+            r#"{"_id": 1, "meta": {"$weird": 1}, "name": "Bo"}"#,
+            Some("{}"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(modified, 1);
+        assert_eq!(writes(&env).len(), 1);
+    }
+
     // An edit sends the field update local mode would make, and falls back to
     // replacing the document where local mode does.
     #[tokio::test]
