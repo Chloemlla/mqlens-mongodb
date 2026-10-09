@@ -253,9 +253,11 @@ mod tests {
         });
         let (state, id) = connected(&env).await;
 
-        let found = execute_mql_query_impl(&state, &id, "orders", "customers", "{}", "", "", 0, 0)
-            .await
-            .unwrap();
+        // A limit above the 253 stored, so every batch is read.
+        let found =
+            execute_mql_query_impl(&state, &id, "orders", "customers", "{}", "", "", 500, 0)
+                .await
+                .unwrap();
 
         let expected: Vec<String> = docs.iter().map(as_local_mode_shows).collect();
         assert_eq!(found, expected);

@@ -3,7 +3,7 @@
 //! connections return synthetic users/roles so the view works in demo mode.
 
 use crate::write_guard::{guard_writable, WriteOp};
-use crate::{connection_is_mock, require_real_client, AppState};
+use crate::{connection_is_mock, AppState};
 use mongodb::bson::{doc, Bson, Document};
 use serde::{Deserialize, Serialize};
 

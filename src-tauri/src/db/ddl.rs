@@ -1,7 +1,7 @@
 //! Collection, view, and database DDL operations.
 
 use crate::write_guard::{guard_writable, WriteOp};
-use crate::{connection_is_mock, require_real_client, AppState};
+use crate::{connection_is_mock, AppState};
 
 #[derive(serde::Serialize)]
 pub struct DatabaseRenameResult {

@@ -1015,9 +1015,13 @@ type Batches = Pin<Box<dyn tokio_stream::Stream<Item = Result<FindBatch, Status>
 impl Fake {
     /// The stored documents as raw BSON, in batches, each after
     /// `batch_delay`. Counts a stream the client drops before the end.
-    fn batches(&self) -> Batches {
-        let (documents, size, delay) =
+    /// The stored documents in batches, at most `limit` of them (0: all).
+    fn batches(&self, limit: usize) -> Batches {
+        let (mut documents, size, delay) =
             self.with(|s| (s.documents.clone(), s.batch_size.max(1), s.batch_delay));
+        if limit > 0 {
+            documents.truncate(limit);
+        }
         let state = self.state.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
@@ -1059,7 +1063,8 @@ impl DataService for Fake {
             state.data_calls += 1;
             state.last_find = Some(request.get_ref().clone());
         }
-        Ok(Response::new(self.batches()))
+        let limit = usize::try_from(request.get_ref().limit).unwrap_or(0);
+        Ok(Response::new(self.batches(limit)))
     }
 
     async fn aggregate(
@@ -1072,7 +1077,7 @@ impl DataService for Fake {
             state.data_calls += 1;
             state.last_aggregate = Some(request.get_ref().clone());
         }
-        Ok(Response::new(self.batches()))
+        Ok(Response::new(self.batches(0)))
     }
 
     async fn count(

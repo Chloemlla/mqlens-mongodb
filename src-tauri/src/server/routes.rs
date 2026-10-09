@@ -213,7 +213,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DataService/Find"],
             class: OpClass::Read,
             since: 2,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -222,7 +222,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DataService/Find", "/mqlens.v1.DataService/Aggregate"],
             class: OpClass::Read,
             since: 2,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -231,7 +231,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DataService/Aggregate"],
             class: OpClass::Read,
             since: 2,
-            adapter: false,
+            adapter: true,
         },
     },
     CommandRoute {
@@ -240,7 +240,7 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             procedures: &["/mqlens.v1.DataService/Find", "/mqlens.v1.DataService/Aggregate"],
             class: OpClass::Read,
             since: 2,
-            adapter: false,
+            adapter: true,
         },
     },
     // Collections and databases

@@ -2,7 +2,7 @@
 
 use crate::limits::{GRIDFS_STREAM_BUF, MAX_GRIDFS_LIST, MAX_GRIDFS_UPLOAD_BYTES};
 use crate::write_guard::{guard_writable, WriteOp};
-use crate::{connection_is_mock, require_real_client, AppState};
+use crate::{connection_is_mock, AppState};
 use serde::Serialize;
 use std::path::Path;
 
