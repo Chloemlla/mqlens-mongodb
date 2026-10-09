@@ -80,6 +80,9 @@ interface MongoShellProps {
    */
   scopeKey?: string;
   connectionUri: string;
+  /** A connection made through an MQLens Server: its shell runs there, so it
+   *  needs no URI here. */
+  server?: boolean;
   databaseName: string;
   collectionName?: string;
   initialCommand?: string;
@@ -365,6 +368,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   connectionName,
   scopeKey,
   connectionUri,
+  server = false,
   databaseName,
   collectionName,
   initialCommand,
@@ -492,6 +496,9 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   const [mongoshPath, setMongoshPath] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(storedSession?.sessionId ?? null);
   const [sessionAttempted, setSessionAttempted] = useState(Boolean(storedSession?.sessionId));
+  // Why the last start failed, shown for a server shell: no local mongosh
+  // setup can fix what went wrong on the server.
+  const [startError, setStartError] = useState<string | null>(null);
   // Which retry generation we are already attached for. Seeded to 0 when a
   // session was restored, so the start effect reattaches instead of respawning.
   const attachedNonce = useRef<number | null>(storedSession?.sessionId ? 0 : null);
@@ -804,12 +811,16 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         mongodbResult.status === 'fulfilled' ? extractVersion(mongodbResult.value) : 'unavailable';
       const settings = settingsResult.status === 'fulfilled' ? settingsResult.value : { mongosh_path: '' };
       if (!cancelled) setMongoshPath(settings.mongosh_path || '');
-      const mongoshResult = await invoke<string>('test_mongosh_path', {
-        path: settings.mongosh_path || '',
-      }).then(
-        (value) => extractVersion(value),
-        () => 'unavailable'
-      );
+      // A server shell's mongosh is the server's, which reports no version;
+      // this machine's would be beside the point.
+      const mongoshResult = server
+        ? 'on MQLens Server'
+        : await invoke<string>('test_mongosh_path', {
+            path: settings.mongosh_path || '',
+          }).then(
+            (value) => extractVersion(value),
+            () => 'unavailable'
+          );
 
       updateStartupEntry(mongodbVersion, mongoshResult);
     };
@@ -819,7 +830,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [connectionId, connectionTarget, startupLogId, retryNonce]);
+  }, [connectionId, connectionTarget, server, startupLogId, retryNonce]);
 
   // Appends that must land even if the tab was switched away mid-command.
   // While mounted, setEntries drives the mirror effect as usual; once unmounted
@@ -886,7 +897,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     // a second child for a tab that already has one.
     if (!hydrated) return;
     if (mongoshPath === null) return;
-    if (!connectionUri) {
+    if (!connectionUri && !server) {
       setSessionAttempted(true);
       return;
     }
@@ -926,6 +937,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     let openedSessionId: string | null = null;
     setSessionId(null);
     setSessionAttempted(false);
+    setStartError(null);
 
     const startSession = async () => {
       try {
@@ -1021,6 +1033,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         persistSession({ sessionId: null });
         if (!cancelled) {
           setSessionId(null);
+          setStartError(err.message || String(err));
           appendEntries([
             {
               kind: 'error',
@@ -1048,7 +1061,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     };
     // The session is started once per shell tab. currentDb is intentionally used only as startup database.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionId, connectionUri, mongoshPath, retryNonce, sessionKey, hydrated]);
+  }, [connectionId, connectionUri, server, mongoshPath, retryNonce, sessionKey, hydrated]);
 
   // Pinned to the newest output. Not while the tab is hidden: a kept-alive
   // tab (#240) is `display: none`, where scrollHeight is 0 and the assignment
@@ -1071,7 +1084,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
   // install, PATH, well-known locations) so the gate can offer a one-click
   // fix instead of only pointing at Settings.
   useEffect(() => {
-    if (!sessionAttempted || sessionId !== null || mongoshPath === null) return;
+    if (server || !sessionAttempted || sessionId !== null || mongoshPath === null) return;
     let alive = true;
     invoke<{ path: string; version: string; source: string } | null>('detect_mongosh_binary', {
       configured: mongoshPath || '',
@@ -1088,7 +1101,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     return () => {
       alive = false;
     };
-  }, [sessionAttempted, sessionId, mongoshPath, retryNonce]);
+  }, [server, sessionAttempted, sessionId, mongoshPath, retryNonce]);
 
   // Persist a newly chosen mongosh path and re-attempt the session. The
   // retry-nonce bump matters when the picked path equals the current one
@@ -1268,7 +1281,9 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         setTab('console');
         return;
       }
-      const ranExternally = raw.includes('\n')
+      // A server shell has no local mongosh for a one-shot run; its session
+      // takes the script instead.
+      const ranExternally = raw.includes('\n') && !server
         ? await runMongoshScriptOnce(raw)
         : await runExternalMongoshCommand(raw);
       // Whatever follows — a driver call for a recognised command, or nothing —
@@ -1436,6 +1451,17 @@ export const MongoShell: React.FC<MongoShellProps> = ({
             <>
               <div className="h-6 w-6 animate-spin rounded-full border-b-2 border-primary" />
               <span className="text-sm text-muted-foreground">{t('mongoShell.gate.startingSession')}</span>
+            </>
+          ) : server ? (
+            <>
+              <Terminal size={28} className="text-muted-foreground" />
+              <div className="text-sm font-semibold text-foreground">{t('mongoShell.gate.serverFailed')}</div>
+              <div className="max-w-sm text-xs leading-relaxed text-muted-foreground" data-testid="shell-server-failed">
+                {startError}
+              </div>
+              <Button variant="outline" onClick={() => setRetryNonce((n) => n + 1)} data-testid="gate-retry">
+                {t('mongoShell.gate.retry')}
+              </Button>
             </>
           ) : (
             <>

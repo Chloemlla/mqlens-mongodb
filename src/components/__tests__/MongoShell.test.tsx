@@ -447,6 +447,57 @@ describe('MongoShell Component', () => {
     });
   });
 
+  it('starts a shell on an MQLens Server connection, which has no URI', async () => {
+    render(
+      <MongoShell
+        connectionId="server-conn"
+        connectionName="Orders"
+        connectionUri=""
+        server
+        databaseName="orders"
+      />
+    );
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('start_mongosh_session', expect.objectContaining({
+        connectionId: 'server-conn',
+        uri: '',
+        database: 'orders',
+      }))
+    );
+  });
+
+  it('does not report this machine’s mongosh for a shell running on MQLens Server', async () => {
+    render(
+      <MongoShell connectionId="server-conn" connectionName="Orders" connectionUri="" server databaseName="orders" />
+    );
+
+    fireEvent.click(await screen.findByRole('tab', { name: /console/i }));
+    expect(await screen.findByText(/Using MongoDB: 7.0.5\s+Using Mongosh: on MQLens Server/)).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith('test_mongosh_path', expect.anything());
+  });
+
+  it('says why a shell failed to start on MQLens Server, not that mongosh is missing here', async () => {
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((cmd, args) =>
+      cmd === 'start_mongosh_session' ? Promise.reject('MQLens Server is unavailable') : base(cmd, args)
+    );
+    render(
+      <MongoShell connectionId="server-conn" connectionName="Orders" connectionUri="" server databaseName="orders" />
+    );
+
+    const gate = await screen.findByTestId('shell-server-failed');
+    expect(gate).toHaveTextContent('MQLens Server is unavailable');
+    expect(screen.queryByText('MongoShell requires mongosh')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('shell-browse-mongosh-btn')).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith('detect_mongosh_binary', expect.anything());
+
+    const starts = () => mockInvoke.mock.calls.filter((c) => c[0] === 'start_mongosh_session').length;
+    const before = starts();
+    fireEvent.click(screen.getByTestId('gate-retry'));
+    await waitFor(() => expect(starts()).toBe(before + 1));
+  });
+
   it('auto-runs initial find command and shows documents in Data Viewer', async () => {
     render(
       <MongoShell
@@ -523,6 +574,28 @@ describe('MongoShell Component', () => {
       )
     ).toBe(false);
     expect(await screen.findByText('script result')).toBeInTheDocument();
+  });
+
+  it('runs a multi-line script down the live session on an MQLens Server connection', async () => {
+    // One-shot scripts need a local mongosh and a URI; a server shell has
+    // neither, but its session runs on the server and takes the script.
+    render(
+      <MongoShell connectionId="server-conn" connectionName="Orders" connectionUri="" server databaseName="orders" />
+    );
+    await screen.findByText(/mongosh session attached/);
+
+    const script = 'for (let i = 0; i < 2; i++) {\n  print(i)\n}';
+    fireEvent.change(screen.getByLabelText('mongosh editor'), { target: { value: script } });
+    fireEvent.click(screen.getByRole('button', { name: /^run$/i }));
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('run_mongosh_command', expect.objectContaining({
+        sessionId: 'shell-session-1',
+        command: script,
+      }))
+    );
+    expect(mockInvoke.mock.calls.some((c) => c[0] === 'run_mongosh_script')).toBe(false);
+    expect(await screen.findByText('mongosh result')).toBeInTheDocument();
   });
 
   it('keeps a single typed command on the warm session', async () => {
