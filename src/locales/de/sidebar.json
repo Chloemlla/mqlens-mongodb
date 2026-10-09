@@ -8,6 +8,8 @@
     "readOnlyAriaLabel": "Schreibgeschützte Verbindung",
     "readOnlyBadge": "schreibgeschützt",
     "refreshAriaLabel": "Datenbanken aktualisieren",
+    "serverBadge": "Server",
+    "serverBadgeTitle": "Über das MQLens-Server-Konto {{account}}",
     "viaMcpAriaLabel": "Verbunden über MCP",
     "viaMcpBadge": "über MCP"
   },
@@ -25,6 +27,7 @@
     "createIndex": "Index erstellen",
     "createView": "View erstellen",
     "deleteIndex": "Index löschen",
+    "destructiveActions": "Verwalten",
     "disconnect": "Trennen",
     "dropCollection": "Collection löschen",
     "dropDatabase": "Datenbank löschen",
@@ -38,6 +41,7 @@
     "newBucket": "Neuer Bucket",
     "newCollection": "Neue Collection",
     "newConnection": "Neue Verbindung",
+    "notOnServer": "Auf MQLens Server noch nicht verfügbar",
     "open": "Öffnen",
     "openCollection": "Collection öffnen",
     "openInNewTab": "In neuem Tab öffnen",
@@ -60,13 +64,9 @@
   },
   "dialogs": {
     "dropCollection": {
-      "confirmLabel": "Löschen",
-      "message": "Möchtest du die Collection \"{{name}}\" wirklich löschen?",
       "title": "Collection löschen"
     },
     "dropDatabase": {
-      "confirmLabel": "Löschen",
-      "message": "Möchtest du die Datenbank \"{{name}}\" wirklich löschen? Dies kann nicht rückgängig gemacht werden.",
       "title": "Datenbank löschen"
     },
     "enterNewCollectionName": "Neuen Collection-Namen eingeben:",
@@ -156,7 +156,9 @@
     "createCollectionFailed": "Collection konnte nicht erstellt werden: {{error}}",
     "createDatabaseFailed": "Datenbank konnte nicht erstellt werden: {{error}}",
     "dropCollectionFailed": "Collection konnte nicht gelöscht werden: {{error}}",
+    "dropCollectionSuccess": "Collection \"{{name}}\" wurde erfolgreich gelöscht.",
     "dropDatabaseFailed": "Datenbank konnte nicht gelöscht werden: {{error}}",
+    "dropDatabaseSuccess": "Datenbank \"{{name}}\" wurde erfolgreich gelöscht.",
     "loadCollectionsFailed": "Sammlungen in {{db}} konnten nicht aufgelistet werden: {{error}}",
     "namespaceBusyWithSave": "Hier wird gerade ein Dokument gespeichert. Warte, bis das fertig ist, bevor du umbenennst.",
     "noSavedConnection": "Keine gespeicherte Verbindung \"{{name}}\". Füge sie im Verbindungsmanager hinzu und versuche es erneut.",

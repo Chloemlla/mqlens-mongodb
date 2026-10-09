@@ -2,11 +2,14 @@
 //! and returns exactly what local mode returns.
 
 pub(crate) mod ddl;
+pub(crate) mod export;
+pub(crate) mod gridfs;
 pub(crate) mod metadata;
 pub(crate) mod monitoring;
 pub(crate) mod query;
 pub(crate) mod stats;
 pub(crate) mod users;
+pub(crate) mod write;
 
 use crate::server::accounts;
 use crate::server::remote::RemoteConn;
@@ -51,11 +54,14 @@ pub(crate) async fn session_for(
     if !account.same_identity(&conn.identity) {
         return Err(ACCOUNT_REPOINTED.to_string());
     }
-    state
+    let session = state
         .server
         .session(
             &account,
             crate::server::commands::token_store(state, &conn.accounts_path),
         )
-        .await
+        .await?;
+    // A session resumed since the connection was made has agreed nothing yet.
+    session.speak(conn.api_version);
+    Ok(session)
 }

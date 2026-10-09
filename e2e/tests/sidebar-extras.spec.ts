@@ -1,6 +1,6 @@
 import type { Locator, Page } from '@playwright/test';
 import { test, expect } from '../fixtures';
-import { callFrom, connectStaging, dismissHoverCards, expandCollections, loadSample } from '../helpers';
+import { callFrom, confirmTypedName, connectStaging, dismissHoverCards, expandCollections, loadSample } from '../helpers';
 
 const sidebar = (page: Page) => page.getByRole('complementary').first();
 const databaseRow = (page: Page, name: string) => sidebar(page).getByRole('button', { name: `Database ${name}` });
@@ -13,6 +13,9 @@ async function answer(page: Page, value: string): Promise<void> {
 
 async function menu(page: Page, row: Locator, item: string): Promise<void> {
   await row.click({ button: 'right' });
+  if (item.startsWith('Drop ') || item === 'Delete Index') {
+    await page.getByRole('menuitem', { name: 'Manage', exact: true }).press('ArrowRight');
+  }
   await page.getByRole('menuitem', { name: item, exact: true }).click();
 }
 
@@ -53,7 +56,7 @@ test.describe('Sidebar confirmations and failures', () => {
 
     await app.failNext('drop_database', 'database is in use');
     await menu(page, databaseRow(page, 'user_analytics'), 'Drop Database');
-    await page.getByTestId('dialog-confirm').click();
+    await confirmTypedName(page, 'user_analytics');
     await expect(toast(page, 'Failed to drop database: database is in use')).toBeVisible();
   });
 

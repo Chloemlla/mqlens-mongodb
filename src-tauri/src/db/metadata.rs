@@ -342,15 +342,27 @@ async fn create_index_inner(
         return Ok(());
     }
 
-    let client = crate::require_real_client(state, id)?;
-
-    let database = client.database(db);
-    let coll = database.collection::<mongodb::bson::Document>(collection);
-
     let value: serde_json::Value =
         serde_json::from_str(keys).map_err(|e| format!("Invalid JSON keys: {}", e))?;
     let keys_doc = mongodb::bson::to_document(&value)
         .map_err(|e| format!("Failed to convert keys JSON to BSON: {}", e))?;
+
+    let client = match crate::server::remote::route(state, id)? {
+        crate::server::remote::Route::Local(client) => client,
+        crate::server::remote::Route::Remote(conn) => {
+            let index = crate::server::ops::write::NewIndex {
+                name: index_name,
+                keys: &keys_doc,
+                unique,
+                sparse,
+            };
+            use crate::server::ops::write;
+            return write::create_index(state, &conn, db, collection, index).await;
+        }
+    };
+
+    let database = client.database(db);
+    let coll = database.collection::<mongodb::bson::Document>(collection);
 
     let mut options = mongodb::options::IndexOptions::builder()
         .name(index_name.to_string())
@@ -427,7 +439,13 @@ async fn delete_index_inner(
         return Ok(());
     }
 
-    let client = crate::require_real_client(state, id)?;
+    let client = match crate::server::remote::route(state, id)? {
+        crate::server::remote::Route::Local(client) => client,
+        crate::server::remote::Route::Remote(conn) => {
+            use crate::server::ops::write;
+            return write::drop_index(state, &conn, db, collection, index_name).await;
+        }
+    };
 
     let database = client.database(db);
     let coll = database.collection::<mongodb::bson::Document>(collection);

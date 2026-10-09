@@ -8,6 +8,8 @@
     "readOnlyAriaLabel": "只读连接",
     "readOnlyBadge": "只读",
     "refreshAriaLabel": "刷新数据库",
+    "serverBadge": "服务器",
+    "serverBadgeTitle": "通过 MQLens Server 账户 {{account}}",
     "viaMcpAriaLabel": "通过 MCP 连接",
     "viaMcpBadge": "通过 MCP"
   },
@@ -25,6 +27,7 @@
     "createIndex": "创建索引",
     "createView": "创建 View",
     "deleteIndex": "删除索引",
+    "destructiveActions": "管理",
     "disconnect": "断开连接",
     "dropCollection": "删除 Collection",
     "dropDatabase": "删除数据库",
@@ -38,6 +41,7 @@
     "newBucket": "新建 Bucket",
     "newCollection": "新建 Collection",
     "newConnection": "新建连接",
+    "notOnServer": "MQLens Server 暂不支持",
     "open": "打开",
     "openCollection": "打开 Collection",
     "openInNewTab": "在新标签页中打开",
@@ -60,13 +64,9 @@
   },
   "dialogs": {
     "dropCollection": {
-      "confirmLabel": "删除",
-      "message": "确定要删除 Collection“{{name}}”吗？",
       "title": "删除 Collection"
     },
     "dropDatabase": {
-      "confirmLabel": "删除",
-      "message": "确定要删除数据库“{{name}}”吗？此操作无法撤销。",
       "title": "删除数据库"
     },
     "enterNewCollectionName": "请输入新的 Collection 名称：",
@@ -156,7 +156,9 @@
     "createCollectionFailed": "创建 Collection 失败：{{error}}",
     "createDatabaseFailed": "创建数据库失败：{{error}}",
     "dropCollectionFailed": "删除 Collection 失败：{{error}}",
+    "dropCollectionSuccess": "Collection“{{name}}”已成功删除。",
     "dropDatabaseFailed": "删除数据库失败：{{error}}",
+    "dropDatabaseSuccess": "数据库“{{name}}”已成功删除。",
     "loadCollectionsFailed": "无法列出 {{db}} 中的集合：{{error}}",
     "namespaceBusyWithSave": "此处正在保存文档，请等待完成后再重命名。",
     "noSavedConnection": "没有名为“{{name}}”的已保存连接。请先在连接管理器中添加，然后重试。",

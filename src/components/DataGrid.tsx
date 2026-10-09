@@ -32,6 +32,12 @@ import {
 import type { ListImperativeAPI } from 'react-window';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { useThemeOptional } from '@/hooks/use-theme';
 import { getScaledRowHeight } from '@/lib/themes/ui-scale';
 import { cn } from '@/lib/utils';
@@ -112,7 +118,11 @@ interface DataGridProps {
   // modal (Task 3) gates the actually-destructive ones. Undefined/'normal'
   // behaves exactly as before this feature existed.
   connectionMode?: 'normal' | 'read_only' | 'confirm_destructive';
+  /** Commands this connection cannot run (a server connection). Blocked writes make the grid read-only. */
+  blockedCommands?: readonly string[];
 }
+
+const WRITE_COMMANDS = ['insert_document', 'update_document', 'update_many', 'delete_document', 'delete_many'];
 
 export type ViewMode = 'table' | 'tree' | 'json' | 'chart';
 
@@ -603,6 +613,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
   onViewModeChange,
   onCreateSuggestedIndex,
   connectionMode,
+  blockedCommands,
   chromeless = false,
 }) => {
   const { t } = useTranslation('documents');
@@ -612,7 +623,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
   // #188: read_only disables writes in this grid; confirm_destructive does
   // NOT (see the connectionMode doc comment on DataGridProps above).
-  const isReadOnly = connectionMode === 'read_only';
+  const isReadOnly = connectionMode === 'read_only' || WRITE_COMMANDS.some((c) => blockedCommands?.includes(c));
 
   // ESR-rule suggestion derived from the current explain plan (null unless it's a COLLSCAN).
   const indexSuggestion = useMemo(
@@ -2096,6 +2107,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
             {t('dataGrid.tabs.results')}
           </button>
           <button
+            disabled={blockedCommands?.includes('explain_mql_query')}
             onClick={() => {
               setActiveTab('explain');
               if (docViewerContext && !docViewerContext.explainLoading) {
@@ -2154,35 +2166,42 @@ export const DataGrid: React.FC<DataGridProps> = ({
               {t('dataGrid.actions.schema')}
             </Button>
           )}
-          {activeTab === 'results' && onUpdateMany && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={onUpdateMany}
-              disabled={isReadOnly}
-              className="h-7 gap-1.5 text-[11px]"
-              title={isReadOnly ? t('dataGrid.tooltips.readOnly') : t('dataGrid.tooltips.updateMany')}
-              data-testid="update-many-btn"
-            >
-              <Edit size={12} />
-              {t('dataGrid.actions.updateMany')}
-            </Button>
-          )}
-          {activeTab === 'results' && onDeleteMany && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={onDeleteMany}
-              disabled={isReadOnly}
-              className="h-7 gap-1.5 border-destructive/30 bg-destructive/10 text-[11px] text-destructive hover:bg-destructive/20"
-              title={isReadOnly ? t('dataGrid.tooltips.readOnly') : t('dataGrid.tooltips.deleteMany')}
-              data-testid="delete-many-btn"
-            >
-              <Trash2 size={12} />
-              {t('dataGrid.actions.deleteMany')}
-            </Button>
+          {activeTab === 'results' && (onUpdateMany || onDeleteMany) && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={isReadOnly}
+                  className="h-7 gap-1.5 text-[11px]"
+                  title={isReadOnly ? t('dataGrid.tooltips.readOnly') : undefined}
+                  data-testid="bulk-write-menu-btn"
+                >
+                  <Edit size={12} />
+                  {t('dataGrid.actions.updateOrDelete')}
+                  <ChevronDown size={11} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                {onUpdateMany && (
+                  <DropdownMenuItem onSelect={onUpdateMany} data-testid="update-many-btn">
+                    <Edit />
+                    {t('dataGrid.actions.updateMany')}
+                  </DropdownMenuItem>
+                )}
+                {onDeleteMany && (
+                  <DropdownMenuItem
+                    onSelect={onDeleteMany}
+                    className="text-destructive focus:text-destructive"
+                    data-testid="delete-many-btn"
+                  >
+                    <Trash2 />
+                    {t('dataGrid.actions.deleteMany')}
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
           {activeTab === 'results' ? (
             <>

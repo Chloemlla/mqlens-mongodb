@@ -8,6 +8,8 @@
     "readOnlyAriaLabel": "Read-only connection",
     "readOnlyBadge": "read-only",
     "refreshAriaLabel": "Refresh databases",
+    "serverBadge": "Server",
+    "serverBadgeTitle": "Through the MQLens Server account {{account}}",
     "viaMcpAriaLabel": "Connected via MCP",
     "viaMcpBadge": "via MCP"
   },
@@ -25,6 +27,7 @@
     "createIndex": "Create Index",
     "createView": "Create View",
     "deleteIndex": "Delete Index",
+    "destructiveActions": "Manage",
     "disconnect": "Disconnect",
     "dropCollection": "Drop Collection",
     "dropDatabase": "Drop Database",
@@ -38,6 +41,7 @@
     "newBucket": "New Bucket",
     "newCollection": "New Collection",
     "newConnection": "New Connection",
+    "notOnServer": "Not available on MQLens Server yet",
     "open": "Open",
     "openCollection": "Open Collection",
     "openInNewTab": "Open in New Tab",
@@ -60,13 +64,9 @@
   },
   "dialogs": {
     "dropCollection": {
-      "confirmLabel": "Drop",
-      "message": "Are you sure you want to drop collection \"{{name}}\"?",
       "title": "Drop collection"
     },
     "dropDatabase": {
-      "confirmLabel": "Drop",
-      "message": "Are you sure you want to drop database \"{{name}}\"? This cannot be undone.",
       "title": "Drop database"
     },
     "enterNewCollectionName": "Enter new collection name:",
@@ -156,7 +156,9 @@
     "createCollectionFailed": "Failed to create collection: {{error}}",
     "createDatabaseFailed": "Failed to create database: {{error}}",
     "dropCollectionFailed": "Failed to drop collection: {{error}}",
+    "dropCollectionSuccess": "Collection \"{{name}}\" dropped successfully.",
     "dropDatabaseFailed": "Failed to drop database: {{error}}",
+    "dropDatabaseSuccess": "Database \"{{name}}\" dropped successfully.",
     "loadCollectionsFailed": "Could not list collections in {{db}}: {{error}}",
     "namespaceBusyWithSave": "A document is being saved here. Wait for it to finish before renaming.",
     "noSavedConnection": "No saved connection \"{{name}}\". Add it in Connection Manager, then try again.",

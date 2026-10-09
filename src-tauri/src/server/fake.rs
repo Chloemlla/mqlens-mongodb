@@ -21,6 +21,7 @@ use crate::server::pb::mqlens::v1::ddl_service_server::{DdlService, DdlServiceSe
 use crate::server::pb::mqlens::v1::deployment_user_service_server::{
     DeploymentUserService, DeploymentUserServiceServer,
 };
+use crate::server::pb::mqlens::v1::grid_fs_service_server::{GridFsService, GridFsServiceServer};
 use crate::server::pb::mqlens::v1::metadata_service_server::{
     MetadataService, MetadataServiceServer,
 };
@@ -28,6 +29,7 @@ use crate::server::pb::mqlens::v1::monitoring_service_server::{
     MonitoringService, MonitoringServiceServer,
 };
 use crate::server::pb::mqlens::v1::stats_service_server::{StatsService, StatsServiceServer};
+use crate::server::pb::mqlens::v1::write_service_server::{WriteService, WriteServiceServer};
 use crate::server::pb::mqlens::v1::{
     login_request, ConnectionRef, GetConnectionRequest, ListConnectionsRequest,
     ListConnectionsResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Principal,
@@ -61,8 +63,17 @@ use crate::server::pb::mqlens::v1::{
     DeploymentUserAck, DropCollectionRequest, DropDatabaseRequest, DropDeploymentUserRequest,
     GetCollectionOptionsRequest, ListDeploymentRolesRequest, ListDeploymentRolesResponse,
     ListDeploymentUsersRequest, ListDeploymentUsersResponse, RenameCollectionRequest,
-    RenameDatabaseRequest, RoleSpec as PbRoleSpec, SetValidatorRequest,
-    UpdateDeploymentUserRequest,
+    RenameDatabaseDetailedRequest, RenameDatabaseRequest, RenameDatabaseResult,
+    RoleSpec as PbRoleSpec, SetValidatorRequest, UpdateDeploymentUserRequest,
+};
+use crate::server::pb::mqlens::v1::{CurrentOp as PbCurrentOp, ProfileEntry as PbProfileEntry};
+use crate::server::pb::mqlens::v1::{
+    DeleteDocumentRequest, DeleteManyRequest, InsertDocumentRequest, InsertDocumentResponse,
+    ReplaceDocumentRequest, UpdateDocumentRequest, UpdateManyRequest, WriteResult,
+};
+use crate::server::pb::mqlens::v1::{
+    DeleteFileRequest, DeleteFileResponse, DownloadFileRequest, FileChunk, ListFilesRequest,
+    ListFilesResponse, UploadChunk, UploadFileResponse,
 };
 use crate::server::session::{unix_now, AccountSession, FileTokenStore, TokenStore};
 use mongodb::bson::{doc, Document};
@@ -110,12 +121,13 @@ pub(crate) struct FakeState {
     /// Codes the next logouts fail with, before ending the session.
     pub logout_failures: Vec<Code>,
     pub connections: Vec<ConnectionRef>,
-    /// Feature strings GetCapabilities announces.
-    pub features: Vec<String>,
+    /// The MQLens API versions GetCapabilities announces and requests may speak.
+    pub min_api_version: u32,
+    pub max_api_version: u32,
+    /// The version each authenticated request spoke, 1 when it sent none.
+    pub api_versions_seen: std::cell::RefCell<Vec<u32>>,
     /// A code MongoVersion fails with, to play an unreachable deployment.
     pub version_failure: Option<Code>,
-    /// Procedures GetCapabilities announces.
-    pub procedures: Vec<String>,
     /// What the metadata procedures answer, for any connection the caller
     /// can reach.
     pub databases: Vec<String>,
@@ -128,6 +140,31 @@ pub(crate) struct FakeState {
     pub batch_delay: Duration,
     pub last_find: Option<FindRequest>,
     pub last_aggregate: Option<AggregateRequest>,
+    /// What Count answers, and the last request it got.
+    pub count_result: i64,
+    pub last_count: Option<CountRequest>,
+    /// Every write and index change received, in order.
+    pub writes: Vec<FakeWrite>,
+    /// What the document writes answer.
+    pub write_result: WriteResult,
+    /// The file documents ListFiles returns, as stored.
+    pub gridfs_files: Vec<Document>,
+    /// The bytes DownloadFile streams, in messages of `gridfs_chunk` bytes.
+    pub gridfs_content: Vec<u8>,
+    pub gridfs_chunk: usize,
+    /// Each upload received: its first message without data, and every byte.
+    pub uploads: Vec<(UploadChunk, Vec<u8>)>,
+    /// Held after an upload's last byte, before answering it.
+    pub upload_delay: Duration,
+    /// The download and delete requests received.
+    pub gridfs_requests: Vec<FakeGridFs>,
+    /// What RenameDatabaseDetailed reports.
+    pub rename_result: RenameDatabaseResult,
+    /// The id InsertDocument reports.
+    pub inserted_id: mongodb::bson::Bson,
+    /// The plan Explain answers, and the last request it got.
+    pub explain_plan: Document,
+    pub last_explain: Option<ExplainRequest>,
     pub data_calls: u32,
     /// Streams the client stopped reading before the end.
     pub streams_abandoned: u32,
@@ -139,6 +176,11 @@ pub(crate) struct FakeState {
     pub server_status: ServerStatusResponse,
     pub repl_set_status: ReplSetStatusResponse,
     pub profiling_status: PbProfilingStatus,
+    /// What CurrentOps and ReadProfile answer.
+    pub current_ops: Vec<PbCurrentOp>,
+    pub profile: Vec<PbProfileEntry>,
+    /// The admin monitoring calls received, in order.
+    pub admin_calls: Vec<FakeAdmin>,
     /// What GetCollectionOptions, ListUsers and ListRoles answer.
     pub collection_options: PbCollectionValidation,
     pub users: Vec<DeploymentUser>,
@@ -183,6 +225,24 @@ impl FakeState {
     }
 
     fn authenticate<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let version = match request.metadata().get("mqlens-api-version") {
+            None => 1,
+            Some(v) => v
+                .to_str()
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .ok_or_else(|| Status::invalid_argument("bad mqlens-api-version"))?,
+        };
+        if version < self.min_api_version || version > self.max_api_version {
+            return Err(Status::failed_precondition("API version not served"));
+        }
+        self.api_versions_seen.borrow_mut().push(version);
+        self.authenticate_any_version(request)
+    }
+
+    /// For the calls a client makes before it has agreed a version, which the
+    /// server answers whatever version they name.
+    fn authenticate_any_version<T>(&self, request: &Request<T>) -> Result<(), Status> {
         let token =
             bearer(request).ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
         match self.access.get(token) {
@@ -267,28 +327,10 @@ impl Fake {
                     deployment_kind: "replica_set".to_string(),
                     op_classes: vec!["read".to_string(), "write".to_string()],
                 }],
-                features: vec!["documents.raw_bson".to_string()],
+                min_api_version: 1,
+                max_api_version: 2,
+                api_versions_seen: std::cell::RefCell::new(Vec::new()),
                 version_failure: None,
-                procedures: [
-                    "MetadataService/ListDatabases",
-                    "MetadataService/ListCollections",
-                    "MetadataService/ListIndexes",
-                    "MetadataService/MongoVersion",
-                    "DataService/Find",
-                    "DataService/Aggregate",
-                    "StatsService/DbStats",
-                    "StatsService/CollStats",
-                    "StatsService/IndexStats",
-                    "MonitoringService/ServerStatus",
-                    "MonitoringService/ReplSetStatus",
-                    "MonitoringService/GetProfilingStatus",
-                    "DdlService/GetCollectionOptions",
-                    "DeploymentUserService/ListUsers",
-                    "DeploymentUserService/ListRoles",
-                ]
-                .iter()
-                .map(|p| format!("/mqlens.v1.{p}"))
-                .collect(),
                 databases: vec!["admin".to_string(), "orders".to_string()],
                 collections: [
                     ("customers", "collection"),
@@ -335,6 +377,30 @@ impl Fake {
                 batch_delay: Duration::ZERO,
                 last_find: None,
                 last_aggregate: None,
+                count_result: 0,
+                writes: Vec::new(),
+                write_result: WriteResult {
+                    matched_count: 1,
+                    modified_count: 1,
+                    deleted_count: 1,
+                    upserted_id_json: String::new(),
+                },
+                gridfs_files: Vec::new(),
+                gridfs_content: Vec::new(),
+                gridfs_chunk: 4,
+                uploads: Vec::new(),
+                upload_delay: Duration::ZERO,
+                gridfs_requests: Vec::new(),
+                rename_result: RenameDatabaseResult {
+                    collections: 2,
+                    documents: 40,
+                },
+                inserted_id: mongodb::bson::Bson::ObjectId(
+                    mongodb::bson::oid::ObjectId::parse_str("64b7f0c2a1b2c3d4e5f60718").unwrap(),
+                ),
+                last_count: None,
+                explain_plan: Document::new(),
+                last_explain: None,
                 data_calls: 0,
                 streams_abandoned: 0,
                 db_stats: DbStatsResponse {
@@ -424,6 +490,9 @@ impl Fake {
                     level: 1,
                     slow_ms: 250,
                 },
+                current_ops: Vec::new(),
+                profile: Vec::new(),
+                admin_calls: Vec::new(),
                 collection_options: PbCollectionValidation {
                     validator: r#"{"$jsonSchema":{"required":["email"],"properties":{"age":{"minimum":0}}}}"#
                         .to_string(),
@@ -497,6 +566,8 @@ impl Fake {
                 .add_service(StatsServiceServer::new(self.clone()))
                 .add_service(MonitoringServiceServer::new(self.clone()))
                 .add_service(DdlServiceServer::new(self.clone()))
+                .add_service(WriteServiceServer::new(self.clone()))
+                .add_service(GridFsServiceServer::new(self.clone()))
                 .add_service(DeploymentUserServiceServer::new(self.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
@@ -587,7 +658,7 @@ impl AuthService for Fake {
         let delay = self.with(|s| s.logout_delay);
         tokio::time::sleep(delay).await;
         let mut state = self.state.lock().unwrap();
-        state.authenticate(&request)?;
+        state.authenticate_any_version(&request)?;
         if !state.logout_failures.is_empty() {
             let code = state.logout_failures.remove(0);
             return Err(Status::new(code, "injected failure"));
@@ -626,7 +697,7 @@ impl ConnectionService for Fake {
         let delay = self.with(|s| s.list_delay);
         tokio::time::sleep(delay).await;
         let mut state = self.state.lock().unwrap();
-        state.authenticate(&request)?;
+        state.authenticate_any_version(&request)?;
         state.list_calls += 1;
         Ok(Response::new(ListConnectionsResponse {
             connections: state.connections.clone(),
@@ -648,7 +719,7 @@ impl CapabilityService for Fake {
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let state = self.state.lock().unwrap();
-        state.authenticate(&request)?;
+        state.authenticate_any_version(&request)?;
         // Empty op classes for an id the caller cannot reach, existing or not.
         let connections = request
             .get_ref()
@@ -666,8 +737,8 @@ impl CapabilityService for Fake {
             .collect();
         Ok(Response::new(GetCapabilitiesResponse {
             server_version: "fake".to_string(),
-            procedures: state.procedures.clone(),
-            features: state.features.clone(),
+            min_api_version: state.min_api_version,
+            max_api_version: state.max_api_version,
             principal: Some(principal()),
             connections,
         }))
@@ -733,16 +804,209 @@ impl MetadataService for Fake {
 
     async fn create_index(
         &self,
-        _request: Request<CreateIndexRequest>,
+        request: Request<CreateIndexRequest>,
     ) -> Result<Response<MetadataAck>, Status> {
-        Err(Status::unimplemented("CreateIndex is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::CreateIndex(request.into_inner()));
+        Ok(Response::new(MetadataAck {}))
     }
 
     async fn drop_index(
         &self,
-        _request: Request<DropIndexRequest>,
+        request: Request<DropIndexRequest>,
     ) -> Result<Response<MetadataAck>, Status> {
-        Err(Status::unimplemented("DropIndex is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::DropIndex(request.into_inner()));
+        Ok(Response::new(MetadataAck {}))
+    }
+}
+
+/// A GridFS download or delete the fake received.
+#[derive(Clone, Debug)]
+pub(crate) enum FakeGridFs {
+    Download(DownloadFileRequest),
+    Delete(DeleteFileRequest),
+}
+
+type FileChunks = Pin<Box<dyn tokio_stream::Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl GridFsService for Fake {
+    async fn list_files(
+        &self,
+        request: Request<ListFilesRequest>,
+    ) -> Result<Response<ListFilesResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        let mut files_bson = Vec::new();
+        for doc in &state.gridfs_files {
+            let mut bytes = Vec::new();
+            doc.to_writer(&mut bytes).unwrap();
+            files_bson.push(bytes.into());
+        }
+        Ok(Response::new(ListFilesResponse {
+            files_ejson: Vec::new(),
+            files_bson,
+        }))
+    }
+
+    type DownloadFileStream = FileChunks;
+
+    async fn download_file(
+        &self,
+        request: Request<DownloadFileRequest>,
+    ) -> Result<Response<Self::DownloadFileStream>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .gridfs_requests
+            .push(FakeGridFs::Download(request.into_inner()));
+        let chunks: Vec<Result<FileChunk, Status>> = state
+            .gridfs_content
+            .chunks(state.gridfs_chunk.max(1))
+            .map(|data| {
+                Ok(FileChunk {
+                    data: data.to_vec().into(),
+                })
+            })
+            .collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+    }
+
+    async fn upload_file(
+        &self,
+        request: Request<tonic::Streaming<UploadChunk>>,
+    ) -> Result<Response<UploadFileResponse>, Status> {
+        let (metadata, extensions, mut stream) = request.into_parts();
+        let mut first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty upload"))?;
+        {
+            let state = self.state.lock().unwrap();
+            let check = Request::from_parts(metadata, extensions, ());
+            state.authorize_connection(&check, &first.connection_id)?;
+        }
+        let mut data = std::mem::take(&mut first.data).to_vec();
+        while let Some(chunk) = stream.message().await? {
+            data.extend_from_slice(&chunk.data);
+        }
+        let delay = {
+            let mut state = self.state.lock().unwrap();
+            state.uploads.push((first, data));
+            state.upload_delay
+        };
+        tokio::time::sleep(delay).await;
+        Ok(Response::new(UploadFileResponse {
+            file_id_ejson: r#"{"_id":{"$oid":"64b7f0c2a1b2c3d4e5f60719"}}"#.to_string(),
+        }))
+    }
+
+    async fn delete_file(
+        &self,
+        request: Request<DeleteFileRequest>,
+    ) -> Result<Response<DeleteFileResponse>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .gridfs_requests
+            .push(FakeGridFs::Delete(request.into_inner()));
+        Ok(Response::new(DeleteFileResponse {}))
+    }
+}
+
+/// A write or index change the fake received.
+#[derive(Clone, Debug)]
+pub(crate) enum FakeWrite {
+    Insert(InsertDocumentRequest),
+    Update(UpdateDocumentRequest),
+    Replace(ReplaceDocumentRequest),
+    Delete(DeleteDocumentRequest),
+    UpdateMany(UpdateManyRequest),
+    DeleteMany(DeleteManyRequest),
+    CreateIndex(CreateIndexRequest),
+    DropIndex(DropIndexRequest),
+    CreateCollection(CreateCollectionRequest),
+    DropCollection(DropCollectionRequest),
+    RenameCollection(RenameCollectionRequest),
+    CreateView(CreateViewRequest),
+    DropDatabase(DropDatabaseRequest),
+    RenameDatabase(RenameDatabaseDetailedRequest),
+    SetValidator(SetValidatorRequest),
+}
+
+impl Fake {
+    /// Records a write and answers it with the configured result.
+    fn write<T>(
+        &self,
+        request: Request<T>,
+        connection_id: impl Fn(&T) -> &str,
+        record: impl FnOnce(T) -> FakeWrite,
+    ) -> Result<Response<WriteResult>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, connection_id(request.get_ref()))?;
+        state.writes.push(record(request.into_inner()));
+        Ok(Response::new(state.write_result.clone()))
+    }
+}
+
+#[tonic::async_trait]
+impl WriteService for Fake {
+    async fn insert_document(
+        &self,
+        request: Request<InsertDocumentRequest>,
+    ) -> Result<Response<InsertDocumentResponse>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state.writes.push(FakeWrite::Insert(request.into_inner()));
+        Ok(Response::new(InsertDocumentResponse {
+            inserted_id_json: state
+                .inserted_id
+                .clone()
+                .into_canonical_extjson()
+                .to_string(),
+        }))
+    }
+
+    async fn update_document(
+        &self,
+        request: Request<UpdateDocumentRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::Update)
+    }
+
+    async fn replace_document(
+        &self,
+        request: Request<ReplaceDocumentRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::Replace)
+    }
+
+    async fn delete_document(
+        &self,
+        request: Request<DeleteDocumentRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::Delete)
+    }
+
+    async fn update_many(
+        &self,
+        request: Request<UpdateManyRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::UpdateMany)
+    }
+
+    async fn delete_many(
+        &self,
+        request: Request<DeleteManyRequest>,
+    ) -> Result<Response<WriteResult>, Status> {
+        self.write(request, |r| &r.connection_id, FakeWrite::DeleteMany)
     }
 }
 
@@ -751,9 +1015,13 @@ type Batches = Pin<Box<dyn tokio_stream::Stream<Item = Result<FindBatch, Status>
 impl Fake {
     /// The stored documents as raw BSON, in batches, each after
     /// `batch_delay`. Counts a stream the client drops before the end.
-    fn batches(&self) -> Batches {
-        let (documents, size, delay) =
+    /// The stored documents in batches, at most `limit` of them (0: all).
+    fn batches(&self, limit: usize) -> Batches {
+        let (mut documents, size, delay) =
             self.with(|s| (s.documents.clone(), s.batch_size.max(1), s.batch_delay));
+        if limit > 0 {
+            documents.truncate(limit);
+        }
         let state = self.state.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
@@ -795,7 +1063,8 @@ impl DataService for Fake {
             state.data_calls += 1;
             state.last_find = Some(request.get_ref().clone());
         }
-        Ok(Response::new(self.batches()))
+        let limit = usize::try_from(request.get_ref().limit).unwrap_or(0);
+        Ok(Response::new(self.batches(limit)))
     }
 
     async fn aggregate(
@@ -808,21 +1077,33 @@ impl DataService for Fake {
             state.data_calls += 1;
             state.last_aggregate = Some(request.get_ref().clone());
         }
-        Ok(Response::new(self.batches()))
+        Ok(Response::new(self.batches(0)))
     }
 
     async fn count(
         &self,
-        _request: Request<CountRequest>,
+        request: Request<CountRequest>,
     ) -> Result<Response<CountResponse>, Status> {
-        Err(Status::unimplemented("Count is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state.last_count = Some(request.get_ref().clone());
+        Ok(Response::new(CountResponse {
+            count: state.count_result,
+        }))
     }
 
     async fn explain(
         &self,
-        _request: Request<ExplainRequest>,
+        request: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
-        Err(Status::unimplemented("Explain is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state.last_explain = Some(request.get_ref().clone());
+        Ok(Response::new(ExplainResponse {
+            plan_json: mongodb::bson::Bson::Document(state.explain_plan.clone())
+                .into_canonical_extjson()
+                .to_string(),
+        }))
     }
 }
 
@@ -872,9 +1153,14 @@ impl MonitoringService for Fake {
 
     async fn current_ops(
         &self,
-        _request: Request<CurrentOpsRequest>,
+        request: Request<CurrentOpsRequest>,
     ) -> Result<Response<CurrentOpsResponse>, Status> {
-        Err(Status::unimplemented("CurrentOps is not implemented"))
+        let state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        Ok(Response::new(CurrentOpsResponse {
+            ops: state.current_ops.clone(),
+            truncated: false,
+        }))
     }
 
     async fn repl_set_status(
@@ -888,9 +1174,14 @@ impl MonitoringService for Fake {
 
     async fn kill_op(
         &self,
-        _request: Request<KillOpRequest>,
+        request: Request<KillOpRequest>,
     ) -> Result<Response<MonitoringAck>, Status> {
-        Err(Status::unimplemented("KillOp is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::KillOp(request.into_inner()));
+        Ok(Response::new(MonitoringAck {}))
     }
 
     async fn get_profiling_status(
@@ -904,19 +1195,43 @@ impl MonitoringService for Fake {
 
     async fn set_profiling_level(
         &self,
-        _request: Request<SetProfilingLevelRequest>,
+        request: Request<SetProfilingLevelRequest>,
     ) -> Result<Response<PbProfilingStatus>, Status> {
-        Err(Status::unimplemented(
-            "SetProfilingLevel is not implemented",
-        ))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        let set = request.into_inner();
+        state.profiling_status = PbProfilingStatus {
+            level: set.level.into(),
+            slow_ms: set.slow_ms.into(),
+        };
+        state.admin_calls.push(FakeAdmin::SetProfilingLevel(set));
+        Ok(Response::new(state.profiling_status))
     }
 
     async fn read_profile(
         &self,
-        _request: Request<ReadProfileRequest>,
+        request: Request<ReadProfileRequest>,
     ) -> Result<Response<ReadProfileResponse>, Status> {
-        Err(Status::unimplemented("ReadProfile is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::ReadProfile(request.into_inner()));
+        Ok(Response::new(ReadProfileResponse {
+            entries: state.profile.clone(),
+        }))
     }
+}
+
+/// An admin monitoring call the fake received.
+#[derive(Clone, Debug)]
+pub(crate) enum FakeAdmin {
+    KillOp(KillOpRequest),
+    SetProfilingLevel(SetProfilingLevelRequest),
+    ReadProfile(ReadProfileRequest),
+    CreateUser(CreateDeploymentUserRequest),
+    UpdateUser(UpdateDeploymentUserRequest),
+    DropUser(DropDeploymentUserRequest),
 }
 
 /// Only GetCollectionOptions; the DDL writes come with D5.
@@ -924,37 +1239,62 @@ impl MonitoringService for Fake {
 impl DdlService for Fake {
     async fn create_collection(
         &self,
-        _request: Request<CreateCollectionRequest>,
+        request: Request<CreateCollectionRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("CreateCollection is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::CreateCollection(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn drop_collection(
         &self,
-        _request: Request<DropCollectionRequest>,
+        request: Request<DropCollectionRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("DropCollection is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::DropCollection(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn rename_collection(
         &self,
-        _request: Request<RenameCollectionRequest>,
+        request: Request<RenameCollectionRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("RenameCollection is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::RenameCollection(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn create_view(
         &self,
-        _request: Request<CreateViewRequest>,
+        request: Request<CreateViewRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("CreateView is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::CreateView(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn drop_database(
         &self,
-        _request: Request<DropDatabaseRequest>,
+        request: Request<DropDatabaseRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("DropDatabase is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::DropDatabase(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 
     async fn rename_database(
@@ -962,6 +1302,18 @@ impl DdlService for Fake {
         _request: Request<RenameDatabaseRequest>,
     ) -> Result<Response<DdlAck>, Status> {
         Err(Status::unimplemented("RenameDatabase is not implemented"))
+    }
+
+    async fn rename_database_detailed(
+        &self,
+        request: Request<RenameDatabaseDetailedRequest>,
+    ) -> Result<Response<RenameDatabaseResult>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::RenameDatabase(request.into_inner()));
+        Ok(Response::new(state.rename_result.clone()))
     }
 
     async fn get_collection_options(
@@ -975,9 +1327,14 @@ impl DdlService for Fake {
 
     async fn set_validator(
         &self,
-        _request: Request<SetValidatorRequest>,
+        request: Request<SetValidatorRequest>,
     ) -> Result<Response<DdlAck>, Status> {
-        Err(Status::unimplemented("SetValidator is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::SetValidator(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
     }
 }
 
@@ -1009,23 +1366,38 @@ impl DeploymentUserService for Fake {
 
     async fn create_user(
         &self,
-        _request: Request<CreateDeploymentUserRequest>,
+        request: Request<CreateDeploymentUserRequest>,
     ) -> Result<Response<DeploymentUserAck>, Status> {
-        Err(Status::unimplemented("CreateUser is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::CreateUser(request.into_inner()));
+        Ok(Response::new(DeploymentUserAck {}))
     }
 
     async fn update_user(
         &self,
-        _request: Request<UpdateDeploymentUserRequest>,
+        request: Request<UpdateDeploymentUserRequest>,
     ) -> Result<Response<DeploymentUserAck>, Status> {
-        Err(Status::unimplemented("UpdateUser is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::UpdateUser(request.into_inner()));
+        Ok(Response::new(DeploymentUserAck {}))
     }
 
     async fn drop_user(
         &self,
-        _request: Request<DropDeploymentUserRequest>,
+        request: Request<DropDeploymentUserRequest>,
     ) -> Result<Response<DeploymentUserAck>, Status> {
-        Err(Status::unimplemented("DropUser is not implemented"))
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .admin_calls
+            .push(FakeAdmin::DropUser(request.into_inner()));
+        Ok(Response::new(DeploymentUserAck {}))
     }
 }
 

@@ -33,7 +33,7 @@ use crate::server::pb::mqlens::v1::{
 };
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::metadata::MetadataValue;
@@ -182,6 +182,9 @@ pub(crate) struct AccountSession {
     tokens: tokio::sync::Mutex<Tokens>,
     ended: AtomicBool,
     displaced_session_warning: Option<String>,
+    /// The MQLens API version agreed with the server; 0 until a connection
+    /// has agreed one, when requests carry none and the server takes them as 1.
+    api_version: AtomicU32,
 }
 
 impl AccountSession {
@@ -196,6 +199,7 @@ impl AccountSession {
             tokens: tokio::sync::Mutex::new(Tokens::default()),
             ended: AtomicBool::new(false),
             displaced_session_warning: None,
+            api_version: AtomicU32::new(0),
         })
     }
 
@@ -356,6 +360,12 @@ impl AccountSession {
         tokens.generation += 1;
     }
 
+    /// Speaks `version` of the MQLens API on every later request. One account
+    /// is one server, so every connection on it agrees the same version.
+    pub(crate) fn speak(&self, version: u32) {
+        self.api_version.store(version, Ordering::Relaxed);
+    }
+
     /// Makes one unary call with the session's access token. A call refused as
     /// unauthenticated refreshes once, unless another task already has, and is
     /// retried once; refused again, the session ends.
@@ -385,6 +395,18 @@ impl AccountSession {
         self.call_bounded(message, rpc, Bound::Opening).await
     }
 
+/// Makes one call with no deadline, refreshing and retrying once like
+    /// `call`: for a client stream as long as the file it sends, which the
+    /// caller bounds by its own progress instead.
+    pub(crate) async fn call_unbounded<M, R, F, Fut>(&self, message: M, rpc: F) -> Result<R, String>
+    where
+        M: Clone,
+        F: Fn(Channel, Request<M>) -> Fut,
+        Fut: Future<Output = Result<Response<R>, Status>>,
+    {
+        self.call_bounded(message, rpc, Bound::None).await
+    }
+
     async fn call_bounded<M, R, F, Fut>(
         &self,
         message: M,
@@ -400,7 +422,11 @@ impl AccountSession {
         match send(
             &rpc,
             self.channel.clone(),
-            authorized(message.clone(), &token)?,
+            authorized(
+                message.clone(),
+                &token,
+                self.api_version.load(Ordering::Relaxed),
+            )?,
             bound,
         )
         .await
@@ -413,7 +439,7 @@ impl AccountSession {
         match send(
             &rpc,
             self.channel.clone(),
-            authorized(message, &token)?,
+            authorized(message, &token, self.api_version.load(Ordering::Relaxed))?,
             bound,
         )
         .await
@@ -606,6 +632,8 @@ enum Bound {
     Deadline,
     /// A limit on the wait for a stream to open; the stream itself has none.
     Opening,
+    /// No limit: the caller bounds the call by its own progress.
+    None,
 }
 
 async fn send<M, R, F, Fut>(
@@ -623,6 +651,7 @@ where
         Bound::Opening => tokio::time::timeout(STREAM_IDLE_TIMEOUT, rpc(channel, request))
             .await
             .unwrap_or_else(|_| Err(Status::deadline_exceeded(""))),
+        Bound::None => rpc(channel, request).await,
     }
 }
 
@@ -643,11 +672,16 @@ fn with_deadline<M>(mut request: Request<M>) -> Request<M> {
     request
 }
 
-fn authorized<M>(message: M, access_token: &str) -> Result<Request<M>, String> {
+fn authorized<M>(message: M, access_token: &str, api_version: u32) -> Result<Request<M>, String> {
     let value = MetadataValue::try_from(format!("Bearer {access_token}"))
         .map_err(|_| "MQLens Server issued an access token that cannot be sent".to_string())?;
     let mut request = Request::new(message);
     request.metadata_mut().insert("authorization", value);
+    if api_version > 0 {
+        request
+            .metadata_mut()
+            .insert("mqlens-api-version", MetadataValue::from(api_version));
+    }
     Ok(request)
 }
 
@@ -671,6 +705,8 @@ async fn logout(channel: &Channel, access_token: &str, refresh_token: &str) -> R
             refresh_token: refresh_token.to_string(),
         },
         access_token,
+        // Signing in and out belong to every API version.
+        0,
     )
     .map_err(Status::internal)?;
     request.set_timeout(LOGOUT_TIMEOUT);
