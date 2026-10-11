@@ -3884,9 +3884,13 @@ function Workspace() {
       if (existing) {
         newId = existing.id;
       } else if (server) {
-        newId = (await connectToServer(server.accountId, server.remoteId)).id;
-        addActiveConnection(newId, profileName, '', profileId, undefined, undefined, 'normal');
-        setConnectionMeta(newId, profileId, profileName, 'normal');
+        // Opened in the mode the accounts file holds for it, as the connect
+        // itself reads it.
+        const connected = await connectToServer(server.accountId, server.remoteId);
+        const mode = connected.mode;
+        newId = connected.id;
+        addActiveConnection(newId, profileName, '', profileId, undefined, undefined, mode);
+        setConnectionMeta(newId, profileId, profileName, mode);
       } else {
         const profiles = await invoke<ConnectionProfile[]>('load_connection_profiles');
         const profile = profiles.find((p) => p.id === profileId);

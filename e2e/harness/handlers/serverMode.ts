@@ -16,6 +16,7 @@ const view = (account: ServerAccountSeed) => ({
   allowInsecureHttp: account.allowInsecureHttp ?? false,
   extraCaPem: account.extraCaPem ?? null,
   signedIn: account.signedIn ?? false,
+  connectionModes: account.connectionModes ?? {},
 });
 
 const isLoopback = (host: string) => {
@@ -125,6 +126,14 @@ export function registerServerModeHandlers(backend: Backend, state: E2EState): v
       found.signedIn = true;
       return view(found);
     },
+    server_connection_mode_set: ({ accountId, remoteId, mode }) => {
+      const found = account(accountId);
+      const modes = { ...found.connectionModes };
+      if (mode === 'normal') delete modes[remoteId];
+      else modes[remoteId] = mode;
+      found.connectionModes = modes;
+      return view(found);
+    },
     server_sign_out: ({ accountId }) => {
       const found = account(accountId);
       found.signedIn = false;
@@ -165,7 +174,8 @@ export function registerServerModeHandlers(backend: Backend, state: E2EState): v
           roleBlockedCommands: remote.roleBlockedCommands ?? [],
         },
       };
-      return { id, mongoVersion: state.servers[remote.server]?.version ?? '8.0.0', opClasses };
+      const mode = found.connectionModes?.[remote.id] ?? 'normal';
+      return { id, mongoVersion: state.servers[remote.server]?.version ?? '8.0.0', opClasses, mode };
     },
   });
 }

@@ -102,6 +102,43 @@ pub(crate) async fn account_save_impl(
     Ok(view)
 }
 
+/// Chooses the connection mode for one of the account's server connections,
+/// applied each time it is connected. `Normal` clears the choice.
+pub(crate) async fn connection_mode_set_impl(
+    state: &AppState,
+    path: &Path,
+    account_id: &str,
+    remote_id: &str,
+    mode: crate::connections::ConnectionMode,
+) -> Result<ServerAccountView, String> {
+    let key = state.require_key()?;
+    let _modes = state.server.modes.lock().await;
+    if state.server.is_open(account_id, remote_id)? {
+        return Err(
+            "Disconnect this MQLens Server connection before changing its mode".to_string(),
+        );
+    }
+    let file = path.to_path_buf();
+    let (account_id, remote_id) = (account_id.to_string(), remote_id.to_string());
+    // Refused if the vault locked while this waited, as account saves are.
+    let current = key_source(state.vault_key.clone());
+    blocking(move || {
+        accounts::update_while(&file, &key, Some(&current), |all| {
+            let account = all
+                .iter_mut()
+                .find(|a| a.id == account_id)
+                .ok_or_else(|| "MQLens Server account not found".to_string())?;
+            if mode == crate::connections::ConnectionMode::Normal {
+                account.connection_modes.remove(&remote_id);
+            } else {
+                account.connection_modes.insert(remote_id, mode);
+            }
+            Ok(account.view())
+        })
+    })
+    .await
+}
+
 pub(crate) async fn account_delete_impl(
     state: &AppState,
     path: &Path,
@@ -203,6 +240,9 @@ pub(crate) struct ServerConnectResult {
     pub id: String,
     pub mongo_version: String,
     pub op_classes: Vec<String>,
+    /// The mode chosen for the connection, as the accounts file holds it now:
+    /// what to register the connection in, whatever a window last showed.
+    pub mode: crate::connections::ConnectionMode,
 }
 
 /// Connects to one of the account's server connections: asks the server what
@@ -264,8 +304,26 @@ pub(crate) async fn server_connect_impl(
         )
         .await?;
 
+    // The mode is read, and the connection registered, under the lock a mode
+    // change takes, so no change can slip in between them.
+    let _modes = state.server.modes.lock().await;
+    let mode = accounts::find(path, &key, account_id)?
+        .connection_modes
+        .get(remote_id)
+        .copied()
+        .unwrap_or_default();
     let id = uuid::Uuid::new_v4().to_string();
     state.mocks.lock_safe()?.insert(id.clone(), false);
+    // Guarded in its mode before it is routable: a write reaching it before
+    // the renderer sets its name is held to the mode all the same.
+    crate::set_connection_meta_impl(
+        state,
+        &id,
+        &format!("server:{}:{}", account.id, remote_id),
+        remote_id,
+        false,
+        mode,
+    )?;
     state.server.add_remote(RemoteConn {
         desktop_id: id.clone(),
         account_id: account.id.clone(),
@@ -284,6 +342,7 @@ pub(crate) async fn server_connect_impl(
         id,
         mongo_version: version.version,
         op_classes,
+        mode,
     })
 }
 
@@ -521,6 +580,45 @@ mod tests {
         }
     }
 
+    // A server connection's mode is kept with its account, survives an edit
+    // of the account, and choosing normal clears it.
+    #[tokio::test]
+    async fn a_connection_mode_is_kept_with_its_account() {
+        use crate::connections::ConnectionMode;
+        let env = Env::new().await;
+        let state = unlocked();
+        let id = env.account.id.clone();
+
+        let view = connection_mode_set_impl(&state, &env.path, &id, "c1", ConnectionMode::ReadOnly)
+            .await
+            .unwrap();
+        assert_eq!(
+            view.connection_modes.get("c1"),
+            Some(&ConnectionMode::ReadOnly)
+        );
+        let edited = account_save_impl(&state, &env.path, form(&env))
+            .await
+            .unwrap();
+        assert_eq!(
+            edited.connection_modes.get("c1"),
+            Some(&ConnectionMode::ReadOnly)
+        );
+
+        let view = connection_mode_set_impl(&state, &env.path, &id, "c1", ConnectionMode::Normal)
+            .await
+            .unwrap();
+        assert!(view.connection_modes.is_empty());
+        assert!(connection_mode_set_impl(
+            &state,
+            &env.path,
+            "nope",
+            "c1",
+            ConnectionMode::ReadOnly
+        )
+        .await
+        .is_err());
+    }
+
     #[tokio::test]
     async fn every_command_needs_an_unlocked_vault() {
         let env = Env::new().await;
@@ -736,6 +834,98 @@ mod tests {
             .await
             .unwrap();
         state
+    }
+
+    // Connecting reports the mode the accounts file holds for the connection,
+    // so a window showing an older choice still registers the current one.
+    #[tokio::test]
+    async fn connecting_reports_the_stored_mode() {
+        use crate::connections::ConnectionMode;
+        let env = Env::new().await;
+        let state = signed_in_state(&env).await;
+        connection_mode_set_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            "c1",
+            ConnectionMode::ReadOnly,
+        )
+        .await
+        .unwrap();
+
+        let connected = server_connect_impl(&state, &env.path, &env.account.id, "c1")
+            .await
+            .unwrap();
+
+        assert_eq!(connected.mode, ConnectionMode::ReadOnly);
+        // Guarded from the moment it is routable, before the renderer says anything.
+        assert_eq!(
+            crate::write_guard::connection_mode(&state, &connected.id).unwrap(),
+            ConnectionMode::ReadOnly
+        );
+    }
+
+    // A mode change still waiting when the vault locks is not written with the
+    // key the vault no longer uses.
+    #[tokio::test]
+    async fn a_mode_change_waiting_through_a_vault_lock_is_refused() {
+        use crate::connections::ConnectionMode;
+        let env = Env::new().await;
+        let state = std::sync::Arc::new(unlocked());
+        let held = state.server.modes.lock().await;
+        let setting = {
+            let state = state.clone();
+            let (path, id) = (env.path.clone(), env.account.id.clone());
+            tokio::spawn(async move {
+                connection_mode_set_impl(&state, &path, &id, "c1", ConnectionMode::ReadOnly).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        *state.vault_key.lock().unwrap() = None;
+        drop(held);
+
+        assert!(setting.await.unwrap().is_err());
+        assert!(accounts::find(&env.path, &KEY, &env.account.id)
+            .unwrap()
+            .connection_modes
+            .is_empty());
+    }
+
+    // An open connection keeps the mode it opened in: changing it is refused
+    // until the connection closes, so a change can never be saved while an
+    // open connection runs in the old mode.
+    #[tokio::test]
+    async fn the_mode_of_an_open_connection_cannot_change() {
+        use crate::connections::ConnectionMode;
+        let env = Env::new().await;
+        let state = signed_in_state(&env).await;
+        let connected = server_connect_impl(&state, &env.path, &env.account.id, "c1")
+            .await
+            .unwrap();
+
+        let err = connection_mode_set_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            "c1",
+            ConnectionMode::ReadOnly,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Disconnect"), "{err}");
+
+        crate::disconnect_db_impl(&state, &connected.id)
+            .await
+            .unwrap();
+        connection_mode_set_impl(
+            &state,
+            &env.path,
+            &env.account.id,
+            "c1",
+            ConnectionMode::ReadOnly,
+        )
+        .await
+        .unwrap();
     }
 
     // A server connection becomes a desktop connection: a new id, with what
