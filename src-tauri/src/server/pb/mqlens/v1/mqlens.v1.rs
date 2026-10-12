@@ -124,11 +124,18 @@ pub struct AuditEvent {
     pub duration_ms: i64,
     #[prost(string, tag="11")]
     pub status: ::prost::alloc::string::String,
+    /// The request that produced the event, as its error reports it to the
+    /// client: "(MQLens Server correlation id: ...)".
+    #[prost(string, tag="12")]
+    pub correlation_id: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListAuditEventsRequest {
     #[prost(int64, tag="1")]
     pub limit: i64,
+    /// Only the events of the request with this correlation id, when set.
+    #[prost(string, tag="2")]
+    pub correlation_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListAuditEventsResponse {
@@ -290,6 +297,45 @@ pub struct ConnectionCapabilities {
     /// response never reveals whether an ungranted connection exists.
     #[prost(string, repeated, tag="2")]
     pub op_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchRequest {
+    #[prost(string, tag="1")]
+    pub connection_id: ::prost::alloc::string::String,
+    /// Empty watches every database the connection can read.
+    #[prost(string, tag="2")]
+    pub database: ::prost::alloc::string::String,
+    /// Empty watches the whole database.
+    #[prost(string, tag="3")]
+    pub collection: ::prost::alloc::string::String,
+    /// Keep only these operation types (insert, update, ...); empty keeps all.
+    #[prost(string, repeated, tag="4")]
+    pub operation_types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Resume after this resume token, as BSON. Empty starts from now.
+    #[prost(bytes="bytes", tag="5")]
+    pub resume_after: ::prost::bytes::Bytes,
+}
+/// Exactly one field is set. The first message is always a resume_token, sent
+/// once the cursor is open: changes made after it are seen.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchResponse {
+    #[prost(oneof="watch_response::Kind", tags="1, 2")]
+    pub kind: ::core::option::Option<watch_response::Kind>,
+}
+/// Nested message and enum types in `WatchResponse`.
+pub mod watch_response {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        /// A change event's BSON exactly as MongoDB sent it. Its _id is its resume
+        /// token.
+        #[prost(bytes, tag="1")]
+        Event(::prost::bytes::Bytes),
+        /// The cursor's resume token, sent when the cursor moved without an
+        /// event: a filtered stream mostly moves that way, and a client that only
+        /// kept event tokens would resume further and further behind.
+        #[prost(bytes, tag="2")]
+        ResumeToken(::prost::bytes::Bytes),
+    }
 }
 /// Typed error detail attached to connect errors (mirrors desktop UX).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

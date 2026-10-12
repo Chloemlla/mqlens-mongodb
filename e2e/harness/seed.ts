@@ -61,6 +61,8 @@ export interface RemoteConnectionSeed {
    * seed keeps the two consistent: a read-only connection lists its writes.
    */
   blockedCommands?: string[];
+  /** Those of them the role rules out. */
+  roleBlockedCommands?: string[];
 }
 
 export interface ServerAccountSeed {
@@ -79,6 +81,8 @@ export interface ServerAccountSeed {
   signOutUnconfirmed?: boolean;
   /** The warning server_account_save returns. */
   saveWarning?: string;
+  /** The mode chosen for each server connection, by id; absent is normal. */
+  connectionModes?: Record<string, string>;
 }
 
 export interface McpSeed {

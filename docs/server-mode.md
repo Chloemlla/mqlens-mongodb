@@ -45,14 +45,15 @@ What you may do depends on your role on that connection:
 | `operator` | All of the above, plus edit documents and upload or delete GridFS files |
 | `admin`, `owner` | All of the above, plus collections, views, databases, indexes and validation; current operations and killing them; the profiler; deployment users and roles; and the shell |
 
-Actions your role does not allow are disabled or hidden. A disabled one shows
-the tooltip *Not available on MQLens Server yet*, whether your role or the
-server is what rules it out. If you need an action you cannot run, ask your
-server administrator about your role.
+Actions your role does not allow are disabled or hidden. A disabled one says
+why: *Your role on this MQLens Server connection does not allow this* when a
+different role would allow it (ask your server administrator), or *Not
+available on MQLens Server yet* when no role would.
 
-Server connections always open in the normal connection mode. The read-only
-and confirm-destructive modes cannot be chosen for them yet, so your role on
-the server is what limits you.
+Each server connection also has a connection mode, chosen beside **Connect**:
+normal, confirm destructive or read-only, as for a local connection. The
+choice is kept with the account and applies every time the connection opens,
+on top of what your role allows.
 
 ## Not available through a server yet
 
@@ -60,7 +61,6 @@ These are disabled on server connections:
 
 - Copying collections or databases, import, and generating test data.
 - `mongodump`/`mongorestore` (the MongoDB Database Tools).
-- Watching change streams.
 - Running a multi-line script as a one-shot `mongosh --file` program. The shell
   itself works, and multi-line input goes to its live session instead.
 - AI agents over MCP: server connections are never offered to them.
@@ -81,8 +81,9 @@ not as JSON. The known differences:
   is itself a document like `{"$oid": …}` cannot be told apart from the type
   it imitates.
 - **Stored documents with type-wrapper-shaped keys.** A sub-document such as
-  `{"$numberLong": "7", "other": 1}` reads back exactly as stored through a
-  server. Local mode currently reads it as the number 7, which is being fixed.
+  `{"$numberLong": "7", "other": 1}` reads back exactly as stored, through a
+  server as locally. JSON cannot show it apart from the type it imitates, so a
+  document holding one cannot be edited as JSON in either mode; use the shell.
 - **Auditing happens twice.** Your app's activity log records the operation,
   and so does the server's audit log.
 
@@ -91,6 +92,10 @@ not as JSON. The known differences:
 The app and the server agree on an API version when you connect. If they have
 none in common, connecting fails and tells you which side to update:
 **Update MQLens Server** or **Update this app**.
+
+Watching change streams needs a server that speaks API version 4. On an older
+server, Watch stays disabled and says to update the server. As in local mode,
+the deployment must be a replica set or a sharded cluster.
 
 ## When something fails
 

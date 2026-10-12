@@ -12,6 +12,9 @@ use crate::server::pb::mqlens::v1::auth_service_server::{AuthService, AuthServic
 use crate::server::pb::mqlens::v1::capability_service_server::{
     CapabilityService, CapabilityServiceServer,
 };
+use crate::server::pb::mqlens::v1::change_stream_service_server::{
+    ChangeStreamService, ChangeStreamServiceServer,
+};
 use crate::server::pb::mqlens::v1::connection_service_client::ConnectionServiceClient;
 use crate::server::pb::mqlens::v1::connection_service_server::{
     ConnectionService, ConnectionServiceServer,
@@ -36,6 +39,7 @@ use crate::server::pb::mqlens::v1::{
     ListConnectionsResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Principal,
     RefreshRequest, WhoAmIRequest, WhoAmIResponse,
 };
+use crate::server::pb::mqlens::v1::{watch_response, WatchRequest, WatchResponse};
 use crate::server::pb::mqlens::v1::{
     AggregateRequest, CountRequest, CountResponse, ExplainRequest, ExplainResponse, FindBatch,
     FindRequest,
@@ -114,6 +118,14 @@ pub(crate) struct FakeState {
     pub login_delay: Duration,
     /// Held before ListConnections answers, to play a server that stalls.
     pub list_delay: Duration,
+    /// ListConnections calls from this one on (1 is the first) wait at
+    /// `list_gate` before checking their token, until a test releases them
+    /// with `notify_one`. 0 holds none. `list_held` counts the calls that
+    /// reached the gate.
+    pub list_hold_from: u32,
+    pub list_gate: Arc<tokio::sync::Notify>,
+    pub list_held: u32,
+    list_seen: u32,
     /// Held before a logout answers, to play a slow server.
     pub logout_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
@@ -168,6 +180,17 @@ pub(crate) struct FakeState {
     /// Ends every new shell at once with an error, as a mongosh that cannot
     /// start would.
     pub shell_start_failure: bool,
+    /// Each Watch received, and how many have ended because the client let
+    /// go. A watch opens with `watch_opening` as its resume token, then sends
+    /// `watch_messages` and stays open; `watch_failure` refuses it instead.
+    pub watches: Vec<WatchRequest>,
+    pub watches_ended: u32,
+    pub watch_opening: Vec<u8>,
+    pub watch_messages: Vec<WatchResponse>,
+    pub watch_failure: Option<Status>,
+    /// Answers a watch but never sends its opening message, as a server that
+    /// stalls after its headers would.
+    pub watch_stall_opening: bool,
     /// What RenameDatabaseDetailed reports.
     pub rename_result: RenameDatabaseResult,
     /// The id InsertDocument reports.
@@ -326,6 +349,10 @@ impl Fake {
                 refresh_delay: Duration::ZERO,
                 login_delay: Duration::ZERO,
                 list_delay: Duration::ZERO,
+                list_hold_from: 0,
+                list_gate: Arc::new(tokio::sync::Notify::new()),
+                list_held: 0,
+                list_seen: 0,
                 logout_delay: Duration::ZERO,
                 refresh_failures: Vec::new(),
                 refresh_starts: 0,
@@ -405,6 +432,13 @@ impl Fake {
                 shell_input: Vec::new(),
                 shells_ended: 0,
                 shell_start_failure: false,
+                watches: Vec::new(),
+                watches_ended: 0,
+                watch_opening: mongodb::bson::to_vec(&mongodb::bson::doc! { "_data": "opened" })
+                    .unwrap(),
+                watch_messages: Vec::new(),
+                watch_failure: None,
+                watch_stall_opening: false,
                 rename_result: RenameDatabaseResult {
                     collections: 2,
                     documents: 40,
@@ -584,6 +618,7 @@ impl Fake {
                 .add_service(GridFsServiceServer::new(self.clone()))
                 .add_service(DeploymentUserServiceServer::new(self.clone()))
                 .add_service(ShellServiceServer::new(self.clone()))
+                .add_service(ChangeStreamServiceServer::new(self.clone()))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
         format!("http://{addr}")
@@ -709,8 +744,16 @@ impl ConnectionService for Fake {
         &self,
         request: Request<ListConnectionsRequest>,
     ) -> Result<Response<ListConnectionsResponse>, Status> {
-        let delay = self.with(|s| s.list_delay);
+        let (delay, gate) = self.with(|s| {
+            s.list_seen += 1;
+            let held = s.list_hold_from > 0 && s.list_seen >= s.list_hold_from;
+            (s.list_delay, held.then(|| s.list_gate.clone()))
+        });
         tokio::time::sleep(delay).await;
+        if let Some(gate) = gate {
+            self.with(|s| s.list_held += 1);
+            gate.notified().await;
+        }
         let mut state = self.state.lock().unwrap();
         state.authenticate_any_version(&request)?;
         state.list_calls += 1;
@@ -1602,6 +1645,50 @@ impl ShellService for Fake {
                 }
             }
             fake.with(|s| s.shells_ended += 1);
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
+    }
+}
+
+type WatchStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<WatchResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl ChangeStreamService for Fake {
+    type WatchStream = WatchStream;
+
+    async fn watch(&self, request: Request<WatchRequest>) -> Result<Response<WatchStream>, Status> {
+        let (opening, messages, stall) = {
+            let mut state = self.state.lock().unwrap();
+            state.authorize_connection(&request, &request.get_ref().connection_id)?;
+            state.watches.push(request.get_ref().clone());
+            if let Some(failure) = state.watch_failure.clone() {
+                return Err(failure);
+            }
+            (
+                state.watch_opening.clone(),
+                state.watch_messages.clone(),
+                state.watch_stall_opening,
+            )
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let fake = self.clone();
+        tokio::spawn(async move {
+            let opened = WatchResponse {
+                kind: Some(watch_response::Kind::ResumeToken(opening.into())),
+            };
+            if stall {
+                tx.closed().await;
+            } else if tx.send(Ok(opened)).await.is_ok() {
+                for message in messages {
+                    if tx.send(Ok(message)).await.is_err() {
+                        break;
+                    }
+                }
+                tx.closed().await;
+            }
+            fake.with(|s| s.watches_ended += 1);
         });
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),

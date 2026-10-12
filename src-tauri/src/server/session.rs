@@ -33,7 +33,7 @@ use crate::server::pb::mqlens::v1::{
 };
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::metadata::MetadataValue;
@@ -182,9 +182,70 @@ pub(crate) struct AccountSession {
     tokens: tokio::sync::Mutex<Tokens>,
     ended: AtomicBool,
     displaced_session_warning: Option<String>,
-    /// The MQLens API version agreed with the server; 0 until a connection
-    /// has agreed one, when requests carry none and the server takes them as 1.
-    api_version: AtomicU32,
+}
+
+/// An account's session speaking the MQLens API version one connection
+/// agreed. The version belongs to the connection, not the account: after a
+/// server upgrade, a connection made before it and one made after can have
+/// agreed different ones.
+#[derive(Clone)]
+pub(crate) struct Speaking {
+    session: Arc<AccountSession>,
+    version: u32,
+}
+
+impl Speaking {
+    pub(crate) fn new(session: Arc<AccountSession>, version: u32) -> Self {
+        Self { session, version }
+    }
+
+    /// `AccountSession::call`, speaking this version.
+    pub(crate) async fn call<M, R, F, Fut>(&self, message: M, rpc: F) -> Result<R, String>
+    where
+        M: Clone,
+        F: Fn(Channel, Request<M>) -> Fut,
+        Fut: Future<Output = Result<Response<R>, Status>>,
+    {
+        self.session
+            .call_bounded(message, rpc, Bound::Deadline, self.version)
+            .await
+    }
+
+    /// `AccountSession::open_stream`, speaking this version.
+    pub(crate) async fn open_stream<M, T, F, Fut>(
+        &self,
+        message: M,
+        rpc: F,
+    ) -> Result<Streaming<T>, String>
+    where
+        M: Clone,
+        F: Fn(Channel, Request<M>) -> Fut,
+        Fut: Future<Output = Result<Response<Streaming<T>>, Status>>,
+    {
+        self.session
+            .call_bounded(message, rpc, Bound::Opening, self.version)
+            .await
+    }
+
+    /// `AccountSession::call_unbounded`, speaking this version.
+    pub(crate) async fn call_unbounded<M, R, F, Fut>(&self, message: M, rpc: F) -> Result<R, String>
+    where
+        M: Clone,
+        F: Fn(Channel, Request<M>) -> Fut,
+        Fut: Future<Output = Result<Response<R>, Status>>,
+    {
+        self.session
+            .call_bounded(message, rpc, Bound::None, self.version)
+            .await
+    }
+}
+
+impl std::ops::Deref for Speaking {
+    type Target = AccountSession;
+
+    fn deref(&self) -> &AccountSession {
+        &self.session
+    }
 }
 
 impl AccountSession {
@@ -199,7 +260,6 @@ impl AccountSession {
             tokens: tokio::sync::Mutex::new(Tokens::default()),
             ended: AtomicBool::new(false),
             displaced_session_warning: None,
-            api_version: AtomicU32::new(0),
         })
     }
 
@@ -360,12 +420,6 @@ impl AccountSession {
         tokens.generation += 1;
     }
 
-    /// Speaks `version` of the MQLens API on every later request. One account
-    /// is one server, so every connection on it agrees the same version.
-    pub(crate) fn speak(&self, version: u32) {
-        self.api_version.store(version, Ordering::Relaxed);
-    }
-
     /// Makes one unary call with the session's access token. A call refused as
     /// unauthenticated refreshes once, unless another task already has, and is
     /// retried once; refused again, the session ends.
@@ -375,7 +429,7 @@ impl AccountSession {
         F: Fn(Channel, Request<M>) -> Fut,
         Fut: Future<Output = Result<Response<R>, Status>>,
     {
-        self.call_bounded(message, rpc, Bound::Deadline).await
+        self.call_bounded(message, rpc, Bound::Deadline, 0).await
     }
 
     /// Opens a server stream, refreshing and retrying once like `call`. No
@@ -392,7 +446,7 @@ impl AccountSession {
         F: Fn(Channel, Request<M>) -> Fut,
         Fut: Future<Output = Result<Response<Streaming<T>>, Status>>,
     {
-        self.call_bounded(message, rpc, Bound::Opening).await
+        self.call_bounded(message, rpc, Bound::Opening, 0).await
     }
 
 /// Makes one call with no deadline, refreshing and retrying once like
@@ -404,7 +458,7 @@ impl AccountSession {
         F: Fn(Channel, Request<M>) -> Fut,
         Fut: Future<Output = Result<Response<R>, Status>>,
     {
-        self.call_bounded(message, rpc, Bound::None).await
+        self.call_bounded(message, rpc, Bound::None, 0).await
     }
 
     async fn call_bounded<M, R, F, Fut>(
@@ -412,6 +466,9 @@ impl AccountSession {
         message: M,
         rpc: F,
         bound: Bound,
+        // 0 speaks none, which the server takes as 1: the calls an account
+        // makes before any connection has agreed a version.
+        api_version: u32,
     ) -> Result<R, String>
     where
         M: Clone,
@@ -422,11 +479,7 @@ impl AccountSession {
         match send(
             &rpc,
             self.channel.clone(),
-            authorized(
-                message.clone(),
-                &token,
-                self.api_version.load(Ordering::Relaxed),
-            )?,
+            authorized(message.clone(), &token, api_version)?,
             bound,
         )
         .await
@@ -439,7 +492,7 @@ impl AccountSession {
         match send(
             &rpc,
             self.channel.clone(),
-            authorized(message, &token, self.api_version.load(Ordering::Relaxed))?,
+            authorized(message, &token, api_version)?,
             bound,
         )
         .await
@@ -1102,25 +1155,34 @@ mod tests {
         let env = Env::new().await;
         let session = signed_in(&env).await;
         env.fake.revoke_access_tokens();
-        env.fake.with(|s| s.list_delay = Duration::from_millis(400));
+        env.fake.with(|s| s.list_hold_from = 2);
         let calling = {
             let session = session.clone();
             tokio::spawn(async move { list_connections(&session).await })
         };
-        // After the call's own refresh, its retry is in flight.
-        while env.fake.with(|s| s.refreshes) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // After the call's own refresh, its retry waits at the gate.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while env.fake.with(|s| s.list_held) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retry never reached the gate");
         // The retry's token is refused, and another call replaces it.
         env.fake.revoke_access_tokens();
         let current = session.tokens.lock().await.generation;
         session.access_token(Some(current)).await.unwrap();
+        env.fake.with(|s| s.list_hold_from = 0);
+        env.fake.with(|s| s.list_gate.clone()).notify_one();
 
-        let _ = calling.await.unwrap();
+        let err = calling.await.unwrap().unwrap_err();
+        // Refused by the server, not lost to the call deadline while held.
+        assert!(
+            err.starts_with("MQLens Server sign-in is required"),
+            "{err}"
+        );
         assert!(!session.is_ended(), "the newer token was thrown away");
         assert!(env.stored_token().is_some());
-        env.fake.with(|s| s.list_delay = Duration::ZERO);
         list_connections(&session).await.unwrap();
     }
 
@@ -1133,28 +1195,34 @@ mod tests {
         let env = Env::new().await;
         let session = signed_in(&env).await;
         env.fake.revoke_access_tokens();
-        env.fake.with(|s| s.list_delay = Duration::from_millis(400));
+        env.fake.with(|s| s.list_hold_from = 2);
         let calling = {
             let session = session.clone();
             tokio::spawn(async move { list_connections(&session).await })
         };
-        // After the call's own refresh, its retry is in flight.
-        while env.fake.with(|s| s.refreshes) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // After the call's own refresh, its retry waits at the gate.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while env.fake.with(|s| s.list_held) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retry never reached the gate");
         // The other process: its own session object and store, same file.
         let other = signed_in(&env).await;
         let others_token = env.stored_token();
         env.fake.revoke_access_tokens();
+        env.fake.with(|s| s.list_hold_from = 0);
+        env.fake.with(|s| s.list_gate.clone()).notify_one();
 
-        assert!(calling.await.unwrap().is_err());
+        let err = calling.await.unwrap().unwrap_err();
+        // Refused by the server, not lost to the call deadline while held.
+        assert!(err.starts_with(SESSION_ENDED), "{err}");
         assert_eq!(
             env.stored_token(),
             others_token,
             "the refused retry cleared another sign-in's token"
         );
-        env.fake.with(|s| s.list_delay = Duration::ZERO);
         list_connections(&other).await.unwrap();
     }
 

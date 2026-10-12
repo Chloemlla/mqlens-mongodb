@@ -516,13 +516,16 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             reason: "One-shot mongosh scripts are not available on MQLens Server connections; use the shell",
         },
     },
-    // Not served yet
     CommandRoute {
         command: "start_change_stream",
-        serve: Serve::Deferred {
-            reason: "Change streams are not available on MQLens Server connections yet",
+        serve: Serve::Rpc {
+            procedures: &["/mqlens.v1.ChangeStreamService/Watch"],
+            class: OpClass::Read,
+            since: 4,
+            adapter: true,
         },
     },
+    // Not served yet
     CommandRoute {
         command: "start_dump_task",
         serve: Serve::Deferred {
@@ -629,6 +632,24 @@ pub(crate) fn blocked_commands(conn: &RemoteConn) -> Vec<&'static str> {
     ROUTES
         .iter()
         .filter(|route| !command_available(route, conn))
+        .map(|route| route.command)
+        .collect()
+}
+
+/// The blocked commands the server could run but `conn`'s role does not
+/// reach: the ones a different role, not a newer server, would unblock.
+pub(crate) fn role_blocked_commands(conn: &RemoteConn) -> Vec<&'static str> {
+    ROUTES
+        .iter()
+        .filter(|route| match route.serve {
+            Serve::Rpc {
+                class,
+                since,
+                adapter: true,
+                ..
+            } => conn.api_version >= since && require_class(conn, class).is_err(),
+            _ => false,
+        })
         .map(|route| route.command)
         .collect()
 }
@@ -784,8 +805,8 @@ mod tests {
             Err(TASKS.to_string())
         );
         assert_eq!(
-            refuse_deferred(&state, "start_change_stream", &["r1"]),
-            Err("Change streams are not available on MQLens Server connections yet".to_string())
+            refuse_deferred(&state, "start_dump_task", &["r1"]),
+            Err(DATABASE_TOOLS.to_string())
         );
         assert_eq!(
             refuse_deferred(&state, "start_collection_copy", &["local"]),
@@ -915,5 +936,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A command the server serves but the role does not reach is blocked by
+    // the role. One the server cannot serve yet, or one the role reaches, is
+    // not.
+    #[test]
+    fn role_blocked_commands_are_the_ones_the_role_lacks() {
+        let blocked = role_blocked_commands(&conn(&["read"], 2));
+
+        for command in ["insert_document", "drop_database", "start_mongosh_session"] {
+            assert!(blocked.contains(&command), "{command}");
+        }
+        for command in [
+            "execute_mql_query",
+            "start_dump_task",
+            "start_change_stream",
+        ] {
+            assert!(!blocked.contains(&command), "{command}");
+        }
+        assert!(role_blocked_commands(&conn(&["read", "write", "ddl", "admin"], 2)).is_empty());
     }
 }
