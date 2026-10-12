@@ -80,6 +80,7 @@ use crate::server::pb::mqlens::v1::{
     DeleteFileRequest, DeleteFileResponse, DownloadFileRequest, FileChunk, ListFilesRequest,
     ListFilesResponse, UploadChunk, UploadFileResponse,
 };
+use crate::server::pb::mqlens::v1::{InsertManyRequest, InsertManyResponse, InsertRefusal};
 use crate::server::pb::mqlens::v1::{MongoshClientMsg, MongoshServerMsg};
 use crate::server::session::{unix_now, AccountSession, FileTokenStore, TokenStore};
 use mongodb::bson::{doc, Document};
@@ -191,6 +192,11 @@ pub(crate) struct FakeState {
     /// Answers a watch but never sends its opening message, as a server that
     /// stalls after its headers would.
     pub watch_stall_opening: bool,
+    /// What InsertMany refuses, by index in its batch; the rest are stored.
+    pub insert_refusals: Vec<InsertRefusal>,
+    /// When set, Find and Aggregate stream these bytes instead of
+    /// `documents`: BSON a Document cannot hold, such as a repeated key.
+    pub raw_documents: Vec<Vec<u8>>,
     /// What RenameDatabaseDetailed reports.
     pub rename_result: RenameDatabaseResult,
     /// The id InsertDocument reports.
@@ -388,6 +394,7 @@ impl Fake {
                         keys_json: r#"{"_id":{"$numberInt":"1"}}"#.to_string(),
                         unique: false,
                         sparse: false,
+                        spec_bson: index_spec(doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" }),
                     },
                     PbIndexInfo {
                         name: "z_1_a_-1".to_string(),
@@ -395,12 +402,20 @@ impl Fake {
                             .to_string(),
                         unique: true,
                         sparse: true,
+                        spec_bson: index_spec(doc! {
+                            "v": 2, "key": { "z": 1, "a": -1 }, "name": "z_1_a_-1",
+                            "unique": true, "sparse": true,
+                        }),
                     },
                     PbIndexInfo {
                         name: "loc_2dsphere".to_string(),
                         keys_json: r#"{"loc":"2dsphere"}"#.to_string(),
                         unique: false,
                         sparse: false,
+                        spec_bson: index_spec(doc! {
+                            "v": 2, "key": { "loc": "2dsphere" }, "name": "loc_2dsphere",
+                            "2dsphereIndexVersion": 3,
+                        }),
                     },
                 ],
                 documents: vec![
@@ -439,6 +454,8 @@ impl Fake {
                 watch_messages: Vec::new(),
                 watch_failure: None,
                 watch_stall_opening: false,
+                insert_refusals: Vec::new(),
+                raw_documents: Vec::new(),
                 rename_result: RenameDatabaseResult {
                     collections: 2,
                     documents: 40,
@@ -546,6 +563,7 @@ impl Fake {
                         .to_string(),
                     validation_level: "strict".to_string(),
                     validation_action: "error".to_string(),
+                    options_bson: Default::default(),
                 },
                 users: vec![DeploymentUser {
                     user: "app".to_string(),
@@ -614,7 +632,11 @@ impl Fake {
                 .add_service(StatsServiceServer::new(self.clone()))
                 .add_service(MonitoringServiceServer::new(self.clone()))
                 .add_service(DdlServiceServer::new(self.clone()))
-                .add_service(WriteServiceServer::new(self.clone()))
+                // As large as the real server takes, so a test sees what the
+                // desktop sends rather than this server's own limit.
+                .add_service(
+                    WriteServiceServer::new(self.clone()).max_decoding_message_size(64 << 20),
+                )
                 .add_service(GridFsServiceServer::new(self.clone()))
                 .add_service(DeploymentUserServiceServer::new(self.clone()))
                 .add_service(ShellServiceServer::new(self.clone()))
@@ -980,6 +1002,11 @@ impl GridFsService for Fake {
 }
 
 /// A write or index change the fake received.
+/// An index as ListIndexes lists it, as BSON.
+fn index_spec(spec: Document) -> prost::bytes::Bytes {
+    mongodb::bson::to_vec(&spec).unwrap().into()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum FakeWrite {
     Insert(InsertDocumentRequest),
@@ -994,6 +1021,7 @@ pub(crate) enum FakeWrite {
     DropCollection(DropCollectionRequest),
     RenameCollection(RenameCollectionRequest),
     CreateView(CreateViewRequest),
+    InsertMany(InsertManyRequest),
     DropDatabase(DropDatabaseRequest),
     RenameDatabase(RenameDatabaseDetailedRequest),
     SetValidator(SetValidatorRequest),
@@ -1016,6 +1044,28 @@ impl Fake {
 
 #[tonic::async_trait]
 impl WriteService for Fake {
+    async fn insert_many(
+        &self,
+        request: Request<InsertManyRequest>,
+    ) -> Result<Response<InsertManyResponse>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        let sent = request.get_ref().documents_bson.len();
+        let refused: Vec<InsertRefusal> = state
+            .insert_refusals
+            .iter()
+            .filter(|r| (r.index as usize) < sent)
+            .cloned()
+            .collect();
+        state
+            .writes
+            .push(FakeWrite::InsertMany(request.into_inner()));
+        Ok(Response::new(InsertManyResponse {
+            inserted_count: (sent - refused.len()) as i64,
+            refused,
+        }))
+    }
+
     async fn insert_document(
         &self,
         request: Request<InsertDocumentRequest>,
@@ -1075,8 +1125,20 @@ impl Fake {
     /// `batch_delay`. Counts a stream the client drops before the end.
     /// The stored documents in batches, at most `limit` of them (0: all).
     fn batches(&self, limit: usize) -> Batches {
-        let (mut documents, size, delay) =
-            self.with(|s| (s.documents.clone(), s.batch_size.max(1), s.batch_delay));
+        let (raw, size, delay) =
+            self.with(|s| (s.raw_documents.clone(), s.batch_size.max(1), s.batch_delay));
+        let mut documents: Vec<Vec<u8>> = if raw.is_empty() {
+            self.with(|s| s.documents.clone())
+                .iter()
+                .map(|d| {
+                    let mut bytes = Vec::new();
+                    d.to_writer(&mut bytes).unwrap();
+                    bytes
+                })
+                .collect()
+        } else {
+            raw
+        };
         if limit > 0 {
             documents.truncate(limit);
         }
@@ -1087,14 +1149,7 @@ impl Fake {
                 tokio::time::sleep(delay).await;
                 let batch = FindBatch {
                     documents_ejson: Vec::new(),
-                    documents_bson: chunk
-                        .iter()
-                        .map(|d| {
-                            let mut bytes = Vec::new();
-                            d.to_writer(&mut bytes).unwrap();
-                            bytes.into()
-                        })
-                        .collect(),
+                    documents_bson: chunk.iter().map(|d| d.clone().into()).collect(),
                 };
                 if tx.send(Ok(batch)).await.is_err() {
                     state.lock().unwrap().streams_abandoned += 1;
