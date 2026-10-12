@@ -290,8 +290,7 @@ pub(crate) async fn server_connect_impl(
         capabilities.min_api_version,
         capabilities.max_api_version,
     )?;
-    session.speak(api_version);
-    let version = session
+    let version = crate::server::session::Speaking::new(session.clone(), api_version)
         .call(
             MongoVersionRequest {
                 connection_id: remote_id.to_string(),
@@ -483,6 +482,8 @@ async fn reset_accounts_within(
     limit: Duration,
 ) -> Result<PendingSignOuts, String> {
     state.server.clear().await;
+    // An open server watch streams on its own, session or not.
+    crate::change_streams::stop_server_streams(state)?;
     // One locked step checks the key, takes every stored token and removes the
     // vault's other files, the accounts file and then the vault metadata, last,
     // so a failure part way leaves a vault that still opens. A password change
@@ -947,7 +948,8 @@ mod tests {
             crate::server::remote::Route::Remote(conn) => {
                 assert_eq!(conn.remote_id, "c1");
                 assert_eq!(conn.account_id, env.account.id);
-                assert_eq!(conn.api_version, crate::server::remote::API_VERSIONS.1);
+                // The newest version both speak: the fake serves up to 2.
+                assert_eq!(conn.api_version, 2);
             }
             crate::server::remote::Route::Local(_) => panic!("routed to a driver client"),
         }
@@ -988,8 +990,8 @@ mod tests {
         assert!(crate::server::remote::route(&state, &connected.id).is_ok());
 
         env.fake.with(|s| {
-            s.min_api_version = 3;
-            s.max_api_version = 3;
+            s.min_api_version = crate::server::remote::API_VERSIONS.1 + 1;
+            s.max_api_version = crate::server::remote::API_VERSIONS.1 + 1;
         });
         let err = server_connect_impl(&state, &env.path, &env.account.id, "c1")
             .await
