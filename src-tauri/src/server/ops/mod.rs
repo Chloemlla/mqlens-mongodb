@@ -1,8 +1,10 @@
 //! Server adapters: each runs one family of commands through MQLens Server
 //! and returns exactly what local mode returns.
 
+pub(crate) mod copy;
 pub(crate) mod ddl;
 pub(crate) mod export;
+pub(crate) mod import;
 pub(crate) mod gridfs;
 pub(crate) mod metadata;
 pub(crate) mod monitoring;
