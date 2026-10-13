@@ -1217,7 +1217,7 @@ const TYPE_WRAPPER_KEYS: &[&str] = &[
 
 /// Whether any key of the document, at any depth, is a type-wrapper key.
 /// Values of real BSON types are not sub-documents, so they never count.
-fn has_type_wrapper_key(doc: &Document) -> bool {
+pub(crate) fn has_type_wrapper_key(doc: &Document) -> bool {
     fn value(v: &mongodb::bson::Bson) -> bool {
         match v {
             mongodb::bson::Bson::Document(d) => has_type_wrapper_key(d),
@@ -1527,6 +1527,28 @@ pub(crate) async fn insert_many_batched(
             .map_err(|e| format!("Failed to {}: {}", op_label, e))?;
     }
     Ok(())
+}
+
+/// Where an import or a generation writes: a driver client, exactly as
+/// before, or a connection through MQLens Server.
+pub(crate) enum WriteTarget {
+    Local(mongodb::Client),
+    Remote(crate::server::ops::copy::RemoteSide),
+}
+
+/// The write target of connection `id` for `command`. A local connection
+/// gets exactly the client, and the error, it always has.
+pub(crate) async fn write_target(
+    state: &crate::AppState,
+    id: &str,
+    command: &str,
+) -> Result<WriteTarget, String> {
+    match crate::server::remote::route(state, id)? {
+        crate::server::remote::Route::Local(client) => Ok(WriteTarget::Local(client)),
+        crate::server::remote::Route::Remote(conn) => Ok(WriteTarget::Remote(
+            crate::server::ops::copy::RemoteSide::new(state, conn, command, Some(false)).await?,
+        )),
+    }
 }
 
 /// Write already-converted BSON documents to a live collection under the
