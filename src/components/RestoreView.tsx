@@ -605,12 +605,15 @@ export const RestoreView: React.FC<RestoreViewProps> = ({
             </Button>
           </div>
 
-          {previewCmd && (
+          {/* Shown from the moment there is a source, and kept to one line, so
+              a preview that arrives late never pushes the drop confirmation's
+              buttons out from under the pointer. */}
+          {hasSource && onPreviewCommand && (
             <code
               data-testid="restore-preview-cmd"
-              className="block overflow-x-auto rounded-md border border-border bg-muted/30 px-2 py-1.5 text-xs"
+              className="block overflow-x-auto whitespace-pre rounded-md border border-border bg-muted/30 px-2 py-1.5 text-xs"
             >
-              {previewCmd}
+              {previewCmd || ' '}
             </code>
           )}
 
