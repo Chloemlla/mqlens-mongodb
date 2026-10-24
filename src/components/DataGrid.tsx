@@ -490,9 +490,83 @@ interface JsonRowExtra {
   ) => void;
   renderContent: (line: JsonLine) => React.ReactNode;
   hasRowActions: boolean;
-  RowActions: React.ComponentType<{ doc: Record<string, any> }>;
+  rowActions: RowActionsContext;
   t: (key: string) => string;
 }
+
+/** What the per-row controls need from DataGrid, passed in as props. */
+interface RowActionsContext {
+  t: (key: string) => string;
+  onCopy: (doc: Record<string, any>) => void;
+  onEditDocument?: (doc: Record<string, any>) => void;
+  onDeleteDocument?: (doc: Record<string, any>) => void;
+  isReadOnly: boolean;
+}
+
+// One-click "Copy JSON" for a single document, with a brief "Copied"
+// confirmation. Copies the pretty-printed (2-space) document, matching the
+// "Copy document (JSON)" context-menu action.
+//
+// This and RowActions live at module scope so their identity is stable: when
+// they were defined inside DataGrid, every grid re-render made a new component
+// type, React remounted them, and the "Copied" state vanished early.
+const CopyDocButton = ({ doc, t, onCopy }: { doc: Record<string, any> } & Pick<RowActionsContext, 't' | 'onCopy'>) => {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onCopy(doc);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <button
+      onClick={handleCopy}
+      className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary"
+      title={copied ? t('documents:dataGrid.tooltips.copied') : t('documents:dataGrid.actions.copyDocumentJson')}
+      aria-label={copied ? t('documents:dataGrid.tooltips.copied') : t('documents:dataGrid.tooltips.copyDocument')}
+      data-testid="copy-doc-btn"
+    >
+      {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
+    </button>
+  );
+};
+
+// Per-row copy/edit/delete controls, shared across all view modes.
+const RowActions = ({ doc, t, onCopy, onEditDocument, onDeleteDocument, isReadOnly }: { doc: Record<string, any> } & RowActionsContext) => {
+  return (
+    <div className="flex items-center gap-1 flex-shrink-0">
+      <CopyDocButton doc={doc} t={t} onCopy={onCopy} />
+      {onEditDocument && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onEditDocument(doc);
+          }}
+          disabled={isReadOnly}
+          className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary disabled:pointer-events-none disabled:opacity-50"
+          title={isReadOnly ? t('documents:dataGrid.tooltips.readOnly') : t('documents:dataGrid.tooltips.editDocument')}
+          data-testid="edit-doc-btn"
+        >
+          <Edit size={12} />
+        </button>
+      )}
+      {onDeleteDocument && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDeleteDocument(doc);
+          }}
+          disabled={isReadOnly}
+          className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-50"
+          title={isReadOnly ? t('documents:dataGrid.tooltips.readOnly') : t('documents:dataGrid.tooltips.deleteDocument')}
+          data-testid="delete-doc-btn"
+        >
+          <Trash2 size={12} />
+        </button>
+      )}
+    </div>
+  );
+};
 
 // Virtualized row for the JSON view (one descriptor per row).
 //
@@ -514,7 +588,7 @@ const JsonRow = ({
   openCtxMenu,
   renderContent,
   hasRowActions,
-  RowActions,
+  rowActions,
   t,
 }: { index: number; style: React.CSSProperties } & JsonRowExtra) => {
   const line = lines[index];
@@ -578,7 +652,7 @@ const JsonRow = ({
             arrived with three blank lines under its opening brace (#329). */}
         {line.isDocRoot && hasRowActions && line.doc && (
           <span className="ml-2.5 inline-flex select-none align-middle opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
-            <RowActions doc={line.doc} />
+            <RowActions doc={line.doc} {...rowActions} />
           </span>
         )}
       </span>
@@ -1823,66 +1897,12 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Every document now carries at least a copy control, so the actions
   // area is always present; edit/delete remain gated on their handlers.
   const hasRowActions = true;
-
-  // One-click "Copy JSON" for a single document, with a brief "Copied"
-  // confirmation. Copies the pretty-printed (2-space) document, matching the
-  // "Copy document (JSON)" context-menu action.
-  const CopyDocButton = ({ doc }: { doc: Record<string, any> }) => {
-    const [copied, setCopied] = useState(false);
-    const handleCopy = (e: React.MouseEvent) => {
-      e.stopPropagation();
-      writeClipboard(documentCopyText(doc));
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    };
-    return (
-      <button
-        onClick={handleCopy}
-        className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary"
-        title={copied ? t('dataGrid.tooltips.copied') : t('dataGrid.actions.copyDocumentJson')}
-        aria-label={copied ? t('dataGrid.tooltips.copied') : t('dataGrid.tooltips.copyDocument')}
-        data-testid="copy-doc-btn"
-      >
-        {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
-      </button>
-    );
-  };
-
-  // Per-row copy/edit/delete controls, shared across all view modes.
-  const RowActions = ({ doc }: { doc: Record<string, any> }) => {
-    return (
-      <div className="flex items-center gap-1 flex-shrink-0">
-        <CopyDocButton doc={doc} />
-        {onEditDocument && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onEditDocument(doc);
-            }}
-            disabled={isReadOnly}
-            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary disabled:pointer-events-none disabled:opacity-50"
-            title={isReadOnly ? t('dataGrid.tooltips.readOnly') : t('dataGrid.tooltips.editDocument')}
-            data-testid="edit-doc-btn"
-          >
-            <Edit size={12} />
-          </button>
-        )}
-        {onDeleteDocument && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onDeleteDocument(doc);
-            }}
-            disabled={isReadOnly}
-            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-50"
-            title={isReadOnly ? t('dataGrid.tooltips.readOnly') : t('dataGrid.tooltips.deleteDocument')}
-            data-testid="delete-doc-btn"
-          >
-            <Trash2 size={12} />
-          </button>
-        )}
-      </div>
-    );
+  const rowActions: RowActionsContext = {
+    t,
+    onCopy: (doc) => writeClipboard(documentCopyText(doc)),
+    onEditDocument,
+    onDeleteDocument,
+    isReadOnly,
   };
 
   // Row Renderer for Virtualized List (table mode only; JSON & tree have their own).
@@ -1918,7 +1938,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
         ))}
         {hasRowActions && (
           <div className="flex h-full w-[72px] shrink-0 items-center justify-center px-2">
-            <RowActions doc={rawDoc} />
+            <RowActions doc={rawDoc} {...rowActions} />
           </div>
         )}
       </div>
@@ -2068,7 +2088,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
           <span className="truncate">{renderTreeValue(row)}</span>
           {row.isDocRoot && hasRowActions && row.doc && (
             <span className="ml-auto inline-flex opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
-              <RowActions doc={row.doc} />
+              <RowActions doc={row.doc} {...rowActions} />
             </span>
           )}
         </div>
@@ -2394,7 +2414,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
                   openCtxMenu,
                   renderContent: renderJsonLineContent,
                   hasRowActions,
-                  RowActions,
+                  rowActions,
                   t,
                 }}
                 style={{ height: '100%', width: `${jsonMaxWidthPx}px`, minWidth: '100%' }}

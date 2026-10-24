@@ -675,8 +675,12 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const [stages, setStages] = useState<PipelineStage[]>(initialBuilderState.stages);
   const [optionsOpen, setOptionsOpen] = useState<boolean | undefined>(initialBuilderState.optionsOpen);
 
+  // The parent passes a new arrow on every render, and each report is mirrored
+  // to the backend. Reading it through a ref reports changes to the state only.
+  const onBuilderStateChangeRef = useRef(onBuilderStateChange);
+  onBuilderStateChangeRef.current = onBuilderStateChange;
   useEffect(() => {
-    onBuilderStateChange?.({
+    onBuilderStateChangeRef.current?.({
       queryMode,
       filterQuery,
       sortQuery,
@@ -686,7 +690,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       stages,
       optionsOpen,
     });
-  }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen, onBuilderStateChange]);
+  }, [queryMode, filterQuery, sortQuery, projectionQuery, limit, skip, stages, optionsOpen]);
 
   // AI chat assistant. Open/close is per TAB (App owns it, so two tabs on one
   // collection can differ), but it also seeds from — and writes through to —

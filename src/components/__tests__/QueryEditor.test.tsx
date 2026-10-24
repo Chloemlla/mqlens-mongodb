@@ -106,6 +106,7 @@ function createFakeEditor(initialValue: string) {
       getLineCount: () => lines.length,
       getLinesContent: () => [...lines],
       getFullModelRange: () => ({}),
+      getVersionId: () => 1,
     }),
     onDidDispose: vi.fn(),
     /** A keystroke at the end of the line, where the caret is while typing. */

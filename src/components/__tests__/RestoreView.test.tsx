@@ -318,6 +318,16 @@ describe('RestoreView command preview', () => {
       expect(screen.getByTestId('restore-preview-cmd')).toHaveTextContent('mongorestore --drop /tmp/dump')
     );
   });
+
+  it('holds the preview line open while the command is still on its way', async () => {
+    // A preview that arrives late must not push the drop confirmation's
+    // buttons down under the pointer.
+    const onPreviewCommand = vi.fn(() => new Promise<string>(() => {}));
+    renderRestoreView({ onPreviewCommand });
+    fireEvent.click(screen.getByTestId('restore-pick-source-btn'));
+    await waitFor(() => expect(screen.getByTestId('restore-source-path')).toBeInTheDocument());
+    expect(screen.getByTestId('restore-preview-cmd')).toHaveClass('whitespace-pre');
+  });
 });
 
 describe('RestoreView footer', () => {
