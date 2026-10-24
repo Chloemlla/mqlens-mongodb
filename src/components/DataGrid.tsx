@@ -522,8 +522,8 @@ const CopyDocButton = ({ doc, t, onCopy }: { doc: Record<string, any> } & Pick<R
     <button
       onClick={handleCopy}
       className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary"
-      title={copied ? t('dataGrid.tooltips.copied') : t('dataGrid.actions.copyDocumentJson')}
-      aria-label={copied ? t('dataGrid.tooltips.copied') : t('dataGrid.tooltips.copyDocument')}
+      title={copied ? t('documents:dataGrid.tooltips.copied') : t('documents:dataGrid.actions.copyDocumentJson')}
+      aria-label={copied ? t('documents:dataGrid.tooltips.copied') : t('documents:dataGrid.tooltips.copyDocument')}
       data-testid="copy-doc-btn"
     >
       {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
@@ -544,7 +544,7 @@ const RowActions = ({ doc, t, onCopy, onEditDocument, onDeleteDocument, isReadOn
           }}
           disabled={isReadOnly}
           className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-primary disabled:pointer-events-none disabled:opacity-50"
-          title={isReadOnly ? t('dataGrid.tooltips.readOnly') : t('dataGrid.tooltips.editDocument')}
+          title={isReadOnly ? t('documents:dataGrid.tooltips.readOnly') : t('documents:dataGrid.tooltips.editDocument')}
           data-testid="edit-doc-btn"
         >
           <Edit size={12} />
@@ -558,7 +558,7 @@ const RowActions = ({ doc, t, onCopy, onEditDocument, onDeleteDocument, isReadOn
           }}
           disabled={isReadOnly}
           className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-50"
-          title={isReadOnly ? t('dataGrid.tooltips.readOnly') : t('dataGrid.tooltips.deleteDocument')}
+          title={isReadOnly ? t('documents:dataGrid.tooltips.readOnly') : t('documents:dataGrid.tooltips.deleteDocument')}
           data-testid="delete-doc-btn"
         >
           <Trash2 size={12} />
