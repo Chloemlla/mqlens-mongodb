@@ -1172,6 +1172,24 @@ describe('DocumentViewer query persistence (H1)', () => {
     vi.clearAllMocks();
   });
 
+  it('reports the builder state when it changes, not on every parent re-render', () => {
+    // App passes a new arrow each render. Each report is mirrored to the
+    // backend (update_tab_state), so an unrelated re-render must not send one.
+    const props = { connectionName: 'Local', databaseName: 'sales_db', collectionName: 'customers', onExecute, onExplain, loading: false };
+    const first = vi.fn();
+    const { rerender } = render(<DocumentViewer {...props} onBuilderStateChange={(s) => first(s)} />);
+    const second = vi.fn();
+    rerender(
+      <DialogProvider>
+        <DocumentViewer {...props} onBuilderStateChange={(s) => second(s)} />
+      </DialogProvider>
+    );
+    expect(second).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId('mode-aggregate-tab'));
+    expect(second).toHaveBeenCalledWith(expect.objectContaining({ queryMode: 'aggregate' }));
+  });
+
   it('saves the current query via save_query (H1)', async () => {
     const calls: any[] = [];
     mockInvoke.mockImplementation((cmd: string, args: any) => {

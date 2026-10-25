@@ -448,6 +448,16 @@ describe('DataGrid Component', () => {
     // The control flips to a "Copied" confirmation state.
     expect(screen.getAllByLabelText('Copied').length).toBeGreaterThan(0);
   });
+
+  it('keeps the "Copied" confirmation when the grid re-renders', () => {
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: vi.fn() }, configurable: true });
+    // JSON view, the default. The parent re-renders with fresh inline
+    // handlers, as App does on unrelated state changes.
+    const { rerender } = render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getAllByTestId('copy-doc-btn')[0]);
+    rerender(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    expect(screen.getAllByTestId('copy-doc-btn')[0]).toHaveAttribute('aria-label', 'Copied');
+  });
 });
 
 describe('DataGrid — connectionMode (#188 Task 6: disable write UI on read_only)', () => {

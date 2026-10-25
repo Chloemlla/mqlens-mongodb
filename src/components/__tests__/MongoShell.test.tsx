@@ -795,7 +795,7 @@ describe('MongoShell Component', () => {
     const monaco = createFakeMonaco();
     const editor = {
       getValue: () => (lastEditorProps?.defaultValue as string | undefined) ?? '',
-      getModel: () => ({ uri: { toString: () => 'inmemory://shell' } }),
+      getModel: () => ({ uri: { toString: () => 'inmemory://shell' }, getVersionId: () => 1 }),
       onKeyDown: vi.fn(),
       onDidDispose: vi.fn(),
       focus: vi.fn(),
