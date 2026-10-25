@@ -458,6 +458,15 @@ describe('DataGrid Component', () => {
     rerender(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
     expect(screen.getAllByTestId('copy-doc-btn')[0]).toHaveAttribute('aria-label', 'Copied');
   });
+
+  it.each([/table/i, /tree/i])('keeps the "Copied" confirmation when the grid re-renders in %s view', (view) => {
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: vi.fn() }, configurable: true });
+    const { rerender } = render(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: view }));
+    fireEvent.click(screen.getAllByTestId('copy-doc-btn')[0]);
+    rerender(<DataGrid documents={mockDocuments} onEditDocument={() => {}} />);
+    expect(screen.getAllByTestId('copy-doc-btn')[0]).toHaveAttribute('aria-label', 'Copied');
+  });
 });
 
 describe('DataGrid — connectionMode (#188 Task 6: disable write UI on read_only)', () => {
