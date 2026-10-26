@@ -660,6 +660,145 @@ const JsonRow = ({
   );
 };
 
+// Extra (per-render) data handed to the table view's virtualized rows.
+interface TableRowExtra {
+  documents: Array<Record<string, any>>;
+  columns: string[];
+  colWidth: (col: string) => number;
+  findHighlightClass: (rowId: number, columnKey?: string) => string | undefined;
+  openCtxMenu: JsonRowExtra['openCtxMenu'];
+  renderCell: (val: any) => React.ReactNode;
+  hasRowActions: boolean;
+  rowActions: RowActionsContext;
+}
+
+// Virtualized row for the table view. Module scope for the same reason as
+// JsonRow: an inline component remounts every row on each DataGrid render.
+const TableRow = ({
+  index,
+  style,
+  documents,
+  columns,
+  colWidth,
+  findHighlightClass,
+  openCtxMenu,
+  renderCell,
+  hasRowActions,
+  rowActions,
+}: { index: number; style: React.CSSProperties } & TableRowExtra) => {
+  const rawDoc = documents[index];
+  if (!rawDoc) return null;
+
+  return (
+    <div
+      style={style}
+      className="flex items-center border-b border-border font-mono text-xs hover:bg-accent"
+      onContextMenu={(e) => openCtxMenu(e, rawDoc)}
+    >
+      <div
+        className="flex h-full shrink-0 select-none items-center justify-center border-r border-border text-[10px] text-muted-foreground"
+        style={{ width: `${TABLE_ROW_NUMBER_WIDTH_PX}px` }}
+      >
+        {index + 1}
+      </div>
+      {columns.map((col) => (
+        <div
+          key={col}
+          className={cn(
+            'flex h-full items-center truncate border-r border-border px-3 text-foreground',
+            findHighlightClass(index, col)
+          )}
+          style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
+          onContextMenu={(e) => openCtxMenu(e, rawDoc, col, rawDoc[col])}
+        >
+          {renderCell(rawDoc[col])}
+        </div>
+      ))}
+      {hasRowActions && (
+        <div className="flex h-full w-[72px] shrink-0 items-center justify-center px-2">
+          <RowActions doc={rawDoc} {...rowActions} />
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Extra (per-render) data handed to the tree-table view's virtualized rows.
+interface TreeRowExtra {
+  rows: TreeRow[];
+  collapsedFolds: Set<number>;
+  findHighlightClass: (rowId: number) => string | undefined;
+  toggleFold: (id: number) => void;
+  documents: Array<Record<string, any>>;
+  openCtxMenu: JsonRowExtra['openCtxMenu'];
+  keyWidth: number;
+  renderValue: (row: TreeRow) => React.ReactNode;
+  hasRowActions: boolean;
+  rowActions: RowActionsContext;
+  t: (key: string) => string;
+}
+
+// Virtualized row for the tree-table view (Key | Value | Type). Module scope
+// for the same reason as JsonRow.
+const TreeRowComponent = ({
+  index,
+  style,
+  rows,
+  collapsedFolds,
+  findHighlightClass,
+  toggleFold,
+  documents,
+  openCtxMenu,
+  keyWidth,
+  renderValue,
+  hasRowActions,
+  rowActions,
+  t,
+}: { index: number; style: React.CSSProperties } & TreeRowExtra) => {
+  const row = rows[index];
+  if (!row) return null;
+  const collapsed = row.foldId !== undefined && collapsedFolds.has(row.foldId);
+  return (
+    <div
+      style={style}
+      className={cn(
+        'flex items-center border-b border-border font-mono text-[11.5px] hover:bg-accent',
+        row.docIndex % 2 === 0 ? 'bg-background' : 'bg-card',
+        row.isDocRoot && row.docIndex > 0 && 'border-t border-border',
+        findHighlightClass(row.num)
+      )}
+      data-doc-even={row.docIndex % 2 === 0}
+      onContextMenu={(e) => openCtxMenu(e, documents[row.docIndex], row.kind === 'scalar' ? row.keyName : undefined, row.value)}
+    >
+      <div className="flex min-w-0 items-center border-r border-border" style={{ width: keyWidth, paddingLeft: 6 + row.depth * 14 }}>
+        {row.foldId !== undefined ? (
+          <button
+            type="button"
+            onClick={() => toggleFold(row.foldId!)}
+            className="mr-1 flex shrink-0 items-center text-muted-foreground hover:text-foreground"
+            data-testid="tree-fold-btn"
+            aria-label={collapsed ? t('documents:dataGrid.tooltips.expand') : t('documents:dataGrid.tooltips.collapse')}
+          >
+            {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+          </button>
+        ) : (
+          <span className="mr-1 inline-block w-[11px] shrink-0" />
+        )}
+        <span className="truncate text-syntax-key" title={row.keyName}>{row.keyName}</span>
+      </div>
+      <div className="flex min-w-0 flex-1 items-center gap-2 border-r border-border px-3">
+        <span className="truncate">{renderValue(row)}</span>
+        {row.isDocRoot && hasRowActions && row.doc && (
+          <span className="ml-auto inline-flex opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
+            <RowActions doc={row.doc} {...rowActions} />
+          </span>
+        )}
+      </div>
+      <div className="w-28 shrink-0 px-3 text-muted-foreground">{row.type}</div>
+    </div>
+  );
+};
+
 export const DataGrid: React.FC<DataGridProps> = ({
   documents,
   loading = false,
@@ -1905,47 +2044,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
     isReadOnly,
   };
 
-  // Row Renderer for Virtualized List (table mode only; JSON & tree have their own).
-  const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => {
-    const rawDoc = documents[index];
-    if (!rawDoc) return null;
-
-    // Table mode
-    return (
-      <div
-        style={style}
-        className="flex items-center border-b border-border font-mono text-xs hover:bg-accent"
-        onContextMenu={(e) => openCtxMenu(e, rawDoc)}
-      >
-        <div
-          className="flex h-full shrink-0 select-none items-center justify-center border-r border-border text-[10px] text-muted-foreground"
-          style={{ width: `${TABLE_ROW_NUMBER_WIDTH_PX}px` }}
-        >
-          {index + 1}
-        </div>
-        {columns.map((col) => (
-          <div
-            key={col}
-            className={cn(
-              'flex h-full items-center truncate border-r border-border px-3 text-foreground',
-              findHighlightClass(index, col)
-            )}
-            style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
-            onContextMenu={(e) => openCtxMenu(e, rawDoc, col, rawDoc[col])}
-          >
-            {renderColoredCell(rawDoc[col])}
-          </div>
-        ))}
-        {hasRowActions && (
-          <div className="flex h-full w-[72px] shrink-0 items-center justify-center px-2">
-            <RowActions doc={rawDoc} {...rowActions} />
-          </div>
-        )}
-      </div>
-    );
-  };
-
-
   // Bring the matched column into view as well as the matched row. The table
   // scrolls in both directions once resized columns overflow, so a vertical jump
   // alone can leave the highlighted cell off the side of the viewport while the
@@ -2051,51 +2149,6 @@ export const DataGrid: React.FC<DataGridProps> = ({
     return getScaledRowHeight(24, density);
   };
 
-  // Virtualized row for the tree-table view (Key | Value | Type).
-  const TreeRowComponent = ({ index, style }: { index: number; style: React.CSSProperties }) => {
-    const row = visibleTreeRows[index];
-    if (!row) return null;
-    const collapsed = row.foldId !== undefined && treeCollapsed.has(row.foldId);
-    return (
-      <div
-        style={style}
-        className={cn(
-          'flex items-center border-b border-border font-mono text-[11.5px] hover:bg-accent',
-          row.docIndex % 2 === 0 ? 'bg-background' : 'bg-card',
-          row.isDocRoot && row.docIndex > 0 && 'border-t border-border',
-          findHighlightClass(row.num)
-        )}
-        data-doc-even={row.docIndex % 2 === 0}
-        onContextMenu={(e) => openCtxMenu(e, documents[row.docIndex], row.kind === 'scalar' ? row.keyName : undefined, row.value)}
-      >
-        <div className="flex min-w-0 items-center border-r border-border" style={{ width: treeKeyWidth, paddingLeft: 6 + row.depth * 14 }}>
-          {row.foldId !== undefined ? (
-            <button
-              type="button"
-              onClick={() => toggleTreeFold(row.foldId!)}
-              className="mr-1 flex shrink-0 items-center text-muted-foreground hover:text-foreground"
-              data-testid="tree-fold-btn"
-              aria-label={collapsed ? t('documents:dataGrid.tooltips.expand') : t('documents:dataGrid.tooltips.collapse')}
-            >
-              {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-            </button>
-          ) : (
-            <span className="mr-1 inline-block w-[11px] shrink-0" />
-          )}
-          <span className="truncate text-syntax-key" title={row.keyName}>{row.keyName}</span>
-        </div>
-        <div className="flex min-w-0 flex-1 items-center gap-2 border-r border-border px-3">
-          <span className="truncate">{renderTreeValue(row)}</span>
-          {row.isDocRoot && hasRowActions && row.doc && (
-            <span className="ml-auto inline-flex opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
-              <RowActions doc={row.doc} {...rowActions} />
-            </span>
-          )}
-        </div>
-        <div className="w-28 shrink-0 px-3 text-muted-foreground">{row.type}</div>
-      </div>
-    );
-  };
   return (
     <>
       {/* The accessible announcement of a run in flight, kept OUTSIDE the inert
@@ -2436,12 +2489,24 @@ export const DataGrid: React.FC<DataGridProps> = ({
               <div className="w-28 shrink-0 px-3">{t('dataGrid.labels.type')}</div>
             </div>
             <div className="min-h-0 flex-1 min-w-0 overflow-hidden">
-              <List<{}>
+              <List<TreeRowExtra>
                 rowCount={visibleTreeRows.length}
                 listRef={treeListRef}
                 rowHeight={getRowHeight()}
                 rowComponent={TreeRowComponent}
-                rowProps={{}}
+                rowProps={{
+                  rows: visibleTreeRows,
+                  collapsedFolds: treeCollapsed,
+                  findHighlightClass,
+                  toggleFold: toggleTreeFold,
+                  documents,
+                  openCtxMenu,
+                  keyWidth: treeKeyWidth,
+                  renderValue: renderTreeValue,
+                  hasRowActions,
+                  rowActions,
+                  t,
+                }}
                 style={{ height: '100%', width: '100%' }}
               />
             </div>
@@ -2496,12 +2561,21 @@ export const DataGrid: React.FC<DataGridProps> = ({
               className="min-h-0 flex-1 min-w-0 overflow-auto"
               style={{ scrollbarGutter: 'stable' }}
             >
-              <List<{}>
+              <List<TableRowExtra>
                 rowCount={documents.length}
                 listRef={tableListRef}
                 rowHeight={getRowHeight()}
-                rowComponent={Row}
-                rowProps={{}}
+                rowComponent={TableRow}
+                rowProps={{
+                  documents,
+                  columns,
+                  colWidth,
+                  findHighlightClass,
+                  openCtxMenu,
+                  renderCell: renderColoredCell,
+                  hasRowActions,
+                  rowActions,
+                }}
                 style={{ height: '100%', width: '100%', minWidth: viewMode === 'table' ? `${columns.reduce((s, c) => s + colWidth(c), 0) + TABLE_ROW_NUMBER_WIDTH_PX + (hasRowActions ? 72 : 0)}px` : '100%' }}
               />
             </div>
