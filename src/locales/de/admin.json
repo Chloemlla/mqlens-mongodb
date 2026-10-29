@@ -245,14 +245,19 @@
       "indexAccessesSinceRestart": "Indexzugriffe seit dem letzten Neustart"
     },
     "properties": {
+      "hiddenBadge": "Für Abfragen verborgen",
+      "noTtl": "Keine",
+      "partialFilter": "Teilfilter",
       "title": "Eigenschaften & Details",
       "indexName": "Indexname",
+      "ttl": "Gültigkeitsdauer (TTL)",
       "uniqueConstraint": "Eindeutigkeit",
       "sparseConstraint": "Sparse-Beschränkung",
       "operationalStatus": "Betriebsstatus",
       "active": "Aktiv",
       "nonSparseBadge": "Nicht-Sparse",
-      "descriptionAndGuidelines": "Beschreibung & Richtlinien"
+      "descriptionAndGuidelines": "Beschreibung & Richtlinien",
+      "visibility": "Sichtbarkeit"
     },
     "raw": {
       "title": "Rohspezifikation (BSON-Metadaten)"
@@ -292,6 +297,9 @@
       "descending": "Absteigend (-1)"
     },
     "constraintLabels": {
+      "ttl": "Dokumente löschen nach",
+      "ttlSeconds": "Ablauf nach Sekunden",
+      "ttlUnit": "Sekunden",
       "unique": "Eindeutig",
       "uniqueHint": "verhindert Duplikate",
       "sparse": "Sparse",
@@ -303,7 +311,10 @@
       "invalidJsonSyntax": "Ungültige JSON-Syntax",
       "allFieldsNeedName": "Alle Indexschlüsselfelder müssen einen Namen haben",
       "specifyAtLeastOneKey": "Gib mindestens einen Indexschlüssel an",
-      "nameRequired": "Indexname ist erforderlich"
+      "nameRequired": "Indexname ist erforderlich",
+      "ttlNotId": "Ein TTL-Index kann nicht auf _id liegen",
+      "ttlRange": "Die Ablaufzeit in Sekunden muss eine ganze Zahl von 0 bis 2147483647 sein",
+      "ttlSingleField": "Ein TTL-Index muss genau ein Schlüsselfeld haben"
     }
   },
   "validationRulesView": {

@@ -13,6 +13,7 @@ export interface IndexSeed {
   keys: Record<string, unknown>;
   unique?: boolean;
   sparse?: boolean;
+  expireAfterSeconds?: number;
 }
 
 export interface CollectionSeed {
@@ -63,6 +64,8 @@ export interface RemoteConnectionSeed {
   blockedCommands?: string[];
   /** Those of them the role rules out. */
   roleBlockedCommands?: string[];
+  /** The MQLens API version the connection speaks; 9 by default. */
+  apiVersion?: number;
 }
 
 export interface ServerAccountSeed {

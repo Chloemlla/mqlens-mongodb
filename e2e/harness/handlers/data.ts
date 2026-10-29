@@ -669,9 +669,10 @@ export function registerDataHandlers(backend: Backend, state: E2EState): void {
         keys: JSON.stringify(index.keys),
         unique: Boolean(index.unique),
         sparse: Boolean(index.sparse),
+        ...(index.expireAfterSeconds === undefined ? {} : { expireAfterSeconds: index.expireAfterSeconds }),
       })),
     ],
-    create_index: ({ id, database: db, collection: coll, indexName, keys, unique, sparse }) => {
+    create_index: ({ id, database: db, collection: coll, indexName, keys, unique, sparse, expireAfterSeconds }) => {
       guardWritable(state, id);
       const found = collection(id, db, coll);
       const name = String(indexName);
@@ -689,7 +690,21 @@ export function registerDataHandlers(backend: Backend, state: E2EState): void {
           (unique ? duplicateIndexKey(`${String(db)}.${String(coll)}`, name, parsedKeys, found.docs, Boolean(sparse)) : null);
         if (clash) throw `Failed to create index: ${clash}`;
       }
-      found.indexes.push({ name, keys: parsedKeys, unique: Boolean(unique), sparse: Boolean(sparse) });
+      found.indexes.push({
+        name,
+        keys: parsedKeys,
+        unique: Boolean(unique),
+        sparse: Boolean(sparse),
+        ...(typeof expireAfterSeconds === 'number' ? { expireAfterSeconds } : {}),
+      });
+      return null;
+    },
+    // collMod on a TTL index: only its expiry changes.
+    set_index_expiry: ({ id, database: db, collection: coll, indexName, expireAfterSeconds }) => {
+      guardWritable(state, id);
+      const index = collection(id, db, coll).indexes.find((each) => each.name === indexName);
+      if (index?.expireAfterSeconds === undefined) throw `Index ${String(indexName)} has no TTL to change`;
+      index.expireAfterSeconds = Number(expireAfterSeconds);
       return null;
     },
     delete_index: ({ id, database: db, collection: coll, indexName }) => {

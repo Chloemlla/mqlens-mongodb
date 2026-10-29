@@ -111,4 +111,49 @@ describe('IndexViewer (T2)', () => {
     expect(screen.queryByTestId('index-size-card')).not.toBeInTheDocument();
     expect(screen.queryByTestId('index-usage-card')).not.toBeInTheDocument();
   });
+
+  it('shows the TTL, hidden flag and partial filter of the index', async () => {
+    const TTL_INDEX = {
+      name: 'city_1', keys: '{"city":1}', unique: false, sparse: false,
+      expireAfterSeconds: 3600, hidden: true, partialFilterExpression: '{"active":true}',
+    };
+    mockInvokeByCommand({ list_indexes: [TTL_INDEX], index_stats: [] });
+    const onEditIndex = vi.fn();
+    render(<IndexViewer {...baseProps} onEditIndex={onEditIndex} />);
+
+    expect(await screen.findByTestId('index-ttl')).toHaveTextContent('TTL 1 hour (3600 s)');
+    expect(screen.getByTestId('index-hidden')).toBeInTheDocument();
+    expect(screen.getByTestId('index-partial-filter')).toHaveTextContent('{"active":true}');
+    // The raw definition carries them as MongoDB writes them.
+    expect(screen.getByText(/"expireAfterSeconds"/)).toBeInTheDocument();
+    expect(screen.getByText(/"partialFilterExpression"/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('edit-index-btn'));
+    expect(onEditIndex).toHaveBeenCalledWith('city_1', { city: 1 }, false, false, 3600, true);
+  });
+
+  it('says an index has no TTL', async () => {
+    mockInvokeByCommand({ list_indexes: [CITY_INDEX], index_stats: [] });
+    render(<IndexViewer {...baseProps} />);
+    expect(await screen.findByTestId('index-ttl')).toHaveTextContent('None');
+    expect(screen.queryByTestId('index-hidden')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('index-partial-filter')).not.toBeInTheDocument();
+  });
+  // An expiry changed in place keeps the tab open; the app bumps the key.
+  it('refetches when the refresh key changes', async () => {
+    let expireAfterSeconds = 3600;
+    mockInvoke.mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'list_indexes' ? [{ ...CITY_INDEX, expireAfterSeconds }] : [])
+    );
+    const { rerender } = render(<IndexViewer {...baseProps} refreshKey={0} />);
+    expect(await screen.findByTestId('index-ttl')).toHaveTextContent('3600 s');
+
+    expireAfterSeconds = 86400;
+    rerender(
+      <DialogProvider>
+        <IndexViewer {...baseProps} refreshKey={1} />
+      </DialogProvider>
+    );
+    await waitFor(() => expect(screen.getByTestId('index-ttl')).toHaveTextContent('86400 s'));
+  });
 });

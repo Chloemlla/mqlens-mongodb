@@ -363,7 +363,7 @@ pub struct CollectionInfo {
     pub collection_type: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct IndexInfo {
     pub name: String,
     // The real key pattern serialized as a JSON string, preserving field order and
@@ -371,6 +371,14 @@ pub struct IndexInfo {
     pub keys: String,
     pub unique: bool,
     pub sparse: bool,
+    // Left out when absent, so a plain index's payload stays as it was.
+    #[serde(rename = "expireAfterSeconds", skip_serializing_if = "Option::is_none")]
+    pub expire_after_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    // The filter as a JSON string, written as `keys` is.
+    #[serde(rename = "partialFilterExpression", skip_serializing_if = "Option::is_none")]
+    pub partial_filter_expression: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3030,6 +3038,7 @@ async fn create_index(
     keys: String,
     unique: bool,
     sparse: bool,
+    expire_after_seconds: Option<i64>,
 ) -> Result<(), String> {
     create_index_impl(
         &state,
@@ -3040,6 +3049,27 @@ async fn create_index(
         &keys,
         unique,
         sparse,
+        expire_after_seconds,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_index_expiry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    database: String,
+    collection: String,
+    index_name: String,
+    expire_after_seconds: i64,
+) -> Result<(), String> {
+    db::metadata::set_index_expiry_impl(
+        &state,
+        &id,
+        &database,
+        &collection,
+        &index_name,
+        expire_after_seconds,
     )
     .await
 }
@@ -4384,6 +4414,7 @@ pub fn run() {
             coll_stats,
             index_stats,
             create_index,
+            set_index_expiry,
             delete_index,
             delete_document,
             delete_many,

@@ -66,6 +66,8 @@ export interface RemoteConnectionInfo {
   serverUrl: string;
   remoteId: string;
   opClasses: string[];
+  /** The MQLens API version it speaks. */
+  apiVersion: number;
   /** Commands the connection cannot run; the UI disables them. */
   blockedCommands: string[];
   /** Those of them that only the user's role rules out. */

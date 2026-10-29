@@ -351,7 +351,7 @@ fn mock_index(name: &str) -> crate::IndexInfo {
         name: name.to_string(),
         keys,
         unique,
-        sparse: false,
+        ..Default::default()
     }
 }
 

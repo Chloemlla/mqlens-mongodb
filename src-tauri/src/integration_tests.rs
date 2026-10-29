@@ -280,6 +280,7 @@ mod integration {
             r#"{"city":1}"#,
             true,
             true,
+            None,
         )
         .await
         .expect("create index");
@@ -302,6 +303,54 @@ mod integration {
             .await
             .expect("list indexes after delete");
         assert!(!after.iter().any(|i| i.name == "city_unique"));
+
+        cleanup(&state, &id, &db).await;
+    }
+
+    /// A TTL index as MongoDB keeps it: created with its expiry, listed with
+    /// it, changed in place by collMod, and refused where MongoDB would.
+    #[tokio::test]
+    async fn it_ttl_index_round_trip_real() {
+        let Some((state, id, db)) = connect().await else {
+            return;
+        };
+        async fn expiry(state: &AppState, id: &str, db: &str, name: &str) -> Option<i64> {
+            list_indexes_impl(state, id, db, "events")
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .expire_after_seconds
+        }
+
+        create_index_impl(&state, &id, &db, "events", "createdAt_1", r#"{"createdAt":1}"#, false, false, Some(3600))
+            .await
+            .expect("create TTL index");
+        assert_eq!(expiry(&state, &id, &db, "createdAt_1").await, Some(3600));
+
+        crate::db::metadata::set_index_expiry_impl(&state, &id, &db, "events", "createdAt_1", 86400)
+            .await
+            .expect("collMod the expiry");
+        assert_eq!(expiry(&state, &id, &db, "createdAt_1").await, Some(86400));
+
+        // A plain index still lists without one.
+        create_index_impl(&state, &id, &db, "events", "kind_1", r#"{"kind":1}"#, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!(expiry(&state, &id, &db, "kind_1").await, None);
+
+        assert!(create_index_impl(&state, &id, &db, "events", "c", r#"{"a":1,"b":1}"#, false, false, Some(60))
+            .await
+            .is_err());
+        assert!(crate::db::metadata::set_index_expiry_impl(&state, &id, &db, "events", "createdAt_1", -1)
+            .await
+            .is_err());
+        // MongoDB's own refusal comes back as an error: no index of that name.
+        let err = crate::db::metadata::set_index_expiry_impl(&state, &id, &db, "events", "missing_1", 60)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Failed to change the index expiry"), "{err}");
 
         cleanup(&state, &id, &db).await;
     }
@@ -610,7 +659,7 @@ mod integration {
             vec![doc! { "a": 1 }, doc! { "a": 2 }],
         )
         .await;
-        create_index_impl(&state, &id, &db, "old_name", "a_1", r#"{"a":1}"#, false, false)
+        create_index_impl(&state, &id, &db, "old_name", "a_1", r#"{"a":1}"#, false, false, None)
             .await
             .expect("index for rename");
 
@@ -886,7 +935,7 @@ mod integration {
         )
         .await;
         // A non-default index so copy_indexes has something to recreate.
-        create_index_impl(&state, &id, &db, "orders", "amount_1", r#"{"amount":1}"#, false, false)
+        create_index_impl(&state, &id, &db, "orders", "amount_1", r#"{"amount":1}"#, false, false, None)
             .await
             .expect("source index");
 
@@ -971,7 +1020,7 @@ mod integration {
             vec![doc! { "_id": 1, "qty": 2 }, doc! { "_id": 2, "qty": 8 }],
         )
         .await;
-        create_index_impl(&state, &id, &db, "items", "qty_1", r#"{"qty":1}"#, false, false)
+        create_index_impl(&state, &id, &db, "items", "qty_1", r#"{"qty":1}"#, false, false, None)
             .await
             .expect("source index");
         create_view_impl(&state, &id, &db, "big_items", "items", r#"[{"$match":{"qty":{"$gte":5}}}]"#)

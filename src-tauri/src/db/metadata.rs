@@ -248,32 +248,151 @@ async fn list_indexes_impl_inner(
     use futures::stream::StreamExt;
     while let Some(result) = cursor.next().await {
         let index_model = result.map_err(|e| format!("Index read error: {}", e))?;
-        // Serialize the real key pattern (preserves field order + direction/type).
-        let keys = serde_json::to_string(&index_model.keys).unwrap_or_else(|_| "{}".to_string());
-        let name = index_model
-            .options
-            .as_ref()
-            .and_then(|o| o.name.clone())
-            .unwrap_or_default();
-        let unique = index_model
-            .options
-            .as_ref()
-            .and_then(|o| o.unique)
-            .unwrap_or(false);
-        let sparse = index_model
-            .options
-            .as_ref()
-            .and_then(|o| o.sparse)
-            .unwrap_or(false);
-        indexes.push(IndexInfo {
-            name,
-            keys,
-            unique,
-            sparse,
-        });
+        indexes.push(index_info(&index_model));
     }
 
     Ok(indexes)
+}
+
+fn index_info(index_model: &mongodb::IndexModel) -> IndexInfo {
+    // Serialize the real key pattern (preserves field order + direction/type).
+    let keys = serde_json::to_string(&index_model.keys).unwrap_or_else(|_| "{}".to_string());
+    let options = index_model.options.as_ref();
+    let info = IndexInfo {
+        name: options.and_then(|o| o.name.clone()).unwrap_or_default(),
+        keys,
+        unique: options.and_then(|o| o.unique).unwrap_or(false),
+        sparse: options.and_then(|o| o.sparse).unwrap_or(false),
+        ..Default::default()
+    };
+    // The options serialize under their index document names.
+    let spec = options
+        .and_then(|o| mongodb::bson::to_document(o).ok())
+        .unwrap_or_default();
+    with_spec_details(info, &spec)
+}
+
+/// `info` with what the index document `spec` says beyond keys and flags: its
+/// TTL, whether it is hidden, and its partial filter.
+pub(crate) fn with_spec_details(mut info: IndexInfo, spec: &mongodb::bson::Document) -> IndexInfo {
+    use mongodb::bson::Bson;
+    info.expire_after_seconds = match spec.get("expireAfterSeconds") {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n),
+        Some(Bson::Double(n)) => Some(*n as i64),
+        _ => None,
+    };
+    info.hidden = spec.get_bool("hidden").unwrap_or(false);
+    info.partial_filter_expression = spec
+        .get_document("partialFilterExpression")
+        .ok()
+        .and_then(|filter| serde_json::to_string(filter).ok());
+    info
+}
+
+pub(crate) const TTL_SINGLE_FIELD: &str = "A TTL index must have exactly one key field";
+pub(crate) const TTL_NOT_ID: &str = "A TTL index cannot be on _id";
+pub(crate) const TTL_RANGE: &str =
+    "Expire after seconds must be a whole number from 0 to 2147483647";
+
+fn check_ttl_seconds(seconds: i64) -> Result<(), String> {
+    if (0..=i64::from(i32::MAX)).contains(&seconds) {
+        Ok(())
+    } else {
+        Err(TTL_RANGE.to_string())
+    }
+}
+
+/// MongoDB's rules for a TTL index: one field, not `_id`, a 32-bit expiry.
+fn check_ttl(keys: &mongodb::bson::Document, seconds: i64) -> Result<(), String> {
+    if keys.len() != 1 {
+        return Err(TTL_SINGLE_FIELD.to_string());
+    }
+    if keys.contains_key("_id") {
+        return Err(TTL_NOT_ID.to_string());
+    }
+    check_ttl_seconds(seconds)
+}
+
+fn set_expiry_command(collection: &str, index_name: &str, seconds: i64) -> mongodb::bson::Document {
+    mongodb::bson::doc! {
+        "collMod": collection,
+        "index": { "name": index_name, "expireAfterSeconds": seconds },
+    }
+}
+
+/// Changes a TTL index's expiry in place with `collMod`, without rebuilding it.
+pub async fn set_index_expiry_impl(
+    state: &AppState,
+    id: &str,
+    db: &str,
+    collection: &str,
+    index_name: &str,
+    expire_after_seconds: i64,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let result =
+        set_index_expiry_inner(state, id, db, collection, index_name, expire_after_seconds).await;
+    crate::audit::maybe_record_result(
+        state,
+        Some(id),
+        Some(db),
+        Some(collection),
+        "set_index_expiry",
+        crate::audit::OpClass::Write,
+        None,
+        started,
+        &format!("collMod {db}.{collection}.{index_name} expireAfterSeconds={expire_after_seconds}"),
+        None,
+        &result,
+    );
+    result
+}
+
+async fn set_index_expiry_inner(
+    state: &AppState,
+    id: &str,
+    db: &str,
+    collection: &str,
+    index_name: &str,
+    expire_after_seconds: i64,
+) -> Result<(), String> {
+    guard_writable(state, id, WriteOp::CollMod, false)?;
+    check_ttl_seconds(expire_after_seconds)?;
+
+    if crate::connection_is_mock(state, id)? {
+        let key = format!("{}/{}/{}", id, db, collection);
+        let mut mock_indexes = state.mock_indexes.lock_safe()?;
+        let list = mock_indexes
+            .entry(key)
+            .or_insert_with(|| mock_db::get_mock_indexes(db, collection));
+        return match list
+            .iter_mut()
+            .find(|i| i.name == index_name && i.expire_after_seconds.is_some())
+        {
+            Some(index) => {
+                index.expire_after_seconds = Some(expire_after_seconds);
+                Ok(())
+            }
+            None => Err(format!("Index {index_name} has no TTL to change")),
+        };
+    }
+
+    let client = match crate::server::remote::route(state, id)? {
+        crate::server::remote::Route::Local(client) => client,
+        crate::server::remote::Route::Remote(conn) => {
+            return crate::server::ops::ddl::set_index_expiry(
+                state, &conn, db, collection, index_name, expire_after_seconds,
+            )
+            .await;
+        }
+    };
+    client
+        .database(db)
+        .run_command(set_expiry_command(collection, index_name, expire_after_seconds))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to change the index expiry: {}", e))
 }
 
 pub async fn create_index_impl(
@@ -285,9 +404,10 @@ pub async fn create_index_impl(
     keys: &str,
     unique: bool,
     sparse: bool,
+    expire_after_seconds: Option<i64>,
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
-    let result = create_index_inner(state, id, db, collection, index_name, keys, unique, sparse).await;
+    let result = create_index_inner(state, id, db, collection, index_name, keys, unique, sparse, expire_after_seconds).await;
     crate::audit::maybe_record_result(
         state,
         Some(id),
@@ -313,8 +433,17 @@ async fn create_index_inner(
     keys: &str,
     unique: bool,
     sparse: bool,
+    expire_after_seconds: Option<i64>,
 ) -> Result<(), String> {
     guard_writable(state, id, WriteOp::CreateIndex, false)?;
+
+    let value: serde_json::Value =
+        serde_json::from_str(keys).map_err(|e| format!("Invalid JSON keys: {}", e))?;
+    let keys_doc = mongodb::bson::to_document(&value)
+        .map_err(|e| format!("Failed to convert keys JSON to BSON: {}", e))?;
+    if let Some(seconds) = expire_after_seconds {
+        check_ttl(&keys_doc, seconds)?;
+    }
 
     let is_mock = {
         let mocks = state.mocks.lock_safe()?;
@@ -337,15 +466,12 @@ async fn create_index_inner(
                 keys: keys.to_string(),
                 unique,
                 sparse,
+                expire_after_seconds,
+                ..Default::default()
             });
         }
         return Ok(());
     }
-
-    let value: serde_json::Value =
-        serde_json::from_str(keys).map_err(|e| format!("Invalid JSON keys: {}", e))?;
-    let keys_doc = mongodb::bson::to_document(&value)
-        .map_err(|e| format!("Failed to convert keys JSON to BSON: {}", e))?;
 
     let client = match crate::server::remote::route(state, id)? {
         crate::server::remote::Route::Local(client) => client,
@@ -355,6 +481,7 @@ async fn create_index_inner(
                 keys: &keys_doc,
                 unique,
                 sparse,
+                expire_after_seconds,
             };
             use crate::server::ops::write;
             return write::create_index(state, &conn, db, collection, index).await;
@@ -374,6 +501,9 @@ async fn create_index_inner(
     if sparse {
         options.sparse = Some(true);
     }
+    // Checked above to be 0 or more.
+    options.expire_after =
+        expire_after_seconds.map(|s| std::time::Duration::from_secs(s as u64));
 
     let model = mongodb::IndexModel::builder()
         .keys(keys_doc)
@@ -542,5 +672,157 @@ mod tests {
         assert_ne!(UNKNOWN_COLLECTION_TYPE, "collection");
         assert_ne!(UNKNOWN_COLLECTION_TYPE, "view");
         assert_ne!(UNKNOWN_COLLECTION_TYPE, "timeseries");
+    }
+
+    async fn mock_connection() -> (AppState, String) {
+        let state = AppState::new();
+        let id = crate::connect_db_impl(&state, "mongodb://mock", None)
+            .await
+            .unwrap();
+        (state, id)
+    }
+
+    async fn listed(state: &AppState, id: &str, name: &str) -> IndexInfo {
+        list_indexes_impl(state, id, "sales_db", "customers")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.name == name)
+            .unwrap()
+    }
+
+    // What the driver reads back from listIndexes: the TTL, hidden and the
+    // partial filter all reach the listing.
+    #[test]
+    fn an_index_lists_its_ttl_hidden_flag_and_partial_filter() {
+        let model = mongodb::IndexModel::builder()
+            .keys(mongodb::bson::doc! { "createdAt": 1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .name("createdAt_1".to_string())
+                    .expire_after(std::time::Duration::from_secs(86400))
+                    .hidden(true)
+                    .partial_filter_expression(mongodb::bson::doc! { "archived": true })
+                    .build(),
+            )
+            .build();
+        let info = index_info(&model);
+        assert_eq!(info.name, "createdAt_1");
+        assert_eq!(info.expire_after_seconds, Some(86400));
+        assert!(info.hidden);
+        assert_eq!(
+            info.partial_filter_expression.as_deref(),
+            Some(r#"{"archived":true}"#)
+        );
+    }
+
+    // Payloads for an index without any of these stay exactly as they were.
+    #[test]
+    fn a_plain_index_serializes_as_before() {
+        let plain = IndexInfo {
+            name: "a_1".into(),
+            keys: r#"{"a":1}"#.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({ "name": "a_1", "keys": "{\"a\":1}", "unique": false, "sparse": false })
+        );
+        let ttl = IndexInfo {
+            expire_after_seconds: Some(60),
+            hidden: true,
+            partial_filter_expression: Some("{}".into()),
+            ..plain
+        };
+        let value = serde_json::to_value(&ttl).unwrap();
+        assert_eq!(value["expireAfterSeconds"], 60);
+        assert_eq!(value["hidden"], true);
+        assert_eq!(value["partialFilterExpression"], "{}");
+    }
+
+    #[tokio::test]
+    async fn a_ttl_index_is_created_and_listed_with_its_expiry() {
+        let (state, id) = mock_connection().await;
+        create_index_impl(
+            &state, &id, "sales_db", "customers", "createdAt_1", r#"{"createdAt":1}"#, false,
+            false, Some(3600),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listed(&state, &id, "createdAt_1").await.expire_after_seconds,
+            Some(3600)
+        );
+    }
+
+    // MongoDB's rules for a TTL index, refused before any request.
+    #[tokio::test]
+    async fn a_ttl_index_follows_mongodb_rules() {
+        let (state, id) = mock_connection().await;
+        let create = |keys: &'static str, ttl: i64| {
+            let (state, id) = (&state, id.clone());
+            async move {
+                create_index_impl(state, &id, "sales_db", "customers", "t", keys, false, false, Some(ttl))
+                    .await
+                    .unwrap_err()
+            }
+        };
+        assert_eq!(create(r#"{"a":1,"b":1}"#, 60).await, TTL_SINGLE_FIELD);
+        assert_eq!(create(r#"{"_id":1}"#, 60).await, TTL_NOT_ID);
+        assert_eq!(create(r#"{"a":1}"#, -1).await, TTL_RANGE);
+        assert_eq!(create(r#"{"a":1}"#, 2_147_483_648).await, TTL_RANGE);
+        assert!(list_indexes_impl(&state, &id, "sales_db", "customers")
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| i.name != "t"));
+        // The bounds themselves are allowed.
+        for (name, ttl) in [("zero", 0), ("max", 2_147_483_647)] {
+            create_index_impl(&state, &id, "sales_db", "customers", name, r#"{"a":1}"#, false, false, Some(ttl))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_expiry_of_a_ttl_index_changes_in_place() {
+        let (state, id) = mock_connection().await;
+        create_index_impl(
+            &state, &id, "sales_db", "customers", "createdAt_1", r#"{"createdAt":1}"#, false,
+            false, Some(3600),
+        )
+        .await
+        .unwrap();
+        set_index_expiry_impl(&state, &id, "sales_db", "customers", "createdAt_1", 86400)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&state, &id, "createdAt_1").await.expire_after_seconds,
+            Some(86400)
+        );
+        assert_eq!(
+            set_index_expiry_impl(&state, &id, "sales_db", "customers", "createdAt_1", -5)
+                .await
+                .unwrap_err(),
+            TTL_RANGE
+        );
+        assert_eq!(
+            set_index_expiry_impl(&state, &id, "sales_db", "customers", "email_1", 60)
+                .await
+                .unwrap_err(),
+            "Index email_1 has no TTL to change"
+        );
+    }
+
+    // collMod's own shape, as MongoDB documents it.
+    #[test]
+    fn the_expiry_change_is_a_collmod_on_the_index_name() {
+        assert_eq!(
+            set_expiry_command("events", "createdAt_1", 60),
+            mongodb::bson::doc! {
+                "collMod": "events",
+                "index": { "name": "createdAt_1", "expireAfterSeconds": 60_i64 },
+            }
+        );
     }
 }

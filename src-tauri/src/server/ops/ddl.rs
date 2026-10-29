@@ -9,7 +9,7 @@ use crate::server::pb::mqlens::v1::ddl_service_client::DdlServiceClient;
 use crate::server::pb::mqlens::v1::{
     CreateCollectionRequest, CreateViewRequest, DropCollectionRequest, DropDatabaseRequest,
     GetCollectionOptionsRequest, RenameCollectionRequest, RenameDatabaseDetailedRequest,
-    SetValidatorRequest,
+    SetIndexExpiryRequest, SetValidatorRequest,
 };
 use crate::server::remote::RemoteConn;
 use crate::server::routes;
@@ -149,6 +149,25 @@ pub(crate) async fn set_validator(
         validation_action: validation.action.to_string(),
     };
     ddl_call!(state, conn, "set_validator", request, set_validator).map(|_| ())
+}
+
+/// collMod on the TTL index `index_name`, run by the server.
+pub(crate) async fn set_index_expiry(
+    state: &AppState,
+    conn: &RemoteConn,
+    database: &str,
+    collection: &str,
+    index_name: &str,
+    expire_after_seconds: i64,
+) -> Result<(), String> {
+    let request = SetIndexExpiryRequest {
+        connection_id: conn.remote_id.clone(),
+        database: database.to_string(),
+        collection: collection.to_string(),
+        index_name: index_name.to_string(),
+        expire_after_seconds,
+    };
+    ddl_call!(state, conn, "set_index_expiry", request, set_index_expiry).map(|_| ())
 }
 
 pub(crate) async fn drop_database(

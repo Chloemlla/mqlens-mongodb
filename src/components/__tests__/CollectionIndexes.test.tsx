@@ -174,7 +174,7 @@ describe('CollectionIndexes', () => {
     expect(onDeleteIndex).toHaveBeenCalledWith('email_1');
 
     fireEvent.click(screen.getByTestId('edit-index-tier_1_age_-1'));
-    expect(onEditIndex).toHaveBeenCalledWith('tier_1_age_-1', { tier: 1, age: -1 }, false, false);
+    expect(onEditIndex).toHaveBeenCalledWith('tier_1_age_-1', { tier: 1, age: -1 }, false, false, undefined, false);
 
     // Actions do not also open the row.
     expect(onOpenIndex).not.toHaveBeenCalled();
@@ -231,5 +231,21 @@ describe('CollectionIndexes', () => {
     rerender(<CollectionIndexes {...baseProps} refreshKey={1} />);
     await waitFor(() => expect(screen.queryByTestId('index-row-email_1')).not.toBeInTheDocument());
     expect(screen.getByTestId('index-row-_id_')).toBeInTheDocument();
+  });
+
+  it('shows a TTL with its duration, and hidden and partial indexes', async () => {
+    const TTL = { name: 'createdAt_1', keys: '{"createdAt":1}', unique: false, sparse: false, expireAfterSeconds: 86400 };
+    const HIDDEN = { name: 'status_1', keys: '{"status":1}', unique: false, sparse: false, hidden: true, partialFilterExpression: '{"active":true}' };
+    mockInvokeByCommand({ list_indexes: [ID, EMAIL, TTL, HIDDEN], index_stats: [] });
+    const onEditIndex = vi.fn();
+    render(<CollectionIndexes {...baseProps} onEditIndex={onEditIndex} />);
+
+    expect(await screen.findByTestId('index-row-createdAt_1')).toHaveTextContent('TTL 1 day (86400 s)');
+    expect(screen.getByTestId('index-row-email_1')).not.toHaveTextContent('TTL');
+    expect(screen.getByTestId('index-row-status_1')).toHaveTextContent('HIDDEN');
+    expect(screen.getByTestId('index-row-status_1')).toHaveTextContent('PARTIAL');
+
+    fireEvent.click(screen.getByTestId('edit-index-createdAt_1'));
+    expect(onEditIndex).toHaveBeenCalledWith('createdAt_1', { createdAt: 1 }, false, false, 86400, false);
   });
 });
