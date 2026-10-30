@@ -154,7 +154,10 @@
     "loading": "Indizes werden geladen…",
     "properties": {
       "default": "STANDARD",
+      "hidden": "VERBORGEN",
+      "partial": "PARTIELL",
       "sparse": "LÜCKENHAFT",
+      "ttl": "TTL {{duration}} ({{seconds}} Sek.)",
       "unique": "EINDEUTIG"
     },
     "statsUnavailable": "Nutzung und Größe der Indizes sind nicht verfügbar: {{detail}}",

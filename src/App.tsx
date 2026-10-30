@@ -1219,6 +1219,8 @@ function Workspace() {
       keys: Record<string, number>;
       unique: boolean;
       sparse: boolean;
+      expireAfterSeconds?: number;
+      rebuildDrops?: boolean;
     } | null;
     prefill?: {
       name: string;
@@ -2585,7 +2587,9 @@ function Workspace() {
     indexName: string,
     keys: Record<string, number>,
     unique: boolean,
-    sparse: boolean
+    sparse: boolean,
+    expireAfterSeconds?: number,
+    rebuildDrops?: boolean
   ) => {
     setIndexModalTarget({
       connectionId,
@@ -2596,16 +2600,63 @@ function Workspace() {
         keys,
         unique,
         sparse,
+        expireAfterSeconds,
+        rebuildDrops,
       },
     });
     setIsIndexModalOpen(true);
   };
 
-  const handleSaveIndex = async (indexName: string, keys: string, unique: boolean, sparse: boolean) => {
+  const handleSaveIndex = async (
+    indexName: string,
+    keys: string,
+    unique: boolean,
+    sparse: boolean,
+    expireAfterSeconds: number | null
+  ) => {
     if (!indexModalTarget) return;
     const { connectionId, db, collection, initialData } = indexModalTarget;
 
     try {
+      // A TTL index whose expiry alone changed keeps its build: collMod
+      // changes the expiry in place where the connection can run it.
+      const expiryOnly =
+        initialData?.expireAfterSeconds !== undefined &&
+        expireAfterSeconds !== null &&
+        indexName === initialData.name &&
+        keys === JSON.stringify(initialData.keys) &&
+        unique === initialData.unique &&
+        sparse === initialData.sparse &&
+        !isCommandBlocked(connectionId, 'set_index_expiry');
+      if (expiryOnly) {
+        await invoke('set_index_expiry', {
+          id: connectionId,
+          database: db,
+          collection,
+          indexName,
+          expireAfterSeconds,
+        });
+        setIsIndexModalOpen(false);
+        setIndexModalTarget(null);
+        // The open viewer refetches on the trigger, so it shows the new expiry.
+        setIndexMutationTrigger(prev => prev + 1);
+        handleSelectIndex(connectionId, db, collection, indexName);
+        return;
+      }
+
+      // Rebuilding would lose the filter (and, on a TTL index, widen what
+      // expires) or bring the index back visible.
+      if (initialData?.rebuildDrops) {
+        toast(t('toast.indexRebuildDropsOptions'), 'error');
+        return;
+      }
+      // Refused before an edit drops the old index, not after.
+      const apiVersion = serverConnections.get(connectionId)?.apiVersion;
+      if (expireAfterSeconds !== null && apiVersion !== undefined && apiVersion < 5) {
+        toast(t('toast.ttlNeedsServerApi5', { version: apiVersion }), 'error');
+        return;
+      }
+
       if (initialData) {
         // Edit mode: drop index first
         await invoke('delete_index', {
@@ -2629,6 +2680,7 @@ function Workspace() {
         keys,
         unique,
         sparse,
+        expireAfterSeconds,
       });
 
       setIsIndexModalOpen(false);
@@ -4674,7 +4726,8 @@ function Workspace() {
             databaseName={tab.db}
             collectionName={tab.collection}
             indexName={tab.indexName || ''}
-            onEditIndex={isCommandBlocked(tab.connectionId, 'create_index') || isCommandBlocked(tab.connectionId, 'delete_index') ? undefined : (indexName, keys, unique, sparse) =>
+            refreshKey={indexMutationTrigger}
+            onEditIndex={isCommandBlocked(tab.connectionId, 'create_index') || isCommandBlocked(tab.connectionId, 'delete_index') ? undefined : (indexName, keys, unique, sparse, expireAfterSeconds, rebuildDrops) =>
               handleOpenIndexModalForEdit(
                 tab.connectionId,
                 tab.db,
@@ -4682,7 +4735,9 @@ function Workspace() {
                 indexName,
                 keys,
                 unique,
-                sparse
+                sparse,
+                expireAfterSeconds,
+                rebuildDrops
               )
             }
             onDeleteIndex={isCommandBlocked(tab.connectionId, 'delete_index') ? undefined : (indexName) =>
@@ -4705,8 +4760,8 @@ function Workspace() {
             onCreateIndex={isCommandBlocked(tab.connectionId, 'create_index') ? undefined : () =>
               handleOpenIndexModalForCreate(tab.connectionId, tab.db, tab.collection)
             }
-            onEditIndex={isCommandBlocked(tab.connectionId, 'create_index') || isCommandBlocked(tab.connectionId, 'delete_index') ? undefined : (indexName, keys, unique, sparse) =>
-              handleOpenIndexModalForEdit(tab.connectionId, tab.db, tab.collection, indexName, keys, unique, sparse)
+            onEditIndex={isCommandBlocked(tab.connectionId, 'create_index') || isCommandBlocked(tab.connectionId, 'delete_index') ? undefined : (indexName, keys, unique, sparse, expireAfterSeconds, rebuildDrops) =>
+              handleOpenIndexModalForEdit(tab.connectionId, tab.db, tab.collection, indexName, keys, unique, sparse, expireAfterSeconds, rebuildDrops)
             }
             onDeleteIndex={isCommandBlocked(tab.connectionId, 'delete_index') ? undefined : (indexName) =>
               handleDeleteIndex(tab.connectionId, tab.db, tab.collection, indexName)

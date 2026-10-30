@@ -154,7 +154,10 @@
     "loading": "正在加载索引…",
     "properties": {
       "default": "默认",
+      "hidden": "隐藏",
+      "partial": "部分",
       "sparse": "稀疏",
+      "ttl": "TTL {{duration}}（{{seconds}} 秒）",
       "unique": "唯一"
     },
     "statsUnavailable": "无法获取索引使用情况和大小：{{detail}}",

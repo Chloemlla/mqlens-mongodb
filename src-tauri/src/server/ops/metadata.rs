@@ -108,12 +108,21 @@ pub(crate) async fn list_indexes(
             // Written as local mode writes the driver's key document, straight
             // from the document so field order holds.
             let keys = ejson::doc_from_wire(&index.keys_json)?;
-            Ok(IndexInfo {
+            let info = IndexInfo {
                 name: index.name,
                 keys: serde_json::to_string(&keys).unwrap_or_else(|_| "{}".to_string()),
                 unique: index.unique,
                 sparse: index.sparse,
-            })
+                ..Default::default()
+            };
+            // The whole index document, from API version 5; empty before.
+            let spec = if index.spec_bson.is_empty() {
+                mongodb::bson::Document::new()
+            } else {
+                mongodb::bson::from_slice(&index.spec_bson)
+                    .map_err(|e| format!("MQLens Server sent an unreadable index {}: {e}", info.name))?
+            };
+            Ok(crate::db::metadata::with_spec_details(info, &spec))
         })
         .collect()
 }
@@ -215,5 +224,66 @@ mod tests {
         assert_eq!(indexes[1].name, "z_1_a_-1");
         assert!(indexes[1].unique && indexes[1].sparse);
         assert!(!indexes[0].unique && !indexes[0].sparse);
+    }
+
+    // The TTL, hidden flag and partial filter come from the index document the
+    // server sends whole; a server too old to send it lists without them.
+    #[tokio::test]
+    async fn index_details_read_from_the_index_document() {
+        use crate::server::pb::mqlens::v1::IndexInfo as PbIndexInfo;
+        let env = Env::new().await;
+        let spec = doc! {
+            "v": 2, "key": { "createdAt": 1 }, "name": "createdAt_1",
+            "expireAfterSeconds": 86400, "hidden": true,
+            "partialFilterExpression": { "archived": false },
+        };
+        env.fake.with(|s| {
+            s.indexes = vec![
+                PbIndexInfo {
+                    name: "createdAt_1".to_string(),
+                    keys_json: r#"{"createdAt":{"$numberInt":"1"}}"#.to_string(),
+                    spec_bson: mongodb::bson::to_vec(&spec).unwrap().into(),
+                    ..Default::default()
+                },
+                PbIndexInfo {
+                    name: "old_1".to_string(),
+                    keys_json: r#"{"old":{"$numberInt":"1"}}"#.to_string(),
+                    ..Default::default()
+                },
+            ]
+        });
+        let (state, id) = connected(&env).await;
+        let indexes = list_indexes_impl(&state, &id, "orders", "customers")
+            .await
+            .unwrap();
+
+        assert_eq!(indexes[0].expire_after_seconds, Some(86400));
+        assert!(indexes[0].hidden);
+        assert_eq!(
+            indexes[0].partial_filter_expression.as_deref(),
+            Some(r#"{"archived":false}"#)
+        );
+        assert_eq!(indexes[1].expire_after_seconds, None);
+        assert!(!indexes[1].hidden);
+    }
+
+    // An index document that cannot be read is an error, not an index without
+    // a TTL: an edit would otherwise rebuild it without one.
+    #[tokio::test]
+    async fn an_unreadable_index_document_is_an_error() {
+        use crate::server::pb::mqlens::v1::IndexInfo as PbIndexInfo;
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.indexes = vec![PbIndexInfo {
+                name: "createdAt_1".to_string(),
+                keys_json: r#"{"createdAt":{"$numberInt":"1"}}"#.to_string(),
+                spec_bson: vec![1, 2, 3].into(),
+                ..Default::default()
+            }]
+        });
+        let (state, id) = connected(&env).await;
+        assert!(list_indexes_impl(&state, &id, "orders", "customers")
+            .await
+            .is_err());
     }
 }

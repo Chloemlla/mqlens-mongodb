@@ -170,6 +170,7 @@ export function registerServerModeHandlers(backend: Backend, state: E2EState): v
           serverUrl: found.url,
           remoteId: remote.id,
           opClasses,
+          apiVersion: remote.apiVersion ?? 9,
           blockedCommands: remote.blockedCommands ?? [],
           roleBlockedCommands: remote.roleBlockedCommands ?? [],
         },

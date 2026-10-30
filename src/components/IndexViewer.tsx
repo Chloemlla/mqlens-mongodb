@@ -21,7 +21,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
-import { formatBytes } from '@/lib/format';
+import { formatBytes, formatDuration } from '@/lib/format';
 import type { IndexInfo } from './Sidebar';
 import type { IndexStatUi } from './StatsCards';
 import { useTranslation } from 'react-i18next';
@@ -31,7 +31,17 @@ interface IndexViewerProps {
   databaseName: string;
   collectionName: string;
   indexName: string;
-  onEditIndex?: (indexName: string, keys: Record<string, number>, unique: boolean, sparse: boolean) => void;
+  /** Bumped after an index is changed in place. */
+  refreshKey?: number;
+  onEditIndex?: (
+    indexName: string,
+    keys: Record<string, number>,
+    unique: boolean,
+    sparse: boolean,
+    expireAfterSeconds?: number,
+    // A partial filter or hidden flag, which a rebuild would drop.
+    rebuildDrops?: boolean
+  ) => void;
   onDeleteIndex?: (indexName: string) => void;
 }
 
@@ -40,10 +50,11 @@ export const IndexViewer: React.FC<IndexViewerProps> = ({
   databaseName,
   collectionName,
   indexName,
+  refreshKey,
   onEditIndex,
   onDeleteIndex,
 }) => {
-  const { t } = useTranslation('admin');
+  const { t, i18n } = useTranslation('admin');
   const [copied, setCopied] = useState(false);
   const [info, setInfo] = useState<IndexInfo | null>(null);
   const [loading, setLoading] = useState(true);
@@ -96,7 +107,7 @@ export const IndexViewer: React.FC<IndexViewerProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [connectionId, databaseName, collectionName, indexName, t]);
+  }, [connectionId, databaseName, collectionName, indexName, refreshKey, t]);
 
   const statEntry = useMemo(() => stats?.find((s) => s.name === indexName) ?? null, [stats, indexName]);
 
@@ -124,6 +135,16 @@ export const IndexViewer: React.FC<IndexViewerProps> = ({
           fields: Object.keys(keyPattern).join(', ') || t('indexViewer.labels.unknownFields'),
         });
 
+    const expireAfterSeconds = info?.expireAfterSeconds;
+    const hidden = info?.hidden ?? false;
+    const partialFilter = info?.partialFilterExpression;
+    let partialFilterExpression: unknown;
+    try {
+      partialFilterExpression = partialFilter === undefined ? undefined : JSON.parse(partialFilter);
+    } catch {
+      partialFilterExpression = partialFilter;
+    }
+
     const rawJson = JSON.stringify(
       {
         v: 2,
@@ -132,12 +153,15 @@ export const IndexViewer: React.FC<IndexViewerProps> = ({
         ns: `${databaseName}.${collectionName}`,
         unique: unique ? true : undefined,
         sparse: sparse ? true : undefined,
+        expireAfterSeconds,
+        hidden: hidden ? true : undefined,
+        partialFilterExpression,
       },
       null,
       2
     );
 
-    return { keyPattern, type, unique, sparse, fieldCount, description, rawJson };
+    return { keyPattern, type, unique, sparse, expireAfterSeconds, hidden, partialFilter, fieldCount, description, rawJson };
   }, [info, indexName, databaseName, collectionName, t]);
 
   const editableKeyPattern = useMemo(() => {
@@ -238,7 +262,16 @@ export const IndexViewer: React.FC<IndexViewerProps> = ({
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() => onEditIndex(indexName, editableKeyPattern, indexSpecs.unique, indexSpecs.sparse)}
+                  onClick={() =>
+                    onEditIndex(
+                      indexName,
+                      editableKeyPattern,
+                      indexSpecs.unique,
+                      indexSpecs.sparse,
+                      indexSpecs.expireAfterSeconds,
+                      indexSpecs.hidden || indexSpecs.partialFilter !== undefined
+                    )
+                  }
                   title={t('indexViewer.actions.editIndex')}
                   data-testid="edit-index-btn"
                 >
@@ -392,6 +425,33 @@ export const IndexViewer: React.FC<IndexViewerProps> = ({
                   <Badge variant="outline">{t('indexViewer.properties.nonSparseBadge')}</Badge>
                 )}
               </div>
+              <div className="flex items-center justify-between gap-4 text-xs">
+                <span className="text-muted-foreground">{t('indexViewer.properties.ttl')}</span>
+                {indexSpecs.expireAfterSeconds !== undefined ? (
+                  <Badge variant="warning" data-testid="index-ttl">
+                    {t('sidebar:indexesView.properties.ttl', {
+                      duration: formatDuration(indexSpecs.expireAfterSeconds, i18n.language),
+                      seconds: indexSpecs.expireAfterSeconds,
+                    })}
+                  </Badge>
+                ) : (
+                  <Badge variant="outline" data-testid="index-ttl">{t('indexViewer.properties.noTtl')}</Badge>
+                )}
+              </div>
+              {indexSpecs.hidden && (
+                <div className="flex items-center justify-between gap-4 text-xs">
+                  <span className="text-muted-foreground">{t('indexViewer.properties.visibility')}</span>
+                  <Badge variant="secondary" data-testid="index-hidden">{t('indexViewer.properties.hiddenBadge')}</Badge>
+                </div>
+              )}
+              {indexSpecs.partialFilter !== undefined && (
+                <div className="flex items-center justify-between gap-4 text-xs">
+                  <span className="text-muted-foreground">{t('indexViewer.properties.partialFilter')}</span>
+                  <span className="select-text break-all font-mono text-foreground" data-testid="index-partial-filter">
+                    {indexSpecs.partialFilter}
+                  </span>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-4 text-xs">
                 <span className="text-muted-foreground">{t('indexViewer.properties.operationalStatus')}</span>
                 <Badge variant="success">{t('indexViewer.properties.active')}</Badge>

@@ -200,7 +200,7 @@ mod tests {
     /// row to `non_destructive_cases` below AND bump this constant — kept as
     /// a paired assertion so a forgotten row fails the test loudly instead of
     /// silently shrinking coverage.
-    const NON_DESTRUCTIVE_GUARDED_COUNT: usize = 21;
+    const NON_DESTRUCTIVE_GUARDED_COUNT: usize = 22;
 
     /// Register a mock connection (`state.mocks`) with the given mode
     /// (`state.connection_meta`), mirroring the `mock_state` helper used
@@ -283,8 +283,14 @@ mod tests {
             (
                 "create_index_impl",
                 Box::pin(async move {
-                    metadata::create_index_impl(state, "ro", "db", "coll", "idx", "{}", false, false)
+                    metadata::create_index_impl(state, "ro", "db", "coll", "idx", "{}", false, false, None)
                         .await
+                }),
+            ),
+            (
+                "set_index_expiry_impl",
+                Box::pin(async move {
+                    metadata::set_index_expiry_impl(state, "ro", "db", "coll", "idx", 60).await
                 }),
             ),
             (

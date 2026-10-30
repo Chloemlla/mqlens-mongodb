@@ -192,6 +192,28 @@ pub(crate) struct NewIndex<'a> {
     pub keys: &'a Document,
     pub unique: bool,
     pub sparse: bool,
+    pub expire_after_seconds: Option<i64>,
+}
+
+/// API version 5 takes an index as its whole document, the only way to send a
+/// TTL.
+const INDEX_SPEC_SINCE: u32 = 5;
+
+/// The index document for an index with a TTL, which only it can carry.
+fn ttl_spec(index: &NewIndex<'_>) -> Result<Vec<u8>, String> {
+    let Some(seconds) = index.expire_after_seconds else {
+        return Ok(Vec::new());
+    };
+    let mut spec = mongodb::bson::doc! { "key": index.keys.clone(), "name": index.name };
+    if index.unique {
+        spec.insert("unique", true);
+    }
+    if index.sparse {
+        spec.insert("sparse", true);
+    }
+    // Checked to fit before this.
+    spec.insert("expireAfterSeconds", seconds as i32);
+    mongodb::bson::to_vec(&spec).map_err(|e| e.to_string())
 }
 
 pub(crate) async fn create_index(
@@ -202,6 +224,13 @@ pub(crate) async fn create_index(
     index: NewIndex<'_>,
 ) -> Result<(), String> {
     routes::require("create_index", conn)?;
+    if index.expire_after_seconds.is_some() && conn.api_version < INDEX_SPEC_SINCE {
+        return Err(format!(
+            "A TTL index needs MQLens API version {INDEX_SPEC_SINCE}, and this MQLens Server speaks {}. Update MQLens Server.",
+            conn.api_version
+        ));
+    }
+    let spec_bson = ttl_spec(&index)?.into();
     let request = CreateIndexRequest {
         connection_id: conn.remote_id.clone(),
         database: database.to_string(),
@@ -210,7 +239,7 @@ pub(crate) async fn create_index(
         unique: index.unique,
         sparse: index.sparse,
         name: index.name.to_string(),
-        spec_bson: Default::default(),
+        spec_bson,
     };
     session_for(state, conn)
         .await?
@@ -470,6 +499,7 @@ mod tests {
             r#"{"email": 1}"#,
             true,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -552,10 +582,103 @@ mod tests {
             r#"{"n": 1}"#,
             false,
             false,
+            None,
         )
         .await
         .unwrap_err();
         assert!(err.contains("does not allow ddl operations"), "{err}");
+        assert!(writes(&env).is_empty());
+    }
+
+    // A TTL lives only in the index document, which the server takes from
+    // API version 5.
+    #[tokio::test]
+    async fn a_ttl_index_is_sent_as_an_index_document() {
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.max_api_version = 5;
+            s.connections[0].op_classes.push("ddl".to_string());
+        });
+        let (state, id) = connected(&env).await;
+
+        create_index_impl(
+            &state, &id, "orders", "events", "createdAt_1", r#"{"createdAt": 1}"#, true, false,
+            Some(86400),
+        )
+        .await
+        .unwrap();
+
+        match writes(&env).as_slice() {
+            [FakeWrite::CreateIndex(c)] => {
+                let spec: mongodb::bson::Document = mongodb::bson::from_slice(&c.spec_bson).unwrap();
+                assert_eq!(
+                    spec,
+                    doc! {
+                        "key": { "createdAt": 1_i64 }, "name": "createdAt_1", "unique": true,
+                        "expireAfterSeconds": 86400_i32,
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ttl_index_needs_api_version_5() {
+        let env = Env::new().await;
+        env.fake
+            .with(|s| s.connections[0].op_classes.push("ddl".to_string()));
+        let (state, id) = connected(&env).await;
+
+        let err = create_index_impl(
+            &state, &id, "orders", "events", "createdAt_1", r#"{"createdAt": 1}"#, false, false,
+            Some(60),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("needs MQLens API version 5"), "{err}");
+        assert!(writes(&env).is_empty());
+    }
+
+    // The server runs the collMod from API version 9.
+    #[tokio::test]
+    async fn an_expiry_change_is_sent_to_the_server() {
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.max_api_version = 9;
+            s.connections[0].op_classes.push("ddl".to_string());
+        });
+        let (state, id) = connected(&env).await;
+
+        crate::db::metadata::set_index_expiry_impl(&state, &id, "orders", "events", "createdAt_1", 86400)
+            .await
+            .unwrap();
+
+        match writes(&env).as_slice() {
+            [FakeWrite::SetIndexExpiry(r)] => {
+                assert_eq!(
+                    (r.database.as_str(), r.collection.as_str(), r.index_name.as_str()),
+                    ("orders", "events", "createdAt_1")
+                );
+                assert_eq!(r.expire_after_seconds, 86400);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expiry_change_needs_api_version_9() {
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.max_api_version = 8;
+            s.connections[0].op_classes.push("ddl".to_string());
+        });
+        let (state, id) = connected(&env).await;
+
+        let err = crate::db::metadata::set_index_expiry_impl(&state, &id, "orders", "events", "createdAt_1", 60)
+            .await
+            .unwrap_err();
+        assert!(err.contains("needs MQLens API version 9"), "{err}");
         assert!(writes(&env).is_empty());
     }
 }

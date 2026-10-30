@@ -571,6 +571,114 @@ describe('App Component', () => {
     });
   });
 
+  // Rebuilding would drop the partial filter, and a TTL index without its
+  // filter expires every document, not just the ones it matched.
+  it('refuses to rebuild an index whose partial filter or hidden flag it cannot keep', async () => {
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'execute_mql_query') return Promise.resolve([JSON.stringify({ _id: '1', name: 'John Doe' })]);
+      if (cmd === 'list_indexes') {
+        return Promise.resolve([
+          { name: 'email_1', keys: '{"city":1}', unique: false, sparse: false, expireAfterSeconds: 3600, partialFilterExpression: '{"archived":true}' },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    const { fireEvent } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId('mock-sidebar');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    fireEvent.click(screen.getByTestId('select-index-btn'));
+    fireEvent.click(await screen.findByTestId('edit-index-btn'));
+    fireEvent.click(screen.getByTestId('unique-checkbox'));
+    fireEvent.click(screen.getByTestId('save-index-btn'));
+
+    expect(await screen.findByText(/partial filter or is hidden/)).toBeInTheDocument();
+    expect(calls.some((c) => c.cmd === 'delete_index' || c.cmd === 'create_index')).toBe(false);
+  });
+
+  // The server would refuse the TTL only after the old index was dropped.
+  it('refuses a TTL a server below API version 5 cannot create, before dropping anything', async () => {
+    const server = {
+      accountId: 'a1', accountName: 'Work', serverUrl: 'https://s', remoteId: 'c1', opClasses: ['read', 'ddl'],
+      apiVersion: 4, blockedCommands: ['set_index_expiry'], roleBlockedCommands: [],
+    };
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'connection_list') return Promise.resolve([{ id: 'conn-1', profileId: 'server:a1:c1', name: 'Orders', viaMcp: false, server }]);
+      if (cmd === 'execute_mql_query') return Promise.resolve([JSON.stringify({ _id: '1', name: 'John Doe' })]);
+      if (cmd === 'list_indexes') return Promise.resolve([{ name: 'email_1', keys: '{"city":1}', unique: false, sparse: false }]);
+      return Promise.resolve([]);
+    });
+    const { fireEvent } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId('sidebar-conn-conn-1');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    fireEvent.click(screen.getByTestId('select-index-btn'));
+    fireEvent.click(await screen.findByTestId('edit-index-btn'));
+    fireEvent.click(screen.getByTestId('ttl-checkbox'));
+    fireEvent.change(screen.getByTestId('ttl-seconds-input'), { target: { value: '60' } });
+    fireEvent.click(screen.getByTestId('save-index-btn'));
+
+    expect(await screen.findByText(/needs MQLens API version 5, and this MQLens Server speaks 4/)).toBeInTheDocument();
+    expect(calls.some((c) => c.cmd === 'delete_index' || c.cmd === 'create_index')).toBe(false);
+  });
+
+  const editTtlExpiry = async (server?: object) => {
+    const calls: any[] = [];
+    mockInvoke.mockImplementation((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'connection_list' && server) {
+        return Promise.resolve([{ id: 'conn-1', profileId: 'server:a1:c1', name: 'Orders', viaMcp: false, server }]);
+      }
+      if (cmd === 'execute_mql_query') return Promise.resolve([JSON.stringify({ _id: '1', name: 'John Doe' })]);
+      if (cmd === 'list_indexes') {
+        return Promise.resolve([{ name: 'email_1', keys: '{"city":1}', unique: false, sparse: false, expireAfterSeconds: 3600 }]);
+      }
+      return Promise.resolve([]);
+    });
+    const { fireEvent } = await import('@testing-library/react');
+    renderWithProviders(<App />);
+    await screen.findByTestId(server ? 'sidebar-conn-conn-1' : 'mock-sidebar');
+    fireEvent.click(screen.getByTestId('select-collection-btn'));
+    fireEvent.click(screen.getByTestId('select-index-btn'));
+    fireEvent.click(await screen.findByTestId('edit-index-btn'));
+    fireEvent.change(screen.getByTestId('ttl-seconds-input'), { target: { value: '7200' } });
+    fireEvent.click(screen.getByTestId('save-index-btn'));
+    return calls;
+  };
+
+  it('changes only the expiry of a TTL index in place, without rebuilding it', async () => {
+    const { waitFor } = await import('@testing-library/react');
+    const calls = await editTtlExpiry();
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('set_index_expiry', {
+        id: 'conn-1',
+        database: 'sales_db',
+        collection: 'customers',
+        indexName: 'email_1',
+        expireAfterSeconds: 7200,
+      })
+    );
+    await waitFor(() => expect(screen.queryByTestId('index-modal')).not.toBeInTheDocument());
+    expect(calls.some((c) => c.cmd === 'delete_index' || c.cmd === 'create_index')).toBe(false);
+  });
+
+  it('rebuilds a TTL index with its new expiry where the connection cannot change it in place', async () => {
+    const { waitFor } = await import('@testing-library/react');
+    const calls = await editTtlExpiry({
+      accountId: 'a1', accountName: 'Work', serverUrl: 'https://s', remoteId: 'c1', opClasses: ['read', 'ddl'],
+      blockedCommands: ['set_index_expiry'],
+    });
+    await waitFor(() => {
+      const create = calls.find((c) => c.cmd === 'create_index');
+      expect(create?.args).toMatchObject({ indexName: 'email_1', keys: '{"city":1}', expireAfterSeconds: 7200 });
+    });
+    expect(calls.some((c) => c.cmd === 'set_index_expiry')).toBe(false);
+  });
+
   it('handles create_index and delete_index flows', async () => {
     mockInvoke.mockImplementation((cmd) => {
       if (cmd === 'create_index') {

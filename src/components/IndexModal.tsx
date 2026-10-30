@@ -38,7 +38,8 @@ const sortFieldNames = (fields: Iterable<string>): string[] =>
 interface IndexModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (indexName: string, keys: string, unique: boolean, sparse: boolean) => void;
+  // `expireAfterSeconds` is null for an index without a TTL.
+  onSave: (indexName: string, keys: string, unique: boolean, sparse: boolean, expireAfterSeconds: number | null) => void;
   availableFields?: string[];
   connectionId?: string;
   databaseName?: string;
@@ -48,6 +49,7 @@ interface IndexModalProps {
     keys: Record<string, number>;
     unique: boolean;
     sparse: boolean;
+    expireAfterSeconds?: number;
   } | null;
   // Pre-fills the create-mode form (e.g. from a COLLSCAN index suggestion).
   // Ignored when initialData is set (edit mode) — unique/sparse always start false.
@@ -69,6 +71,9 @@ const defaultIndexName = (json: string): string => {
     return '';
   }
 };
+
+// MongoDB keeps a TTL as a 32-bit integer.
+const TTL_MAX = 2147483647;
 
 const textareaClassName = cn(
   'flex min-h-[100px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm transition-colors',
@@ -92,6 +97,8 @@ export const IndexModal: React.FC<IndexModalProps> = ({
   const [isRawMode, setIsRawMode] = useState(false);
   const [unique, setUnique] = useState(false);
   const [sparse, setSparse] = useState(false);
+  const [ttl, setTtl] = useState(false);
+  const [ttlSeconds, setTtlSeconds] = useState('');
   const [keysList, setKeysList] = useState<IndexKeyRule[]>([newKeyRule()]);
   const [rawKeysJson, setRawKeysJson] = useState('{\n  "_id": 1\n}');
   const [jsonError, setJsonError] = useState<string | null>(null);
@@ -124,6 +131,8 @@ export const IndexModal: React.FC<IndexModalProps> = ({
         setIndexName(initialData.name);
         setUnique(initialData.unique);
         setSparse(initialData.sparse);
+        setTtl(initialData.expireAfterSeconds !== undefined);
+        setTtlSeconds(initialData.expireAfterSeconds !== undefined ? String(initialData.expireAfterSeconds) : '');
         const list: IndexKeyRule[] = Object.entries(initialData.keys).map(([field, dir]) =>
           newKeyRule(field, dir === -1 ? -1 : 1)
         );
@@ -133,6 +142,8 @@ export const IndexModal: React.FC<IndexModalProps> = ({
         setIndexName(prefill.name);
         setUnique(false);
         setSparse(false);
+        setTtl(false);
+        setTtlSeconds('');
         const list: IndexKeyRule[] = Object.entries(prefill.keys).map(([field, dir]) =>
           newKeyRule(field, dir === -1 ? -1 : 1)
         );
@@ -142,6 +153,8 @@ export const IndexModal: React.FC<IndexModalProps> = ({
         setIndexName('');
         setUnique(false);
         setSparse(false);
+        setTtl(false);
+        setTtlSeconds('');
         setKeysList([newKeyRule()]);
         setRawKeysJson('{\n  "_id": 1\n}');
       }
@@ -237,7 +250,27 @@ export const IndexModal: React.FC<IndexModalProps> = ({
       return;
     }
 
-    onSave(trimmedName, keysJsonStr, unique, sparse);
+    // MongoDB's rules for a TTL index; the backend checks them again.
+    let expireAfterSeconds: number | null = null;
+    if (ttl) {
+      const fields = Object.keys(JSON.parse(keysJsonStr));
+      if (fields.length !== 1) {
+        setJsonError(t('indexModal.errors.ttlSingleField'));
+        return;
+      }
+      if (fields[0] === '_id') {
+        setJsonError(t('indexModal.errors.ttlNotId'));
+        return;
+      }
+      const seconds = ttlSeconds.trim();
+      if (!/^\d+$/.test(seconds) || Number(seconds) > TTL_MAX) {
+        setJsonError(t('indexModal.errors.ttlRange'));
+        return;
+      }
+      expireAfterSeconds = Number(seconds);
+    }
+
+    onSave(trimmedName, keysJsonStr, unique, sparse, expireAfterSeconds);
   };
 
   const switchToBuilder = () => {
@@ -451,6 +484,31 @@ export const IndexModal: React.FC<IndexModalProps> = ({
                   <span>{t('indexModal.constraintLabels.sparse')}</span>
                   <span className="text-muted-foreground">{t('indexModal.constraintLabels.sparseHint')}</span>
                 </label>
+                <div className="flex items-center gap-2 text-xs text-foreground">
+                  <label className="flex cursor-pointer items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={ttl}
+                      onChange={() => setTtl((v) => !v)}
+                      data-testid="ttl-checkbox"
+                      className="rounded border-input"
+                    />
+                    <span>{t('indexModal.constraintLabels.ttl')}</span>
+                  </label>
+                  {/* No min/max/step: the browser's own validation would block
+                      the submit before the app could say what is wrong. */}
+                  <Input
+                    type="number"
+                    inputMode="numeric"
+                    value={ttlSeconds}
+                    onChange={(e) => setTtlSeconds(e.target.value)}
+                    disabled={!ttl}
+                    aria-label={t('indexModal.constraintLabels.ttlSeconds')}
+                    className="h-7 w-28 text-xs"
+                    data-testid="ttl-seconds-input"
+                  />
+                  <span className="text-muted-foreground">{t('indexModal.constraintLabels.ttlUnit')}</span>
+                </div>
               </div>
             </div>
           </div>
