@@ -3267,6 +3267,43 @@ mod tests {
         assert!(crate::read_capped_mongosh_output(none).await.is_empty());
     }
 
+    #[tokio::test]
+    async fn a_one_shot_script_runs_mongosh_with_colours_off() {
+        // mongosh colours a SyntaxError's code frame even when stderr is a
+        // pipe (seen with 2.9.2 on Windows), so the console showed raw
+        // `ESC[90m` escapes. `NO_COLOR` turns that off at the source.
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let fake = {
+            let p = dir.path().join("mongosh.cmd");
+            std::fs::write(&p, "@echo NO_COLOR=%NO_COLOR%\r\n").unwrap();
+            p
+        };
+        #[cfg(not(windows))]
+        let fake = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.path().join("mongosh");
+            std::fs::write(&p, "#!/bin/sh\necho \"NO_COLOR=$NO_COLOR\"\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let state = AppState::new();
+        let id = "one-shot-no-color";
+        state.mocks.lock().unwrap().insert(id.to_string(), false);
+
+        let out = crate::run_mongosh_script_impl(
+            &state,
+            id,
+            "mongodb://localhost:27017",
+            "test",
+            fake.to_str().unwrap(),
+            "print(1)",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("fake mongosh should run: {e}"));
+        assert_eq!(out.stdout, vec!["NO_COLOR=1".to_string()]);
+    }
+
     #[test]
     fn a_one_shot_script_resolves_a_managed_mongosh_like_the_session_does() {
         // An app-managed mongosh is not necessarily on PATH. Falling back to

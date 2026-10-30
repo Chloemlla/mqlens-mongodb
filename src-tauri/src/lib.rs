@@ -1385,6 +1385,9 @@ pub async fn run_mongosh_script_impl(
     let started = std::time::Instant::now();
     let mut command = TokioCommand::new(&executable);
     command.args(uri_args);
+    // mongosh colours a SyntaxError's code frame even into a pipe (seen with
+    // 2.9.2 on Windows), and the console would show the raw escapes.
+    command.env("NO_COLOR", "1");
     // `use <db>` only when the name is a plain one — a control character could
     // not appear in a real database name and must never reach the argument.
     let db = database.trim();
