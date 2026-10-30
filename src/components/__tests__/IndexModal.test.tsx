@@ -189,7 +189,8 @@ describe('IndexModal Component', () => {
       'custom_raw',
       '{"email":1,"age":-1}',
       false,
-      false
+      false,
+      null
     );
   });
 
@@ -265,7 +266,75 @@ describe('IndexModal Component', () => {
       'name_asc',
       '{"name":1}',
       true,
-      false
+      false,
+      null
     );
+  });
+
+  describe('TTL', () => {
+    const renderCreate = (onSave = vi.fn()) => {
+      render(
+        <IndexModal isOpen={true} onClose={() => {}} onSave={onSave} availableFields={['_id', 'createdAt', 'status']} />
+      );
+      return onSave;
+    };
+    const enableTtl = (seconds: string) => {
+      fireEvent.click(screen.getByTestId('ttl-checkbox'));
+      fireEvent.change(screen.getByTestId('ttl-seconds-input'), { target: { value: seconds } });
+    };
+
+    it('is off by default and saves no expiry', () => {
+      const onSave = renderCreate();
+      expect((screen.getByTestId('ttl-checkbox') as HTMLInputElement).checked).toBe(false);
+      expect(screen.getByTestId('ttl-seconds-input')).toBeDisabled();
+      fireEvent.change(screen.getByTestId('index-key-field-0'), { target: { value: 'createdAt' } });
+      fireEvent.click(screen.getByTestId('save-index-btn'));
+      expect(onSave).toHaveBeenCalledWith('createdAt_1', '{"createdAt":1}', false, false, null);
+    });
+
+    it('saves the expiry of a single-field index', () => {
+      const onSave = renderCreate();
+      fireEvent.change(screen.getByTestId('index-key-field-0'), { target: { value: 'createdAt' } });
+      enableTtl('86400');
+      fireEvent.click(screen.getByTestId('save-index-btn'));
+      expect(onSave).toHaveBeenCalledWith('createdAt_1', '{"createdAt":1}', false, false, 86400);
+    });
+
+    it('refuses a compound index, _id, and an expiry out of range', () => {
+      const onSave = renderCreate();
+      enableTtl('60');
+      fireEvent.click(screen.getByTestId('save-index-btn'));
+      expect(screen.getByText('A TTL index cannot be on _id')).toBeInTheDocument();
+
+      fireEvent.change(screen.getByTestId('index-key-field-0'), { target: { value: 'createdAt' } });
+      fireEvent.click(screen.getByText('Add Index Key'));
+      fireEvent.click(screen.getByTestId('save-index-btn'));
+      expect(screen.getByText('A TTL index must have exactly one key field')).toBeInTheDocument();
+      fireEvent.click(screen.getAllByTitle('Remove Key')[1]);
+
+      for (const bad of ['-1', '1.5', '2147483648', '']) {
+        fireEvent.change(screen.getByTestId('ttl-seconds-input'), { target: { value: bad } });
+        fireEvent.click(screen.getByTestId('save-index-btn'));
+        expect(screen.getByText('Expire after seconds must be a whole number from 0 to 2147483647')).toBeInTheDocument();
+      }
+      expect(onSave).not.toHaveBeenCalled();
+
+      fireEvent.change(screen.getByTestId('ttl-seconds-input'), { target: { value: '2147483647' } });
+      fireEvent.click(screen.getByTestId('save-index-btn'));
+      expect(onSave).toHaveBeenCalledWith('createdAt_1', '{"createdAt":1}', false, false, 2147483647);
+    });
+
+    it('starts from the expiry of the index it edits', () => {
+      render(
+        <IndexModal
+          isOpen={true}
+          onClose={() => {}}
+          onSave={() => {}}
+          initialData={{ name: 'createdAt_1', keys: { createdAt: 1 }, unique: false, sparse: false, expireAfterSeconds: 3600 }}
+        />
+      );
+      expect((screen.getByTestId('ttl-checkbox') as HTMLInputElement).checked).toBe(true);
+      expect(screen.getByTestId('ttl-seconds-input')).toHaveValue(3600);
+    });
   });
 });

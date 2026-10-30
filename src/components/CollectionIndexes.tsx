@@ -5,7 +5,7 @@ import { AlertTriangle, ArrowDown, ArrowUp, Edit, KeyRound, Loader2, Plus, Trash
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { formatBytes } from '@/lib/format';
+import { formatBytes, formatDuration } from '@/lib/format';
 import type { IndexInfo } from './Sidebar';
 import type { IndexStatUi } from './StatsCards';
 
@@ -17,7 +17,15 @@ interface CollectionIndexesProps {
   refreshKey?: number;
   onOpenIndex: (indexName: string) => void;
   onCreateIndex?: () => void;
-  onEditIndex?: (indexName: string, keys: Record<string, number>, unique: boolean, sparse: boolean) => void;
+  onEditIndex?: (
+    indexName: string,
+    keys: Record<string, number>,
+    unique: boolean,
+    sparse: boolean,
+    expireAfterSeconds?: number,
+    // A partial filter or hidden flag, which a rebuild would drop.
+    rebuildDrops?: boolean
+  ) => void;
   onDeleteIndex?: (indexName: string) => void;
 }
 
@@ -248,6 +256,20 @@ export const CollectionIndexes: React.FC<CollectionIndexesProps> = ({
                       {isId && <Badge variant="secondary" className="text-[9px]">{t('indexesView.properties.default')}</Badge>}
                       {info.unique && <Badge variant="success" className="text-[9px]">{t('indexesView.properties.unique')}</Badge>}
                       {info.sparse && <Badge variant="secondary" className="text-[9px]">{t('indexesView.properties.sparse')}</Badge>}
+                      {info.expireAfterSeconds !== undefined && (
+                        <Badge variant="warning" className="text-[9px]">
+                          {t('indexesView.properties.ttl', {
+                            duration: formatDuration(info.expireAfterSeconds, i18n.language),
+                            seconds: info.expireAfterSeconds,
+                          })}
+                        </Badge>
+                      )}
+                      {info.hidden && <Badge variant="outline" className="text-[9px]">{t('indexesView.properties.hidden')}</Badge>}
+                      {info.partialFilterExpression !== undefined && (
+                        <Badge variant="outline" className="text-[9px]" title={info.partialFilterExpression}>
+                          {t('indexesView.properties.partial')}
+                        </Badge>
+                      )}
                     </div>
                   </td>
                   <td className="px-4 py-1.5">
@@ -269,7 +291,9 @@ export const CollectionIndexes: React.FC<CollectionIndexesProps> = ({
                                   Object.entries(keys).map(([f, d]) => [f, Number(d)])
                                 ),
                                 info.unique,
-                                info.sparse
+                                info.sparse,
+                                info.expireAfterSeconds,
+                                Boolean(info.hidden) || info.partialFilterExpression !== undefined
                               )
                             }
                           >

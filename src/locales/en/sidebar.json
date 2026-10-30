@@ -154,7 +154,10 @@
     "loading": "Loading indexes…",
     "properties": {
       "default": "DEFAULT",
+      "hidden": "HIDDEN",
+      "partial": "PARTIAL",
       "sparse": "SPARSE",
+      "ttl": "TTL {{duration}} ({{seconds}} s)",
       "unique": "UNIQUE"
     },
     "statsUnavailable": "Index usage and size are unavailable: {{detail}}",

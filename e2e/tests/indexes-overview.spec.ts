@@ -92,6 +92,52 @@ test.describe('Indexes view', () => {
     expect((await rowNames(page)).slice(0, 3)).toEqual(['loc_2dsphere', '_id_', 'bio_text']);
   });
 
+  test('shows a TTL, a hidden index and a partial filter, in the table and the viewer', async ({ page }) => {
+    await page.evaluate(() => {
+      window.__MQLENS_E2E__!.register({
+        list_indexes: () => [
+          { name: '_id_', keys: '{"_id":1}', unique: true, sparse: false },
+          { name: 'joined_1', keys: '{"joined":1}', unique: false, sparse: false, expireAfterSeconds: 5400 },
+          {
+            name: 'tier_1', keys: '{"tier":1}', unique: false, sparse: false,
+            hidden: true, partialFilterExpression: '{"tier":{"$exists":true}}',
+          },
+        ],
+      });
+    });
+    await openOverview(page);
+
+    await expect(row(page, 'joined_1')).toContainText('TTL 90 minutes (5400 s)');
+    await expect(row(page, 'tier_1')).toContainText('HIDDEN');
+    await expect(row(page, 'tier_1')).toContainText('PARTIAL');
+    await expect(row(page, 'tier_1')).not.toContainText('TTL');
+
+    await row(page, 'tier_1').click();
+    const viewer = view(page).getByTestId('index-viewer');
+    await expect(viewer.getByTestId('index-ttl')).toHaveText('None');
+    await expect(viewer.getByTestId('index-hidden')).toHaveText('Hidden from queries');
+    await expect(viewer.getByTestId('index-partial-filter')).toHaveText('{"tier":{"$exists":true}}');
+    await expect(viewer).toContainText('"partialFilterExpression"');
+  });
+
+  test('will not rebuild an index whose partial filter the edit would drop', async ({ app, page }) => {
+    await page.evaluate(() => {
+      window.__MQLENS_E2E__!.register({
+        list_indexes: () => [
+          { name: 'tier_1', keys: '{"tier":1}', unique: false, sparse: false, partialFilterExpression: '{"tier":"Premium"}' },
+        ],
+      });
+    });
+    await openOverview(page);
+    await overview(page).getByTestId('edit-index-tier_1').click();
+    const modal = page.getByTestId('index-modal');
+    await modal.getByTestId('unique-checkbox').check();
+    await modal.getByTestId('save-index-btn').click();
+
+    await expect(page.getByTestId('dialog-toast').filter({ hasText: 'has a partial filter or is hidden' })).toBeVisible();
+    expect(await app.calls('delete_index')).toHaveLength(0);
+  });
+
   test('says when a collection has no indexes', async ({ page }) => {
     await page.evaluate(() => {
       window.__MQLENS_E2E__!.register({ list_indexes: () => [] });
@@ -148,8 +194,8 @@ test.describe('Indexes view on an MQLens Server connection', () => {
     connections: [ORDERS],
   };
 
-  async function connectOrders(app: App, page: Page): Promise<void> {
-    await app.open({ servers: { [STAGING_URI]: SAMPLE_SERVER }, serverAccounts: [WORK] });
+  async function connectOrders(app: App, page: Page, account: ServerAccountSeed = WORK): Promise<void> {
+    await app.open({ servers: { [STAGING_URI]: SAMPLE_SERVER }, serverAccounts: [account] });
     await page.getByRole('button', { name: 'Manage Connections', exact: true }).click();
     await page.getByRole('button', { name: 'MQLens Server', exact: true }).click();
     await page.getByRole('button', { name: 'Connect to Orders', exact: true }).click();
@@ -161,6 +207,23 @@ test.describe('Indexes view on an MQLens Server connection', () => {
     await openOverview(page);
     await expect(row(page, 'email_1')).toContainText('email ↑');
     await expect(row(page, 'email_1')).toContainText('4 KB');
+  });
+
+  // The server would refuse the TTL only after the old index had been dropped.
+  test('refuses a TTL a server below API version 5 cannot create, before dropping anything', async ({ app, page }) => {
+    const old = { ...ORDERS, apiVersion: 4, blockedCommands: ['set_index_expiry'] };
+    await connectOrders(app, page, { ...WORK, connections: [old] });
+    await openOverview(page);
+    await overview(page).getByTestId('edit-index-tier_1').click();
+    const modal = page.getByTestId('index-modal');
+    await modal.getByTestId('ttl-checkbox').check();
+    await modal.getByTestId('ttl-seconds-input').fill('60');
+    await modal.getByTestId('save-index-btn').click();
+
+    await expect(
+      page.getByTestId('dialog-toast').filter({ hasText: 'needs MQLens API version 5, and this MQLens Server speaks 4' })
+    ).toBeVisible();
+    expect(await app.calls('delete_index')).toHaveLength(0);
   });
 
   test('shows the server refusing to list them', async ({ app, page }) => {

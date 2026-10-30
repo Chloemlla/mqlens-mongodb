@@ -604,6 +604,20 @@ pub struct RenameDatabaseResult {
     #[prost(int64, tag="2")]
     pub documents: i64,
 }
+/// expire_after_seconds is 0 to 2147483647; index_name is required.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetIndexExpiryRequest {
+    #[prost(string, tag="1")]
+    pub connection_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub collection: ::prost::alloc::string::String,
+    #[prost(string, tag="4")]
+    pub index_name: ::prost::alloc::string::String,
+    #[prost(int64, tag="5")]
+    pub expire_after_seconds: i64,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeploymentUserAck {
 }

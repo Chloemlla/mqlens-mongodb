@@ -128,6 +128,11 @@ export interface IndexInfo {
   keys: string;
   unique: boolean;
   sparse: boolean;
+  // Present only on indexes that have them.
+  expireAfterSeconds?: number;
+  hidden?: boolean;
+  // A JSON string, as `keys` is.
+  partialFilterExpression?: string;
 }
 
 // Discriminated target for the row-hover stats popover (issue #178):

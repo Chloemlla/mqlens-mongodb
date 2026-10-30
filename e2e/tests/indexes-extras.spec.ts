@@ -169,6 +169,28 @@ test.describe('The index modal', () => {
     expect(await app.calls('create_index')).toHaveLength(0);
   });
 
+  test('a TTL index needs one field other than _id, and an expiry MongoDB can keep', async ({ app, page }) => {
+    const modal = page.getByTestId('index-modal');
+    const save = modal.getByTestId('save-index-btn');
+    await modal.getByTestId('ttl-checkbox').check();
+    await modal.getByTestId('ttl-seconds-input').fill('60');
+
+    // The key starts on _id.
+    await save.click();
+    await expect(modal).toContainText('A TTL index cannot be on _id');
+
+    await modal.getByTestId('index-key-field-0').selectOption('tier');
+    await modal.getByRole('button', { name: 'Add Index Key' }).click();
+    await save.click();
+    await expect(modal).toContainText('A TTL index must have exactly one key field');
+    await modal.getByTitle('Remove Key').nth(1).click();
+
+    await modal.getByTestId('ttl-seconds-input').fill('2147483648');
+    await save.click();
+    await expect(modal).toContainText('Expire after seconds must be a whole number from 0 to 2147483647');
+    expect(await app.calls('create_index')).toHaveLength(0);
+  });
+
   test('Escape closes the modal without writing an index', async ({ app, page }) => {
     const modal = page.getByTestId('index-modal');
     await expect(modal).toBeVisible();

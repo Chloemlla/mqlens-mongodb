@@ -29,6 +29,7 @@ const remote: ConnectionEntry = {
     serverUrl: 'https://mqlens.acme.test',
     remoteId: 'c-9',
     opClasses: ['read'],
+    apiVersion: 9,
     blockedCommands: ['count_documents', 'insert_document'],
     roleBlockedCommands: ['insert_document'],
   },

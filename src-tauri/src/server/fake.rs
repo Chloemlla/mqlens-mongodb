@@ -1055,6 +1055,7 @@ pub(crate) enum FakeWrite {
     DropDatabase(DropDatabaseRequest),
     RenameDatabase(RenameDatabaseDetailedRequest),
     SetValidator(SetValidatorRequest),
+    SetIndexExpiry(crate::server::pb::mqlens::v1::SetIndexExpiryRequest),
 }
 
 impl Fake {
@@ -1477,6 +1478,18 @@ impl DdlService for Fake {
         state
             .writes
             .push(FakeWrite::SetValidator(request.into_inner()));
+        Ok(Response::new(DdlAck {}))
+    }
+
+    async fn set_index_expiry(
+        &self,
+        request: Request<crate::server::pb::mqlens::v1::SetIndexExpiryRequest>,
+    ) -> Result<Response<DdlAck>, Status> {
+        let mut state = self.state.lock().unwrap();
+        state.authorize_connection(&request, &request.get_ref().connection_id)?;
+        state
+            .writes
+            .push(FakeWrite::SetIndexExpiry(request.into_inner()));
         Ok(Response::new(DdlAck {}))
     }
 }

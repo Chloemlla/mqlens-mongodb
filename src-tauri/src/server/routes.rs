@@ -106,6 +106,15 @@ pub(crate) const ROUTES: &[CommandRoute] = &[
             adapter: true,
         },
     },
+    CommandRoute {
+        command: "set_index_expiry",
+        serve: Serve::Rpc {
+            procedures: &["/mqlens.v1.DdlService/SetIndexExpiry"],
+            class: OpClass::Ddl,
+            since: 9,
+            adapter: true,
+        },
+    },
     // Documents
     CommandRoute {
         command: "execute_mql_query",

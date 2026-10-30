@@ -15,6 +15,10 @@ service DdlService {
   // copied. API version 2.
   rpc RenameDatabaseDetailed(RenameDatabaseDetailedRequest) returns (RenameDatabaseResult);
   rpc SetValidator(SetValidatorRequest) returns (DdlAck);
+  // Changes a TTL index's expireAfterSeconds with collMod. MongoDB's own
+  // error comes back for an index that is missing or cannot be a TTL index.
+  // API version 9.
+  rpc SetIndexExpiry(SetIndexExpiryRequest) returns (DdlAck);
 }
 
 message DdlAck {}
@@ -86,4 +90,13 @@ message RenameDatabaseDetailedRequest {
 message RenameDatabaseResult {
   int64 collections = 1;
   int64 documents = 2;
+}
+
+// expire_after_seconds is 0 to 2147483647; index_name is required.
+message SetIndexExpiryRequest {
+  string connection_id = 1;
+  string database = 2;
+  string collection = 3;
+  string index_name = 4;
+  int64 expire_after_seconds = 5;
 }

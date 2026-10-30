@@ -2245,6 +2245,7 @@ mod tests {
             r#"{"city":1}"#,
             true, // unique
             true, // sparse
+            None,
         )
         .await
         .expect("create index in mock mode");
@@ -2282,6 +2283,7 @@ mod tests {
             r#"{"contact_email":1}"#,
             false, // NOT unique
             false,
+            None,
         )
         .await
         .expect("create non-unique email index");
@@ -3375,6 +3377,7 @@ mod tests {
             r#"{"tmp":1}"#,
             false,
             false,
+            None,
         )
         .await
         .expect("create index");

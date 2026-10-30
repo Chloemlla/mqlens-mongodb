@@ -33,8 +33,9 @@ pub(crate) struct RemoteConn {
 /// The MQLens API versions this desktop speaks. 2 is the first with documents
 /// as raw BSON, which every document read needs; 4 adds change streams; 5 bulk
 /// inserts, index specs and collection options, for copies; 8 dumps and
-/// restores the server runs, each deleted once done with.
-pub(crate) const API_VERSIONS: (u32, u32) = (2, 8);
+/// restores the server runs, each deleted once done with; 9 changes a TTL
+/// index's expiry.
+pub(crate) const API_VERSIONS: (u32, u32) = (2, 9);
 
 /// The version to speak with a server that serves `server_min` to
 /// `server_max`: the highest both serve, or why there is none.
@@ -69,6 +70,9 @@ pub struct RemoteConnectionInfo {
     pub server_url: String,
     pub remote_id: String,
     pub op_classes: Vec<String>,
+    /// The MQLens API version the connection speaks, for what a command's
+    /// route cannot tell (a TTL on create_index needs 5).
+    pub api_version: u32,
     /// Commands this connection cannot run; the UI disables them.
     pub blocked_commands: Vec<String>,
     /// Those of them that only the user's role rules out.
@@ -83,6 +87,7 @@ impl RemoteConn {
             server_url: self.server_url.clone(),
             remote_id: self.remote_id.clone(),
             op_classes: self.op_classes.clone(),
+            api_version: self.api_version,
             blocked_commands: crate::server::routes::blocked_commands(self)
                 .into_iter()
                 .map(str::to_string)
@@ -234,6 +239,7 @@ mod tests {
                 server_url: "https://mqlens.acme.test".to_string(),
                 remote_id: "srv-r1".to_string(),
                 op_classes: vec!["read".to_string()],
+                api_version: 2,
                 blocked_commands: crate::server::routes::blocked_commands(
                     &state.server.remote("r1").unwrap().unwrap()
                 )

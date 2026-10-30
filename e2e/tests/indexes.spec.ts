@@ -60,6 +60,36 @@ test.describe('Indexes', () => {
     expect(typeof args.keys === 'string' ? JSON.parse(args.keys) : args.keys).toEqual({ tier: -1 });
   });
 
+  test('creates a TTL index and changes its expiry in place', async ({ app, page }) => {
+    await sidebar(page).getByText('indexes', { exact: true }).click({ button: 'right' });
+    await page.getByRole('menuitem', { name: 'Create Index' }).click();
+    const modal = page.getByTestId('index-modal');
+    await setKeyField(modal.getByTestId('index-key-field-0'), 'tier');
+    await modal.getByTestId('index-key-direction-0').selectOption('-1');
+    await expect(modal.getByTestId('index-name-input')).toHaveValue('tier_-1');
+    await modal.getByTestId('ttl-checkbox').check();
+    await modal.getByTestId('ttl-seconds-input').fill('3600');
+    await modal.getByTestId('save-index-btn').click();
+
+    await expect(modal).toHaveCount(0);
+    expect((await app.calls('create_index'))[0].args).toMatchObject({ indexName: 'tier_-1', expireAfterSeconds: 3600 });
+    // Saving opens the new index.
+    const viewer = view(page).getByTestId('index-viewer');
+    await expect(viewer.getByTestId('index-ttl')).toHaveText('TTL 1 hour (3600 s)');
+
+    await viewer.getByTestId('edit-index-btn').click();
+    await expect(modal.getByTestId('ttl-seconds-input')).toHaveValue('3600');
+    await modal.getByTestId('ttl-seconds-input').fill('86400');
+    await modal.getByTestId('save-index-btn').click();
+
+    await expect(modal).toHaveCount(0);
+    await expect(viewer.getByTestId('index-ttl')).toHaveText('TTL 1 day (86400 s)');
+    const changes = await app.calls('set_index_expiry');
+    expect(changes).toHaveLength(1);
+    expect(changes[0].args).toMatchObject({ collection: 'customers', indexName: 'tier_-1', expireAfterSeconds: 86400 });
+    expect(await app.calls('delete_index')).toHaveLength(0);
+  });
+
   test('deletes an index once confirmed', async ({ app, page }) => {
     await openIndex(page, 'email_1');
     await expect(view(page).getByTestId('index-viewer')).toBeVisible();
