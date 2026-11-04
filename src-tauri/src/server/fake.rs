@@ -6,7 +6,7 @@
 //! `internal/api/auth_handler.go` does. Counters let tests assert what reached
 //! the server.
 
-use crate::server::accounts::{self, ServerAccount, ServerAccountInput};
+use crate::server::accounts::{self, AuthMethod, ServerAccount, ServerAccountInput};
 use crate::server::channel::client;
 use crate::server::pb::mqlens::v1::auth_service_server::{AuthService, AuthServiceServer};
 use crate::server::pb::mqlens::v1::capability_service_server::{
@@ -37,8 +37,9 @@ use crate::server::pb::mqlens::v1::task_service_server::{TaskService, TaskServic
 use crate::server::pb::mqlens::v1::write_service_server::{WriteService, WriteServiceServer};
 use crate::server::pb::mqlens::v1::{
     login_request, ConnectionRef, GetConnectionRequest, ListConnectionsRequest,
-    ListConnectionsResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Principal,
-    RefreshRequest, WhoAmIRequest, WhoAmIResponse,
+    ListConnectionsResponse, ListOidcProvidersRequest, ListOidcProvidersResponse, LoginRequest,
+    LoginResponse, LogoutRequest, LogoutResponse, OidcCode, OidcProvider, Principal,
+    RefreshRequest, StartOidcLoginRequest, StartOidcLoginResponse, WhoAmIRequest, WhoAmIResponse,
 };
 use crate::server::pb::mqlens::v1::{
     start_restore_request, ArtifactChunk, CancelTaskRequest, CancelTaskResponse,
@@ -91,17 +92,22 @@ use crate::server::pb::mqlens::v1::{
 use crate::server::pb::mqlens::v1::{InsertManyRequest, InsertManyResponse, InsertRefusal};
 use crate::server::pb::mqlens::v1::{MongoshClientMsg, MongoshServerMsg};
 use crate::server::session::{unix_now, AccountSession, FileTokenStore, TokenStore};
+use http_body::Frame;
 use mongodb::bson::{doc, Document};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tonic::codegen::{http, Body, Bytes};
 use tonic::{Code, Request, Response, Status};
+use tower::util::MapResponseLayer;
 
 pub(crate) const TENANT: &str = "acme";
 pub(crate) const EMAIL: &str = "ops@acme.test";
 pub(crate) const PASSWORD: &str = "correct horse battery staple";
+pub(crate) const OIDC_EMAIL: &str = "sso.user@acme.test";
 pub(crate) const KEY: [u8; 32] = [7; 32];
 
 struct RefreshRecord {
@@ -137,6 +143,26 @@ pub(crate) struct FakeState {
     list_seen: u32,
     /// Held before a logout answers, to play a slow server.
     pub logout_delay: Duration,
+    /// What ListOidcProviders answers.
+    pub oidc_providers: Vec<OidcProvider>,
+    /// Plays a server from before OIDC sign-in, which answers neither call.
+    pub oidc_unimplemented: bool,
+    /// What StartOidcLogin was asked, in order.
+    pub oidc_starts: Vec<StartOidcLoginRequest>,
+    /// What StartOidcLogin answers with. `oidc_state` replaces the state it
+    /// would otherwise make up.
+    pub oidc_authorization_url: String,
+    pub oidc_state: Option<String>,
+    /// States not yet spent, with the request each came from.
+    oidc_pending: HashMap<String, StartOidcLoginRequest>,
+    /// Who an OIDC sign-in comes back as, which the client cannot choose.
+    pub oidc_email: String,
+    /// Each OidcCode that reached Login.
+    pub oidc_logins: Vec<OidcCode>,
+    /// A status the next OIDC Login answers with.
+    pub oidc_login_failure: Option<Status>,
+    /// How long StartOidcLogin takes to answer.
+    pub oidc_start_delay: Duration,
     /// Codes the next refreshes fail with, before touching the token.
     pub refresh_failures: Vec<Code>,
     /// Refresh RPCs that have started, including ones still waiting on delay.
@@ -194,6 +220,11 @@ pub(crate) struct FakeState {
     /// Ends every new shell at once with an error, as a mongosh that cannot
     /// start would.
     pub shell_start_failure: bool,
+    /// The next Find sends its first batch and is then reset, as a proxy resets
+    /// a stream when the node behind it is killed. `kill()` does this to a shell.
+    pub find_killed: bool,
+    /// Resets the stream that is next polled for a frame.
+    reset_stream: bool,
     /// Each Watch received, and how many have ended because the client let
     /// go. A watch opens with `watch_opening` as its resume token, then sends
     /// `watch_messages` and stays open; `watch_failure` refuses it instead.
@@ -371,6 +402,30 @@ pub(crate) struct Fake {
     state: Arc<Mutex<FakeState>>,
 }
 
+/// A response body that fails on request. hyper answers that by resetting the
+/// stream with INTERNAL_ERROR, which is what reaches a client when a proxy loses
+/// the node behind it. A handler cannot do this: tonic turns a handler's error
+/// into trailers.
+struct Resettable {
+    body: tonic::body::Body,
+    fake: Fake,
+}
+
+impl Body for Resettable {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+        if self.fake.with(|s| std::mem::take(&mut s.reset_stream)) {
+            return Poll::Ready(Some(Err(Status::internal("node killed"))));
+        }
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+}
+
 impl Fake {
     pub(crate) fn new() -> Self {
         Self {
@@ -380,6 +435,20 @@ impl Fake {
                 access: HashMap::new(),
                 access_ttl_secs: 3600,
                 refresh_delay: Duration::ZERO,
+                oidc_providers: vec![OidcProvider {
+                    id: "okta-id".to_string(),
+                    name: "Okta".to_string(),
+                }],
+                oidc_unimplemented: false,
+                oidc_starts: Vec::new(),
+                oidc_authorization_url: "https://idp.acme.test/authorize?client_id=mqlens"
+                    .to_string(),
+                oidc_state: None,
+                oidc_pending: HashMap::new(),
+                oidc_email: OIDC_EMAIL.to_string(),
+                oidc_logins: Vec::new(),
+                oidc_login_failure: None,
+                oidc_start_delay: Duration::ZERO,
                 login_delay: Duration::ZERO,
                 list_delay: Duration::ZERO,
                 list_hold_from: 0,
@@ -476,6 +545,8 @@ impl Fake {
                 shell_stage_room: None,
                 shells_ended: 0,
                 shell_start_failure: false,
+                find_killed: false,
+                reset_stream: false,
                 watches: Vec::new(),
                 watches_ended: 0,
                 watch_opening: mongodb::bson::to_vec(&mongodb::bson::doc! { "_data": "opened" })
@@ -658,8 +729,17 @@ impl Fake {
     pub(crate) async fn serve(&self) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let fake = self.clone();
         tokio::spawn(
             tonic::transport::Server::builder()
+                .layer(MapResponseLayer::new(
+                    move |response: http::Response<tonic::body::Body>| {
+                        response.map(|body| Resettable {
+                            body,
+                            fake: fake.clone(),
+                        })
+                    },
+                ))
                 .add_service(AuthServiceServer::new(self.clone()))
                 .add_service(ConnectionServiceServer::new(self.clone()))
                 .add_service(CapabilityServiceServer::new(self.clone()))
@@ -725,8 +805,81 @@ impl AuthService for Fake {
                 let family = state.next;
                 Ok(Response::new(state.issue(family)))
             }
+            Some(login_request::Login::Oidc(code)) => {
+                state.oidc_logins.push(code.clone());
+                if let Some(status) = state.oidc_login_failure.take() {
+                    return Err(status);
+                }
+                // What the server checks before it spends a state: the state
+                // came from it, for this tenant and redirect, and the verifier
+                // is the one behind its challenge.
+                let genuine = state.oidc_pending.remove(&code.state).is_some_and(|started| {
+                    started.tenant == message.tenant
+                        && started.redirect_uri == code.redirect_uri
+                        && started.code_challenge
+                            == crate::oidc::PkceVerifier::from_string(code.code_verifier.clone())
+                                .challenge()
+                });
+                if !genuine || code.code.is_empty() {
+                    return Err(Status::unauthenticated("invalid login"));
+                }
+                state.next += 1;
+                let family = state.next;
+                let mut response = state.issue(family);
+                if let Some(principal) = response.principal.as_mut() {
+                    principal.email = state.oidc_email.clone();
+                }
+                Ok(Response::new(response))
+            }
             _ => Err(Status::unauthenticated("invalid login")),
         }
+    }
+
+    async fn list_oidc_providers(
+        &self,
+        request: Request<ListOidcProvidersRequest>,
+    ) -> Result<Response<ListOidcProvidersResponse>, Status> {
+        let state = self.state.lock().unwrap();
+        if state.oidc_unimplemented {
+            return Err(Status::unimplemented("unknown method"));
+        }
+        let providers = if request.into_inner().tenant == TENANT {
+            state.oidc_providers.clone()
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(ListOidcProvidersResponse { providers }))
+    }
+
+    async fn start_oidc_login(
+        &self,
+        request: Request<StartOidcLoginRequest>,
+    ) -> Result<Response<StartOidcLoginResponse>, Status> {
+        let message = request.into_inner();
+        let delay = self.with(|s| {
+            if !s.oidc_unimplemented {
+                s.oidc_starts.push(message.clone());
+            }
+            s.oidc_start_delay
+        });
+        tokio::time::sleep(delay).await;
+        let mut state = self.state.lock().unwrap();
+        if state.oidc_unimplemented {
+            return Err(Status::unimplemented("unknown method"));
+        }
+        if !state.oidc_providers.iter().any(|p| p.id == message.provider_id) {
+            return Err(Status::not_found("no such identity provider"));
+        }
+        state.next += 1;
+        let issued = state
+            .oidc_state
+            .clone()
+            .unwrap_or_else(|| format!("state-{}", state.next));
+        state.oidc_pending.insert(issued.clone(), message);
+        Ok(Response::new(StartOidcLoginResponse {
+            authorization_url: state.oidc_authorization_url.clone(),
+            state: issued,
+        }))
     }
 
     async fn refresh(
@@ -1181,14 +1334,21 @@ impl Fake {
             documents.truncate(limit);
         }
         let state = self.state.clone();
+        let killed = std::mem::take(&mut state.lock().unwrap().find_killed);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
-            for chunk in documents.chunks(size) {
+            for (sent, chunk) in documents.chunks(size).enumerate() {
                 tokio::time::sleep(delay).await;
                 let batch = FindBatch {
                     documents_ejson: Vec::new(),
                     documents_bson: chunk.iter().map(|d| d.clone().into()).collect(),
                 };
+                if killed && sent > 0 {
+                    // Long enough for what was sent to reach the client: a
+                    // reset drops whatever is still queued.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    state.lock().unwrap().reset_stream = true;
+                }
                 if tx.send(Ok(batch)).await.is_err() {
                     state.lock().unwrap().streams_abandoned += 1;
                     return;
@@ -1574,6 +1734,15 @@ pub(crate) struct Env {
 
 impl Env {
     pub(crate) async fn new() -> Self {
+        Self::with_sign_in(AuthMethod::Password, EMAIL).await
+    }
+
+    /// `new`, for an account that signs in through an identity provider.
+    pub(crate) async fn oidc() -> Self {
+        Self::with_sign_in(AuthMethod::Oidc, "").await
+    }
+
+    async fn with_sign_in(auth: AuthMethod, email: &str) -> Self {
         let fake = Fake::new();
         let url = fake.serve().await;
         let dir = tempfile::tempdir().unwrap();
@@ -1587,7 +1756,8 @@ impl Env {
                 name: "Acme".to_string(),
                 url,
                 tenant: TENANT.to_string(),
-                email: EMAIL.to_string(),
+                email: email.to_string(),
+                auth,
                 allow_insecure_http: false,
                 extra_ca_pem: None,
             },
@@ -1662,14 +1832,15 @@ enum ShellReply {
     Nothing,
     Quit,
     Fail,
+    Kill,
     /// Busy until the client goes, as mongosh is on a long statement.
     Busy,
 }
 
 /// A REPL just big enough for the session code: a quoted string echoes
 /// bare, as mongosh echoes an expression's value; `.break` prints nothing;
-/// `throw` goes to stderr; `quit()` ends the shell; `sleep()` never
-/// returns; anything else is "ran" back.
+/// `throw` goes to stderr; `quit()` ends the shell; `kill()` resets its
+/// stream; `sleep()` never returns; anything else is "ran" back.
 fn fake_repl(line: &str) -> ShellReply {
     let line = line.trim();
     if line.len() >= 2 && line.starts_with('\'') && line.ends_with('\'') {
@@ -1680,6 +1851,8 @@ fn fake_repl(line: &str) -> ShellReply {
         ShellReply::Quit
     } else if line == "fail()" {
         ShellReply::Fail
+    } else if line == "kill()" {
+        ShellReply::Kill
     } else if line == "sleep()" {
         ShellReply::Busy
     } else if let Some(db) = line.strip_prefix("use ") {
@@ -1798,6 +1971,11 @@ impl ShellService for Fake {
                             ShellReply::Fail => {
                                 let _ = tx.send(Err(Status::internal("mongosh crashed"))).await;
                                 break 'shell;
+                            }
+                            // The frame only wakes the body, which then resets.
+                            ShellReply::Kill => {
+                                fake.with(|s| s.reset_stream = true);
+                                MongoshServerMsg::default()
                             }
                             ShellReply::Busy => {
                                 while let Ok(Some(_)) = input.message().await {}

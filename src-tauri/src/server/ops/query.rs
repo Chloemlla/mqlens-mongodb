@@ -171,8 +171,8 @@ pub(crate) async fn explain(
         })
         .await?;
     let plan = ejson::doc_from_wire(&response.plan_json)?;
-    let json = serde_json::to_value(&plan).map_err(|e| format!("BSON to JSON error: {e}"))?;
-    serde_json::to_string_pretty(&json).map_err(|e| format!("BSON to JSON error: {e}"))
+    serde_json::to_string_pretty(&ejson::ui_json(&plan)?)
+        .map_err(|e| format!("BSON to JSON error: {e}"))
 }
 
 async fn run_pipeline(
@@ -237,10 +237,9 @@ mod tests {
     use crate::server::session::STREAM_IDLE_TIMEOUT;
     use mongodb::bson::{doc, Bson, Document};
 
-    /// What local mode returns for one document: `serde_json::to_value` of
-    /// the driver's document, then `to_string`.
+    /// What local mode returns for one document.
     fn as_local_mode_shows(doc: &Document) -> String {
-        serde_json::to_string(&serde_json::to_value(doc).unwrap()).unwrap()
+        crate::db::ui_string(doc).unwrap()
     }
 
     fn many(n: usize) -> Vec<Document> {
@@ -271,6 +270,30 @@ mod tests {
         let expected: Vec<String> = docs.iter().map(as_local_mode_shows).collect();
         assert_eq!(found, expected);
         assert!(found[1].contains(r#""$numberLong":"7""#), "{}", found[1]);
+    }
+
+    // A node killed mid-Find fails the Find as the server being unavailable,
+    // and the same Find works the next time, as it does once the proxy has
+    // moved on to a live node.
+    #[tokio::test]
+    async fn a_find_reset_mid_stream_can_be_run_again() {
+        let env = Env::new().await;
+        env.fake.with(|s| {
+            s.documents = many(3);
+            s.batch_size = 1;
+        });
+        let (state, id) = connected(&env).await;
+
+        env.fake.with(|s| s.find_killed = true);
+        let err = execute_mql_query_impl(&state, &id, "orders", "customers", "{}", "", "", 10, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "MQLens Server is unavailable");
+
+        let found = execute_mql_query_impl(&state, &id, "orders", "customers", "{}", "", "", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 3);
     }
 
     // The query goes out as local mode parses it, so both modes ask for the
