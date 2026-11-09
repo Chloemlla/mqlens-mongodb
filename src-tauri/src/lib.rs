@@ -18,6 +18,7 @@ mod command_coverage;
 pub mod change_streams;
 pub mod chats;
 pub mod connections;
+pub mod discover;
 mod db;
 pub mod durable;
 pub mod mcp;
@@ -33,6 +34,8 @@ mod state;
 pub mod toolsetup;
 pub mod updater;
 mod vault;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod app_menu;
 mod window;
 mod windows;
 mod workspace;
@@ -1111,7 +1114,13 @@ pub fn mongosh_uri_args(state: &AppState, connection_id: &str, uri: &str) -> Res
     if state.conn_oidc_id_token.lock_safe()?.contains(connection_id) {
         args.push("--oidcIdTokenAsAccessToken".to_string());
     }
-    args.push(connections::normalize_mongodb_uri_options(uri));
+    // The URI the connection actually connected with: it holds a password
+    // asked for at connect and never saved, and an SSH tunnel's local address.
+    // Mock connections have none, so they keep the one passed in. Like a saved
+    // password, it is on mongosh's command line, where `ps` shows it; the
+    // tools avoid that with a 0600 `--config` file (`db::mongotools`).
+    let uri = db::mongotools::resolve_conn_uri(state, connection_id).unwrap_or_else(|_| uri.to_string());
+    args.push(connections::normalize_mongodb_uri_options(&uri));
     Ok(args)
 }
 
@@ -4597,7 +4606,13 @@ pub fn run() {
     // terminal does. Must run here on the main thread before worker threads start.
     path_env::ensure_user_path();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(app_menu::build)
+        .on_menu_event(|app, event| app_menu::handle_event(app, event.id().as_ref()));
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -4753,6 +4768,8 @@ pub fn run() {
             server_list_connections,
             server_connect,
             connections::test_connection_uri,
+            discover::discover_replica_set,
+            discover::resolve_srv_seed_list,
             load_app_settings,
             save_app_settings,
             patch_app_settings,

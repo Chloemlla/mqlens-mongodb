@@ -229,13 +229,14 @@
     "noConnection": "Keine aktive Verbindung. Verbinde dich mit einem MongoDB-Cluster, um Collections zu durchsuchen und Abfragen auszuführen."
   },
   "keyboardShortcuts": {
-    "description": "Globale Tastenkürzel für Navigation, Abfragen, die Seitenleiste, Zoom und die Befehlspalette.",
+    "description": "Globale Tastenkürzel für Navigation, Tabs und Fenster, Abfragen, die Seitenleiste, Zoom und die Befehlspalette.",
     "empty": "Keine Tastenkürzel entsprechen deiner Suche.",
     "groups": {
       "command-palette": "Befehlspalette",
       "navigation": "Navigation",
       "query-editor": "Abfrage-Editor",
       "sidebar": "Seitenleiste",
+      "tabs": "Tabs & Fenster",
       "zoom": "Zoom"
     },
     "items": {
@@ -247,6 +248,14 @@
       "run-query": "Die aktuelle Abfrage ausführen",
       "sidebar-search": "Baumsuche der Seitenleiste fokussieren",
       "submit-dialog": "Einen mehrzeiligen Dialog absenden (URI-Import, Eingabedialoge)",
+      "tab-close": "Den aktiven Tab schließen",
+      "tab-last": "Zum letzten Tab wechseln",
+      "tab-new": "Neuer Tab (zur aktiven Collection, sonst Schnellstart)",
+      "tab-next": "Nächsten Tab anzeigen",
+      "tab-prev": "Vorherigen Tab anzeigen",
+      "tab-reopen": "Den zuletzt geschlossenen Tab wieder öffnen",
+      "tab-select": "Zu Tab 1–8 wechseln",
+      "open-settings": "Einstellungen öffnen",
       "zoom-in": "Oberfläche vergrößern",
       "zoom-in-out": "Oberfläche vergrößern oder verkleinern",
       "zoom-out": "Oberfläche verkleinern",
@@ -488,6 +497,10 @@
       "dismiss": "Verwerfen",
       "offline": "Du bist offline. Verbinde dich mit dem Internet und versuche es erneut.",
       "uptodate": "Du bist auf der neuesten Version."
+    },
+    "whatsNew": {
+      "link": "Neuerungen ansehen",
+      "message": "Auf MQLens {{version}} aktualisiert."
     }
   },
   "vaultGate": {
@@ -495,6 +508,12 @@
       "resetLink": "Passwort vergessen? Zurücksetzen (löscht alle gespeicherten Zugangsdaten)",
       "setup": "Erstellen & entsperren",
       "unlock": "Entsperren"
+    },
+    "biometricOffer": {
+      "description": "Nutze die biometrische Entsperrung dieses Geräts (Touch ID, Face ID oder Windows Hello), statt dein Master-Passwort einzugeben. Du kannst sie unter Einstellungen → Sicherheit wieder ausschalten.",
+      "enable": "Biometrische Entsperrung einschalten",
+      "skip": "Nicht jetzt",
+      "title": "Beim nächsten Mal ohne Passwort entsperren?"
     },
     "biometry": {
       "faceId": "Face ID verwenden",
