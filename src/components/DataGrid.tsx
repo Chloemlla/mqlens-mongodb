@@ -13,6 +13,7 @@ import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { EJSON } from 'bson';
 import { toPlainJson } from '../lib/plainJson';
 import { copyValueToText } from '../lib/copyValue';
+import { docToShell, parseShellJson } from '../lib/shellDoc';
 import { ResultsFindBar } from './ResultsFindBar';
 import {
   isTextEntryContext,
@@ -25,6 +26,7 @@ import {
   bsonInstanceTypeLabel,
   bsonValueText,
   isBsonInstance,
+  isEjsonWrapper,
   jsonStringLiteral,
   plainBsonShape,
   tableValueText,
@@ -68,6 +70,10 @@ interface DataGridProps {
   querySpec?: QueryCodeSpec | null;
   onInsertDocument?: () => void;
   onEditDocument?: (doc: Record<string, any>) => void;
+  /** Saves one value edited in place in the Table or Tree view. `edited` is a
+   *  copy of `doc` with that one value replaced, both in Extended JSON; the
+   *  promise rejects to keep the cell editor open. Omit to make cells read-only. */
+  onEditField?: (doc: Record<string, any>, edited: Record<string, any>) => Promise<void>;
   onDuplicateDocument?: (doc: Record<string, any>) => void;
   onDeleteDocument?: (doc: Record<string, any>) => void;
   onAnalyzeSchema?: () => void;
@@ -491,6 +497,11 @@ interface TreeRow {
   num: number;
   depth: number;
   keyName: string;
+  /** Keys from the document root down to this value; empty for the root. */
+  path: string[];
+  /** Inside an array, which the backend writes back whole: not edited in place,
+   *  so a save cannot overwrite another element changed since the results loaded. */
+  underArray?: boolean;
   kind: 'scalar' | 'object' | 'array';
   value?: any; // scalar value
   childCount: number; // for object/array containers
@@ -689,6 +700,94 @@ const JsonRow = ({
   );
 };
 
+// A sub-document the table's "Embedded fields" opens into columns: not an
+// array, and not one typed value such as `{ $date: … }` or an ObjectId.
+const isEmbeddedDoc = (v: unknown): v is Record<string, any> =>
+  v !== null && typeof v === 'object' && !Array.isArray(v) && !isBsonInstance(v)
+  && Object.keys(v).length > 0 && !isEjsonWrapper(v as Record<string, unknown>);
+
+/** The cell open in the in-place editor: a document and the path to one value. */
+interface CellEdit {
+  docIndex: number;
+  path: string[];
+}
+
+const isCellEditing = (edit: CellEdit | null, docIndex: number, path: string[]): boolean =>
+  !!edit && edit.docIndex === docIndex && edit.path.length === path.length
+  && edit.path.every((k, i) => k === path[i]);
+
+// `_id` cannot be changed by an update, so it is never edited in place.
+const isEditablePath = (path: string[]): boolean => path.length > 0 && path[0] !== '_id';
+
+const valueAtPath = (doc: any, path: string[]): any => path.reduce((v, k) => v?.[k], doc);
+
+// A one-line editor over a Table or Tree cell, in shell syntax so a value keeps
+// or changes its type the way it is written: `"42"`, `42`, `ISODate("…")`.
+// Holds its own text so typing does not re-render the grid. Enter saves;
+// Escape or leaving the field cancels, so a stray click never writes.
+const InlineCellEditor = ({
+  initial,
+  hint,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  hint: string;
+  onCommit: (text: string) => Promise<void>;
+  onCancel: () => void;
+}) => {
+  const [text, setText] = useState(initial);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const commit = async () => {
+    setSaving(true);
+    try {
+      await onCommit(text);
+    } catch (err: any) {
+      setError(String(err?.message ?? err));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <input
+      autoFocus
+      data-testid="cell-editor"
+      value={text}
+      // Not `disabled`: disabling the focused field would blur it, and a blur cancels.
+      readOnly={saving}
+      spellCheck={false}
+      aria-invalid={error ? true : undefined}
+      title={error ?? hint}
+      onFocus={(e) => e.currentTarget.select()}
+      onChange={(e) => {
+        setText(e.target.value);
+        setError(null);
+      }}
+      onKeyDown={(e) => {
+        // The grid's own shortcuts must not see keys typed into a value.
+        e.stopPropagation();
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          onCancel();
+        } else if (e.key === 'Enter' && !saving && !e.nativeEvent.isComposing) {
+          // An Enter that confirms an IME candidate is still typing, not a save.
+          e.preventDefault();
+          void commit();
+        }
+      }}
+      onBlur={() => {
+        if (!saving) onCancel();
+      }}
+      onDoubleClick={(e) => e.stopPropagation()}
+      className={cn(
+        'h-full w-full min-w-0 select-text bg-background px-1 font-mono text-xs text-foreground outline-none ring-1 ring-inset',
+        error ? 'ring-destructive' : 'ring-primary'
+      )}
+    />
+  );
+};
+
 // Extra (per-render) data handed to the table view's virtualized rows.
 interface TableRowExtra {
   documents: Array<Record<string, any>>;
@@ -697,6 +796,14 @@ interface TableRowExtra {
   findHighlightClass: (rowId: number, columnKey?: string) => string | undefined;
   openCtxMenu: JsonRowExtra['openCtxMenu'];
   renderCell: (val: any) => React.ReactNode;
+  /** The column's value in a document; undefined when the field is missing. */
+  cellValue: (doc: Record<string, any>, col: string) => any;
+  /** The column's path into a document: `['address', 'city']` for `address.city`. */
+  cellPath: (col: string) => string[];
+  cellEdit: CellEdit | null;
+  /** Undefined when this grid cannot write. */
+  startCellEdit?: (edit: CellEdit) => void;
+  renderCellEditor: () => React.ReactNode;
   hasRowActions: boolean;
   rowActions: RowActionsContext;
 }
@@ -712,11 +819,21 @@ const TableRow = ({
   findHighlightClass,
   openCtxMenu,
   renderCell,
+  cellValue,
+  cellPath,
+  cellEdit,
+  startCellEdit,
+  renderCellEditor,
   hasRowActions,
   rowActions,
 }: { index: number; style: React.CSSProperties } & TableRowExtra) => {
   const rawDoc = documents[index];
   if (!rawDoc) return null;
+  // One stored value: a sub-document or an array goes through the document editor.
+  const editable = (col: string) => {
+    const v = cellValue(rawDoc, col);
+    return isEditablePath(cellPath(col)) && v !== undefined && !Array.isArray(v) && !isEmbeddedDoc(v);
+  };
 
   return (
     <div
@@ -738,9 +855,10 @@ const TableRow = ({
             findHighlightClass(index, col)
           )}
           style={{ width: `${colWidth(col)}px`, flexShrink: 0 }}
-          onContextMenu={(e) => openCtxMenu(e, rawDoc, col, rawDoc[col])}
+          onContextMenu={(e) => openCtxMenu(e, rawDoc, col, cellValue(rawDoc, col))}
+          onDoubleClick={startCellEdit && editable(col) ? () => startCellEdit({ docIndex: index, path: cellPath(col) }) : undefined}
         >
-          {renderCell(rawDoc[col])}
+          {isCellEditing(cellEdit, index, cellPath(col)) ? renderCellEditor() : renderCell(cellValue(rawDoc, col))}
         </div>
       ))}
       {hasRowActions && (
@@ -762,6 +880,9 @@ interface TreeRowExtra {
   openCtxMenu: JsonRowExtra['openCtxMenu'];
   keyWidth: number;
   renderValue: (row: TreeRow) => React.ReactNode;
+  cellEdit: CellEdit | null;
+  startCellEdit?: (edit: CellEdit) => void;
+  renderCellEditor: () => React.ReactNode;
   hasRowActions: boolean;
   rowActions: RowActionsContext;
   t: (key: string) => string;
@@ -780,6 +901,9 @@ const TreeRowComponent = ({
   openCtxMenu,
   keyWidth,
   renderValue,
+  cellEdit,
+  startCellEdit,
+  renderCellEditor,
   hasRowActions,
   rowActions,
   t,
@@ -787,6 +911,8 @@ const TreeRowComponent = ({
   const row = rows[index];
   if (!row) return null;
   const collapsed = row.foldId !== undefined && collapsedFolds.has(row.foldId);
+  const editing = isCellEditing(cellEdit, row.docIndex, row.path);
+  const editable = startCellEdit && row.kind === 'scalar' && !row.underArray && isEditablePath(row.path);
   return (
     <div
       style={style}
@@ -815,8 +941,11 @@ const TreeRowComponent = ({
         )}
         <span className="truncate text-syntax-key" title={row.keyName}>{row.keyName}</span>
       </div>
-      <div className="flex min-w-0 flex-1 items-center gap-2 border-r border-border px-3">
-        <span className="truncate">{renderValue(row)}</span>
+      <div
+        className="flex min-w-0 flex-1 items-center gap-2 border-r border-border px-3"
+        onDoubleClick={editable ? () => startCellEdit({ docIndex: row.docIndex, path: row.path }) : undefined}
+      >
+        {editing ? renderCellEditor() : <span className="truncate">{renderValue(row)}</span>}
         {row.isDocRoot && hasRowActions && row.doc && (
           <span className="ml-auto inline-flex opacity-0 group-hover:opacity-100 [.flex:hover>&]:opacity-100">
             <RowActions doc={row.doc} {...rowActions} />
@@ -836,6 +965,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
   querySpec = null,
   onInsertDocument,
   onEditDocument,
+  onEditField,
   onDuplicateDocument,
   onDeleteDocument,
   onAnalyzeSchema,
@@ -901,7 +1031,15 @@ export const DataGrid: React.FC<DataGridProps> = ({
     setPendingCompare(null);
   }, [documents]);
 
+  // The Table or Tree cell open in the in-place editor. Closed by new results
+  // (its document index may now point elsewhere) and by a view switch.
+  const [cellEdit, setCellEdit] = useState<CellEdit | null>(null);
+  // A save and the refresh after it are in flight. No other cell opens until
+  // they settle: either one would close it and drop what was typed there.
+  const [cellSaving, setCellSaving] = useState(false);
+
   const [plainJson, setPlainJson] = useState(false);
+  const [embeddedFields, setEmbeddedFields] = useState(false);
   const plainDocument = (doc: Record<string, any>) => {
     try {
       // Canonical parsing retains large integers until conversion to strings.
@@ -977,6 +1115,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // right one for a single document nobody queried for.
   const viewMode = chromeless ? 'json' : (controlledViewMode ?? uncontrolledViewMode);
   const usePlainJson = viewMode === 'json' && plainJson;
+  useEffect(() => setCellEdit(null), [documents, viewMode]);
   const setViewMode = (mode: ViewMode) => {
     setUncontrolledViewMode(mode);
     onViewModeChange?.(mode);
@@ -1261,15 +1400,36 @@ export const DataGrid: React.FC<DataGridProps> = ({
     [documents, parsedDocs, usePlainJson],
   );
 
-  // Extract all unique columns present in documents
-  const columns = useMemo(() => {
-    if (!documents || documents.length === 0) return [];
-    const keys = new Set<string>();
-    documents.forEach((doc) => {
-      Object.keys(doc).forEach((k) => keys.add(k));
-    });
-    return Array.from(keys);
-  }, [documents]);
+  // Each column's name and the path to its value, in first-seen order. Top-level
+  // keys, unless the table's "Embedded fields" is on: then sub-documents open
+  // into dot-path columns. Arrays and typed values (`{ $date: … }`, `{ $oid: … }`)
+  // stay one column. ponytail: a key that itself contains a dot can share a name
+  // with an embedded path; the first one seen wins the column.
+  const flattenEmbedded = embeddedFields && viewMode === 'table';
+  const columnPaths = useMemo(() => {
+    const paths = new Map<string, string[]>();
+    const walk = (obj: Record<string, any>, prefix: string[]) => {
+      for (const [k, v] of Object.entries(obj)) {
+        const path = [...prefix, k];
+        if (flattenEmbedded && isEmbeddedDoc(v)) walk(v, path);
+        else if (!paths.has(path.join('.'))) paths.set(path.join('.'), path);
+      }
+    };
+    documents?.forEach((doc) => walk(doc, []));
+    return paths;
+  }, [documents, flattenEmbedded]);
+  const columns = useMemo(() => Array.from(columnPaths.keys()), [columnPaths]);
+  // undefined when the document has no such field, which the table leaves blank.
+  // Own fields only: a missing `constructor` is not a stored value. The row is
+  // read directly (it is always a document, and checking it would enumerate
+  // every field per cell); deeper steps go only into sub-documents, never
+  // through an array's `length` or a typed value (#551 review).
+  const cellValue = (doc: Record<string, any> | undefined, col: string): any => {
+    const [first, ...rest] = columnPaths.get(col) ?? [col];
+    let v = doc && Object.hasOwn(doc, first) ? doc[first] : undefined;
+    for (const k of rest) v = isEmbeddedDoc(v) && Object.hasOwn(v, k) ? v[k] : undefined;
+    return v;
+  };
 
   // A value the grid gives a constructor call to. Delegates so this list cannot
   // fall behind bsonDisplay's.
@@ -1309,7 +1469,15 @@ export const DataGrid: React.FC<DataGridProps> = ({
   // Colored Table cell — same syntax palette as the Tree/JSON views (strings,
   // numbers, booleans, BSON types) so the Table is visually consistent.
   const renderColoredCell = (val: any): React.ReactNode => {
-    if (val === null || val === undefined) return '';
+    // A field set to null and a field that is missing are different things.
+    if (val === null) {
+      return (
+        <span data-testid="table-null" className="rounded bg-muted px-1 text-[10px] italic text-syntax-null">
+          null
+        </span>
+      );
+    }
+    if (val === undefined) return '';
     if (typeof val === 'string') return <span className="text-syntax-string">{val}</span>;
     if (typeof val === 'number') return <span className="text-syntax-number">{String(val)}</span>;
     if (typeof val === 'boolean') return <span className="text-syntax-boolean font-bold">{val ? 'true' : 'false'}</span>;
@@ -1877,11 +2045,13 @@ export const DataGrid: React.FC<DataGridProps> = ({
     const walk = (
       value: any,
       keyName: string,
+      path: string[],
       depth: number,
       ancestors: number[],
       docIndex: number,
       isDocRoot: boolean,
-      rawDoc?: Record<string, any>
+      rawDoc?: Record<string, any>,
+      underArray = false
     ) => {
       const isArr = Array.isArray(value);
       const isObj = value !== null && typeof value === 'object' && !isBsonObject(value) && !isArr;
@@ -1891,12 +2061,14 @@ export const DataGrid: React.FC<DataGridProps> = ({
           num: rows.length + 1,
           depth,
           keyName,
+          path,
           kind: 'scalar',
           value,
           childCount: 0,
           type: bsonTypeLabel(value),
           ancestors,
           docIndex,
+          underArray,
         });
         return;
       }
@@ -1912,6 +2084,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
         num: rows.length + 1,
         depth,
         keyName,
+        path,
         kind: isArr ? 'array' : 'object',
         childCount: entries.length,
         type: isArr ? 'Array' : 'Object',
@@ -1923,11 +2096,11 @@ export const DataGrid: React.FC<DataGridProps> = ({
       });
 
       const childAncestors = [...ancestors, foldId];
-      entries.forEach(([k, v]) => walk(v, k, depth + 1, childAncestors, docIndex, false));
+      entries.forEach(([k, v]) => walk(v, k, [...path, k], depth + 1, childAncestors, docIndex, false, undefined, underArray || isArr));
     };
 
     parsedDocs.forEach((doc, di) => {
-      walk(doc, String(di + 1), 0, [], di, true, documents[di]);
+      walk(doc, String(di + 1), [], 0, [], di, true, documents[di]);
     });
     return { treeRows: rows, treeDefaultCollapsed: defaultCollapsed };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1994,7 +2167,7 @@ export const DataGrid: React.FC<DataGridProps> = ({
           columns.map((col) => ({
             rowIndex: index,
             columnKey: col,
-            text: tableValueText((doc as Record<string, unknown>)?.[col], bsonDisplayOptions),
+            text: tableValueText(cellValue(doc, col), bsonDisplayOptions),
           }))
         )
       );
@@ -2072,6 +2245,44 @@ export const DataGrid: React.FC<DataGridProps> = ({
     onDeleteDocument,
     isReadOnly,
   };
+
+  const startCellEdit = onEditField && !isReadOnly && !cellSaving ? setCellEdit : undefined;
+  // Saves the open cell. A value written as it was loaded is not a change and
+  // closes without a write. Throws to keep the editor open with the reason.
+  const commitCellEdit = async (text: string) => {
+    if (!cellEdit || !onEditField) return;
+    const doc = documents[cellEdit.docIndex];
+    if (text === docToShell(valueAtPath(doc, cellEdit.path))) {
+      setCellEdit(null);
+      return;
+    }
+    let value: unknown;
+    try {
+      if (!text.trim()) throw new Error('empty');
+      value = parseShellJson(text);
+    } catch {
+      throw new Error(t('dataGrid.inlineEdit.invalidValue'));
+    }
+    const edited = structuredClone(doc);
+    const parent = valueAtPath(edited, cellEdit.path.slice(0, -1));
+    parent[cellEdit.path[cellEdit.path.length - 1]] = value;
+    setCellSaving(true);
+    try {
+      await onEditField(doc, edited);
+    } finally {
+      setCellSaving(false);
+    }
+    setCellEdit(null);
+  };
+  const renderCellEditor = () =>
+    cellEdit && (
+      <InlineCellEditor
+        initial={docToShell(valueAtPath(documents[cellEdit.docIndex], cellEdit.path))}
+        hint={t('dataGrid.inlineEdit.hint')}
+        onCommit={commitCellEdit}
+        onCancel={() => setCellEdit(null)}
+      />
+    );
 
   // Bring the matched column into view as well as the matched row. The table
   // scrolls in both directions once resized columns overflow, so a vertical jump
@@ -2346,6 +2557,12 @@ export const DataGrid: React.FC<DataGridProps> = ({
                 {plainJson && <AlertTriangle size={12} role="img" aria-label={t('dataGrid.labels.plainJsonWarning')} />}
               </label>
             )}
+            {viewMode === 'table' && (
+              <label className="flex items-center gap-2 text-[11px] text-muted-foreground" title={t('dataGrid.labels.embeddedFieldsHint')}>
+                <input type="checkbox" aria-label={t('dataGrid.labels.embeddedFields')} checked={embeddedFields} onChange={e => setEmbeddedFields(e.target.checked)} />
+                {t('dataGrid.labels.embeddedFields')}
+              </label>
+            )}
             <div className="flex items-center rounded-md border border-border bg-background p-0.5">
               <button
                 role="button"
@@ -2532,6 +2749,9 @@ export const DataGrid: React.FC<DataGridProps> = ({
                   openCtxMenu,
                   keyWidth: treeKeyWidth,
                   renderValue: renderTreeValue,
+                  cellEdit,
+                  startCellEdit,
+                  renderCellEditor,
                   hasRowActions,
                   rowActions,
                   t,
@@ -2602,6 +2822,11 @@ export const DataGrid: React.FC<DataGridProps> = ({
                   findHighlightClass,
                   openCtxMenu,
                   renderCell: renderColoredCell,
+                  cellValue,
+                  cellPath: (col) => columnPaths.get(col) ?? [col],
+                  cellEdit,
+                  startCellEdit,
+                  renderCellEditor,
                   hasRowActions,
                   rowActions,
                 }}

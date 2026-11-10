@@ -2694,3 +2694,241 @@ it('keeps malformed EJSON inspectable in Plain JSON and escapes field names', ()
   expect(screen.getByText('"invalid"')).toBeInTheDocument();
   error.mockRestore();
 });
+
+describe('DataGrid — table null, missing and embedded fields', () => {
+  const headerCells = () =>
+    Array.from(screen.getByTestId('table-header').children).map((c) => c.textContent);
+
+  it('marks a null value, and leaves a missing field blank', () => {
+    render(<DataGrid documents={[{ _id: 1, phone: null }, { _id: 2 }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    // One null, one missing: only the null is drawn.
+    const nulls = screen.getAllByTestId('table-null');
+    expect(nulls).toHaveLength(1);
+    expect(nulls[0]).toHaveTextContent('null');
+  });
+
+  it('shows embedded fields as their own dot-path columns when asked', () => {
+    render(
+      <DataGrid
+        documents={[
+          { _id: 1, address: { city: 'New York', geo: { lat: 40.7 } }, tags: ['a'], since: { $date: '2024-01-01T00:00:00Z' } },
+          { _id: 2, address: { city: 'Seattle' } },
+        ]}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(headerCells()).toContain('address');
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /embedded fields/i }));
+
+    const cols = headerCells();
+    expect(cols).toEqual(expect.arrayContaining(['_id', 'address.city', 'address.geo.lat', 'tags', 'since']));
+    expect(cols).not.toContain('address');
+    // A typed value like a date is one value, not an object to open up.
+    expect(cols.some((c) => c?.includes('$date'))).toBe(false);
+    expect(screen.getByText('New York')).toBeInTheDocument();
+    expect(screen.getByText('Seattle')).toBeInTheDocument();
+    expect(screen.getByText('40.7')).toBeInTheDocument();
+    // Seattle has no geo: blank, not null.
+    expect(screen.queryByTestId('table-null')).toBeNull();
+  });
+
+  it('leaves a missing embedded field blank even when its name is a JavaScript built-in (#551 review)', () => {
+    render(<DataGrid documents={[{ _id: 1, profile: { constructor: 'stored value' } }, { _id: 2, profile: { a: 1 } }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /embedded fields/i }));
+
+    expect(headerCells()).toContain('profile.constructor');
+    expect(screen.getByText('stored value')).toBeInTheDocument();
+    expect(screen.queryByText(/native code/)).toBeNull();
+  });
+
+  it('shows a stored top-level field even when the row looks like a typed value (#551 review)', () => {
+    // A projection without _id can return a row whose keys are all EJSON-like.
+    render(<DataGrid documents={[{ $options: 'custom' }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    expect(screen.getByText('custom')).toBeInTheDocument();
+  });
+
+  it('does not read an embedded path through an array (#551 review)', () => {
+    render(<DataGrid documents={[{ _id: 1, a: { length: 4 } }, { _id: 2, a: ['x', 'y', 'z'] }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /embedded fields/i }));
+
+    expect(headerCells()).toContain('a.length');
+    expect(screen.getByText('4')).toBeInTheDocument();
+    // The array's own length is not a stored a.length.
+    expect(screen.queryByText('3')).toBeNull();
+  });
+
+  it('opens an ordinary document that has a $-prefixed field (#551 review)', () => {
+    render(<DataGrid documents={[{ _id: 1, meta: { $schema: 'v1', city: 'Berlin' } }]} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /embedded fields/i }));
+
+    expect(headerCells()).toEqual(expect.arrayContaining(['meta.$schema', 'meta.city']));
+    expect(screen.getByText('Berlin')).toBeInTheDocument();
+  });
+});
+
+describe('DataGrid — in-place cell edit', () => {
+  const docs = () => [
+    { _id: { $oid: '64b000000000000000000001' }, name: 'Alice', tier: 'free', address: { city: 'Berlin' } },
+  ];
+  const cell = (text: string) => screen.getByText(text);
+  const editor = () => screen.getByTestId('cell-editor') as HTMLInputElement;
+
+  it('opens a table cell in an editor that holds the value in shell syntax', () => {
+    render(<DataGrid documents={docs()} onEditField={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+
+    expect(editor().value).toBe('"free"');
+  });
+
+  it('saves only the edited field on Enter', async () => {
+    const onEditField = vi.fn().mockResolvedValue(undefined);
+    const input = docs();
+    render(<DataGrid documents={input} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: '"pro"' } });
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+
+    await vi.waitFor(() => expect(onEditField).toHaveBeenCalledTimes(1));
+    const [original, edited] = onEditField.mock.calls[0];
+    expect(original).toBe(input[0]);
+    expect(edited).toEqual({ ...input[0], tier: 'pro' });
+    // The loaded document is left as it was.
+    expect(input[0].tier).toBe('free');
+    await vi.waitFor(() => expect(screen.queryByTestId('cell-editor')).toBeNull());
+  });
+
+  it('takes typed shell values such as ISODate()', async () => {
+    const onEditField = vi.fn().mockResolvedValue(undefined);
+    render(<DataGrid documents={docs()} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: 'ISODate("2024-01-01T00:00:00Z")' } });
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+
+    await vi.waitFor(() => expect(onEditField).toHaveBeenCalledTimes(1));
+    expect(onEditField.mock.calls[0][1].tier).toEqual({ $date: '2024-01-01T00:00:00Z' });
+  });
+
+  it('does not save on the Enter that confirms an IME composition (#554 review)', () => {
+    const onEditField = vi.fn().mockResolvedValue(undefined);
+    render(<DataGrid documents={docs()} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: '"专业"' } });
+    fireEvent.keyDown(editor(), { key: 'Enter', isComposing: true });
+
+    expect(onEditField).not.toHaveBeenCalled();
+    expect(editor().value).toBe('"专业"');
+  });
+
+  it('cancels on Escape without writing', () => {
+    const onEditField = vi.fn();
+    render(<DataGrid documents={docs()} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: '"pro"' } });
+    fireEvent.keyDown(editor(), { key: 'Escape' });
+
+    expect(screen.queryByTestId('cell-editor')).toBeNull();
+    expect(onEditField).not.toHaveBeenCalled();
+  });
+
+  it('keeps an invalid value in the editor and writes nothing', async () => {
+    const onEditField = vi.fn();
+    render(<DataGrid documents={docs()} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: 'pro' } });
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+
+    await vi.waitFor(() => expect(editor()).toHaveAttribute('aria-invalid', 'true'));
+    expect(onEditField).not.toHaveBeenCalled();
+  });
+
+  it('keeps the editor open when the write fails', async () => {
+    const onEditField = vi.fn().mockRejectedValue(new Error('write refused'));
+    render(<DataGrid documents={docs()} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: '"pro"' } });
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+
+    await vi.waitFor(() => expect(editor()).toHaveAttribute('title', 'write refused'));
+    expect(editor().value).toBe('"pro"');
+  });
+
+  it('edits a nested value in the tree by its full path', async () => {
+    const onEditField = vi.fn().mockResolvedValue(undefined);
+    // Nested field first: jsdom lays out only the first few virtualized rows.
+    render(<DataGrid documents={[{ address: { city: 'Berlin' }, _id: 1 }]} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+
+    fireEvent.doubleClick(cell('"Berlin"'));
+    expect(editor().value).toBe('"Berlin"');
+    fireEvent.change(editor(), { target: { value: '"Paris"' } });
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+
+    await vi.waitFor(() => expect(onEditField).toHaveBeenCalledTimes(1));
+    expect(onEditField.mock.calls[0][1]).toEqual({ address: { city: 'Paris' }, _id: 1 });
+  });
+
+  it('does not open another cell while a save is pending (#554 review)', async () => {
+    let finish!: () => void;
+    const onEditField = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    render(<DataGrid documents={docs()} onEditField={onEditField} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+
+    fireEvent.doubleClick(cell('free'));
+    fireEvent.change(editor(), { target: { value: '"pro"' } });
+    fireEvent.keyDown(editor(), { key: 'Enter' });
+    await vi.waitFor(() => expect(onEditField).toHaveBeenCalledTimes(1));
+
+    // A second cell would be closed, draft and all, when the first save lands.
+    fireEvent.doubleClick(cell('Alice'));
+    expect(screen.getAllByTestId('cell-editor')).toHaveLength(1);
+    expect(editor().value).toBe('"pro"');
+
+    finish();
+    await vi.waitFor(() => expect(screen.queryByTestId('cell-editor')).toBeNull());
+    fireEvent.doubleClick(cell('Alice'));
+    expect(editor().value).toBe('"Alice"');
+  });
+
+  it('does not edit a value inside an array, which the backend writes whole (#554 review)', () => {
+    render(<DataGrid documents={[{ tags: ['a', 'b'], _id: 1 }]} onEditField={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /tree/i }));
+
+    fireEvent.doubleClick(cell('"a"'));
+    expect(screen.queryByTestId('cell-editor')).toBeNull();
+  });
+
+  it('does not edit _id, sub-documents, or a read-only grid', () => {
+    const { unmount } = render(<DataGrid documents={docs()} onEditField={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.doubleClick(screen.getByText(/64b000000000000000000001/));
+    fireEvent.doubleClick(cell('{"city":"Berlin"}'));
+    expect(screen.queryByTestId('cell-editor')).toBeNull();
+    unmount();
+
+    render(<DataGrid documents={docs()} onEditField={vi.fn()} connectionMode="read_only" />);
+    fireEvent.click(screen.getByRole('button', { name: /table/i }));
+    fireEvent.doubleClick(cell('free'));
+    expect(screen.queryByTestId('cell-editor')).toBeNull();
+  });
+});

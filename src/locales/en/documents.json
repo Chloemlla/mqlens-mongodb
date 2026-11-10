@@ -90,6 +90,7 @@
         "body_one": "Apply this update to {{count}} document(s) matching:\n{{filter}}",
         "body_other": "Apply this update to {{count}} document(s) matching:\n{{filter}}",
         "confirmLabel": "Update",
+        "hint": "Shell syntax works here: unquoted keys, ISODate(), ObjectId(). Ctrl+Enter applies the update.",
         "promptMessage": "Update document (operators, e.g. {\"$set\": {...}}):",
         "title": "Update many",
         "validation": {
@@ -139,6 +140,10 @@
       "placeholder": "Find in results…",
       "previous": "Previous match (Shift+Enter)"
     },
+    "inlineEdit": {
+      "hint": "Enter to save, Esc to cancel. Shell syntax: \"text\", 42, ISODate(\"…\")",
+      "invalidValue": "Not a valid value. Quote text, for example \"pro\"."
+    },
     "labels": {
       "actions": "Actions",
       "docsCountEstimated_one": "~{{count}} doc",
@@ -147,6 +152,8 @@
       "docsCountExact_other": "{{count}} docs",
       "elements_one": "[ {{count}} element ]",
       "elements_other": "[ {{count}} elements ]",
+      "embeddedFields": "Embedded fields",
+      "embeddedFieldsHint": "Show the fields of embedded documents as their own columns, named by dot path",
       "fields_one": "{ {{count}} field }",
       "fields_other": "{ {{count}} fields }",
       "generatingQueryPlan": "Generating query plan...",
@@ -402,18 +409,30 @@
     "empty": {
       "title": "Collection is empty — nothing to analyze."
     },
+    "export": {
+      "failed": "Could not export the schema: {{error}}",
+      "json": "JSON",
+      "markdown": "Markdown"
+    },
     "labels": {
       "analyzing": "Analyzing schema…",
       "coverage": "coverage",
       "field": "field",
       "fieldsCount_one": "{{count}} field",
       "fieldsCount_other": "{{count}} fields",
-      "planned": "Planned",
+      "noValues": "No repeated values in the sample.",
       "sampledSummary": "sampled {{sampled}} docs · {{fields}} fields",
       "schemaPrefix": "Schema:",
-      "types": "types",
-      "validationComingSoonPrefix": "Collection validation schema viewer coming soon (#93). This tab will show",
-      "validationComingSoonSuffix": "and validator rules for {{databaseName}}.{{collectionName}}."
+      "showValues": "Click to show the most common values",
+      "types": "types"
+    },
+    "sample": {
+      "docs_one": "{{count}} doc",
+      "docs_other": "{{count}} docs",
+      "first": "First N",
+      "mode": "Sample mode",
+      "random": "Random",
+      "size": "Sample size"
     },
     "tabs": {
       "fieldAnalysis": "Field Analysis",

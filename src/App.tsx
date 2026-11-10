@@ -46,6 +46,7 @@ import { MongoShell } from './components/MongoShell';
 import { ToolSetupDialog, type ManagedToolStatusUi, type InstallTaskUi } from './components/ToolSetupDialog';
 import { QuickStart } from './components/QuickStart';
 import { DocumentEditModal } from './components/DocumentEditModal';
+import { UpdateManyModal } from './components/UpdateManyModal';
 import {
   ExportView,
   DEFAULT_EXPORT_OPTIONS,
@@ -4653,32 +4654,15 @@ function Workspace() {
     }
   };
 
+  // Update Many counts first, then opens UpdateManyModal, which names the
+  // filter and the count, so submitting it is the confirmation. It belongs to
+  // the tab it was opened from and shows only while that tab does, since it
+  // does not name the collection it writes to (#550 review).
+  const [updateManyTarget, setUpdateManyTarget] = useState<{ tab: QueryTab; filter: string; count: number; openedAt: number } | null>(null);
+
   const handleUpdateMany = async (tab: QueryTab) => {
     if (tab.type !== 'collection') return;
     const filter = bulkFilter(tab);
-    const update = await prompt({
-      title: t('documents:dataGrid.dialogs.updateMany.title'),
-      message: t('documents:dataGrid.dialogs.updateMany.promptMessage'),
-      defaultValue: '{ "$set": {} }',
-      validate: (v) => {
-        let parsed: any;
-        try {
-          parsed = JSON.parse(v);
-        } catch {
-          return t('documents:dataGrid.dialogs.updateMany.validation.invalidJson');
-        }
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          return t('documents:dataGrid.dialogs.updateMany.validation.mustBeObject');
-        }
-        if (Object.keys(parsed).length === 0 || !Object.keys(parsed).every((k) => k.startsWith('$'))) {
-          return t('documents:dataGrid.dialogs.updateMany.validation.mustUseOperators');
-        }
-        return null;
-      },
-    });
-    if (!update) return; // cancelled
-    // #188 Task 3: see handleDeleteMany's comment on this same lookup.
-    const mode = activeConnections.find((c) => c.id === tab.connectionId)?.mode ?? 'normal';
     try {
       const count = await invoke<number>('count_documents', {
         id: tab.connectionId,
@@ -4686,6 +4670,20 @@ function Workspace() {
         collection: tab.collection,
         filter,
       });
+      setUpdateManyTarget({ tab, filter, count, openedAt: Date.now() });
+    } catch (err: any) {
+      toast(t('toast.updateFailed', { detail: err?.message || err }), 'error');
+    }
+  };
+
+  /** `update` is Extended JSON from UpdateManyModal. */
+  const runUpdateMany = async (update: string) => {
+    if (!updateManyTarget) return;
+    const { tab, filter, count } = updateManyTarget;
+    setUpdateManyTarget(null);
+    // #188 Task 3: see handleDeleteMany's comment on this same lookup.
+    const mode = activeConnections.find((c) => c.id === tab.connectionId)?.mode ?? 'normal';
+    try {
       let confirmed = false;
       if (mode === 'confirm_destructive') {
         const ok = await confirmByTypedName(prompt, {
@@ -4698,15 +4696,6 @@ function Workspace() {
         }, t);
         if (!ok) return;
         confirmed = true;
-      } else if (
-        !(await confirm({
-          title: t('documents:dataGrid.dialogs.updateMany.title'),
-          message: bulkConfirmMessage('update', count, filter),
-          confirmLabel: t('documents:dataGrid.dialogs.updateMany.confirmLabel'),
-          destructive: true,
-        }))
-      ) {
-        return;
       }
       const modified = await invoke<number>('update_many', {
         id: tab.connectionId,
@@ -4780,11 +4769,44 @@ function Workspace() {
       return;
     }
 
-    const target = edit.targetDoc;
+    await writeDocumentUpdate(tab, edit.targetDoc, json);
+    const savedIn = tabHoldingEdit(edit.id) ?? tab;
+    closeEditById(edit.id);
+    await refreshTabResults(savedIn);
+    toast(t('toast.documentSavedIn', { collection }), 'success', { title: t('toast.savedTitle') });
+  };
+
+  /** Saves one value edited in place in the results grid. Rejects, after a
+   *  toast, so the grid keeps the cell editor open with the value typed. */
+  const handleEditField = async (tab: QueryTab, doc: Record<string, any>, edited: Record<string, any>) => {
+    // A tab on its way to another window is frozen; the edit goes with it.
+    if (movingTabIds.has(tab.id)) throw new Error(t('toast.tabMoving'));
+    // Registered like a dialog save, through the refresh, so the tab is not
+    // moved and its namespace not dropped or renamed while the write is out.
+    const editId = `cell:${crypto.randomUUID()}`;
+    setPendingSaves(prev => [
+      ...prev,
+      { editId, tabId: tab.id, connectionId: tab.connectionId, db: tab.db, collection: tab.collection },
+    ]);
+    try {
+      try {
+        await writeDocumentUpdate(tab, doc, shellToEjson(docToShell(edited)));
+      } catch (err: any) {
+        toast(t('toast.updateFailed', { detail: err?.message || err }), 'error');
+        throw err;
+      }
+      await refreshTabResults(tab);
+      toast(t('toast.documentSavedIn', { collection: tab.collection }), 'success', { title: t('toast.savedTitle') });
+    } finally {
+      setPendingSaves(prev => prev.filter(s => s.editId !== editId));
+    }
+  };
+
+  const writeDocumentUpdate = async (tab: QueryTab, target: Record<string, any> | null | undefined, json: string) => {
     if (!target || target._id === undefined) {
-      // Caught by handleSaveDocument and filed on the edit, which the dialog
-      // renders straight into its error banner — so the text is user-facing
-      // copy, not a dev invariant.
+      // A row shown without its `_id` would update by an empty filter. The
+      // message is user-facing: the document dialog shows it in its error
+      // banner, and the cell editor in its tooltip.
       throw new Error(t('documents:editModal.errors.noId'));
     }
     // Send the document as loaded *and* as edited so the backend can apply only
@@ -4794,7 +4816,7 @@ function Workspace() {
     await invoke('update_document', {
       id: tab.connectionId,
       database: tab.db,
-      collection,
+      collection: tab.collection,
       filter: JSON.stringify({ _id: target._id }),
       // Must be EJSON, not shell text: the backend parses both sides with strict
       // `serde_json`, and DocumentEditModal already converts the editor contents
@@ -4818,10 +4840,6 @@ function Workspace() {
         ? (pipelineYieldsWholeDocuments(tab.lastAggregate) ? '{}' : null)
         : (tab.lastQuery?.projection ?? '{}'),
     });
-    const savedIn = tabHoldingEdit(edit.id) ?? tab;
-    closeEditById(edit.id);
-    await refreshTabResults(savedIn);
-    toast(t('toast.documentSavedIn', { collection }), 'success', { title: t('toast.savedTitle') });
   };
 
   const handleExplainQuery = async (tab: QueryTab, filter: string): Promise<string> => {
@@ -5010,6 +5028,7 @@ function Workspace() {
                     querySpec={buildTabQuerySpec(tab)}
                     onInsertDocument={() => handleInsertDocument(tab)}
                     onEditDocument={rowsAreStoredDocuments(tab) ? (doc => handleEditDocument(tab, doc)) : undefined}
+                    onEditField={rowsAreStoredDocuments(tab) ? ((doc, edited) => handleEditField(tab, doc, edited)) : undefined}
                     onDuplicateDocument={doc => handleDuplicateDocument(tab, doc)}
                     onDeleteDocument={rowsAreStoredDocuments(tab) ? (doc => handleDeleteDocument(tab, doc)) : undefined}
                     onAnalyzeSchema={isCommandBlocked(tab.connectionId, 'analyze_schema') ? undefined : () => handleOpenSchemaTab(tab.connectionId, tab.db, tab.collection)}
@@ -5043,6 +5062,8 @@ function Workspace() {
             connectionId={tab.connectionId}
             databaseName={tab.db}
             collectionName={tab.collection}
+            onValidatorApplied={() => setCollectionMutationTrigger(prev => prev + 1)}
+            validationBlocked={isCommandBlocked(tab.connectionId, 'set_validator')}
           />
         )}
         {tab.type === 'create-view' && (
@@ -5061,6 +5082,7 @@ function Workspace() {
             databaseName={tab.db}
             collectionName={tab.collection}
             onApplied={() => setCollectionMutationTrigger(prev => prev + 1)}
+            canSample={!isCommandBlocked(tab.connectionId, 'analyze_schema')}
           />
         )}
         {tab.type === 'generate' && (
@@ -5513,6 +5535,16 @@ function Workspace() {
             onJsonChange={(draft) => activeTab && setDocumentDraft(activeTab.id, draft)}
             onClose={() => activeTab && closeDocumentEdit(activeTab.id)}
             onSave={handleSaveDocument}
+          />
+
+          <UpdateManyModal
+            // A fresh draft per Update Many; hiding it on another tab keeps the draft.
+            key={updateManyTarget?.openedAt ?? 'none'}
+            isOpen={updateManyTarget !== null && updateManyTarget.tab.id === activeTab?.id}
+            filter={updateManyTarget?.filter ?? '{}'}
+            count={updateManyTarget?.count ?? 0}
+            onClose={() => setUpdateManyTarget(null)}
+            onSubmit={runUpdateMany}
           />
 
           <UpdatePrompt />
