@@ -2,9 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Trans, useTranslation } from 'react-i18next';
 import Editor from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
+import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { AlertCircle, Braces, CornerDownLeft, Eraser, Play, RotateCcw, Sparkles, Square, Terminal } from 'lucide-react';
+import { AlertCircle, Braces, CornerDownLeft, Eraser, FolderOpen, Play, RotateCcw, Save, Sparkles, Square, Terminal } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -21,8 +22,11 @@ import type { IndexInfo } from './Sidebar';
 import { buildRunnableCommand, guardScriptRun, type GeneratedQuery } from '../lib/mongoCommand';
 import { DataGrid } from './DataGrid';
 import { registerMongoCompletionProvider, setModelMeta, clearModelMeta } from '../lib/monacoMongo';
+import { shellCollectionAt } from '../lib/mongoCompletions';
+import { fetchSchema, type SchemaMap } from '../lib/useCollectionSchema';
 import { useMonacoTheme, useMonacoFontSize } from '../lib/useMonacoTheme';
 import { useMonacoValue } from '../lib/useMonacoValue';
+import { statementAt } from '../lib/shellStatement';
 import { attachMonaco } from '../lib/monacoAppTheme';
 import { formatShortcut, shortcutById } from '@/lib/shortcuts';
 import { windowLabel } from '../workspace/workspaceStore';
@@ -399,7 +403,12 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     () => initialCommand || (collectionName ? `db.${collectionName}.find({}).limit(50)` : 'show collections'),
     [collectionName, initialCommand]
   );
-  const [command, setCommand] = useState(defaultCommand);
+  // The saved editor text, unless the shell now opens with another query:
+  // App remounts it for that, under the same session.
+  const openingCommand = initialCommand ?? '';
+  const savedText = (session?: ShellSession) =>
+    (session?.editorFor ?? '') === openingCommand ? session?.editorText : undefined;
+  const [command, setCommand] = useState(savedText(storedSession) ?? defaultCommand);
   const commandEditor = useMonacoValue(command, setCommand);
   const monacoTheme = useMonacoTheme();
   const monacoFontSize = useMonacoFontSize(13);
@@ -524,6 +533,9 @@ export const MongoShell: React.FC<MongoShellProps> = ({
         setIsAIOpenState(restored.aiOpen);
         setAiChatId(restored.aiChatId);
         autoRunRef.current = restored.autoRanCommand;
+        const text = savedText(restored);
+        if (text !== undefined) setCommand(text);
+        if (restored.scriptPath) scriptPathRef.current = restored.scriptPath;
         // A command recorded as running whose caller is not in this renderer:
         // the window was reloaded, or the tab arrived from another window,
         // while a script ran. Its result went to the view it started in. What
@@ -763,13 +775,24 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     return () => document.removeEventListener('keydown', onKeyDown, true);
   }, [tab]);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const runRef = useRef<() => void>(() => {});
+  const runRef = useRef<(script?: string) => void>(() => {});
+  // The script file last opened or saved, offered again by Save. Kept in the
+  // tab's session too, since a ref resets when the shell remounts.
+  const scriptPathRef = useRef<string | null>(storedSession?.scriptPath ?? null);
+  const rememberScriptPath = (path: string) => {
+    scriptPathRef.current = path;
+    persistSession({ scriptPath: path });
+  };
   // Seeded from the tab's session: the opening command must run once per TAB,
   // not once per mount, or switching tabs re-executes it (#240).
   const autoRunRef = useRef(storedSession?.autoRanCommand ?? false);
   // Tracks the latest result docs so the Monaco completion provider (registered
   // once in onMount) can derive field names from the current results.
   const viewerRef = useRef<{ docs: Record<string, any>[] } | null>(null);
+  // What the completion provider (registered once in onMount) samples field
+  // paths from: the collection a statement names, else the shell's own.
+  const schemaScopeRef = useRef({ connectionId, db: currentDb, collection: collectionName });
+  schemaScopeRef.current = { connectionId, db: currentDb, collection: collectionName };
   // Collection names for the current db, for `db.<coll>` completions in the shell.
   const collectionsRef = useRef<string[]>([]);
   useEffect(() => {
@@ -780,9 +803,26 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     return () => { alive = false; };
   }, [connectionId, currentDb]);
 
+  // The default is read only at mount: App keys this view by tab id and
+  // opening command, so a new default (a rename, another command) remounts it.
+  // Keep the editor's text in the tab's session, with the script path it
+  // belongs to, while this view still owns that session: a rename or a move to
+  // another window re-keys it before this view unmounts. Not before hydration,
+  // which may bring back a saved text this would overwrite.
+  // ponytail: 300ms debounce, so the last 300ms of typing before a rename or
+  // move is lost; flush from those paths if that matters.
+  const commandRef = useRef(command);
+  commandRef.current = command;
+  const hydratedRef = useRef(hydrated);
+  hydratedRef.current = hydrated;
   useEffect(() => {
-    setCommand(defaultCommand);
-  }, [defaultCommand]);
+    if (!hydrated) return;
+    const timer = setTimeout(() => persistSession({ editorText: command, editorFor: openingCommand }), 300);
+    return () => clearTimeout(timer);
+  }, [command, hydrated]);
+  useEffect(() => () => {
+    if (hydratedRef.current) persistSession({ editorText: commandRef.current, editorFor: openingCommand });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1267,6 +1307,44 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     appendEntries([{ kind: 'note', text: t('mongoShell.notes.destructiveCancelled') }]);
   };
 
+  const scriptFilters = [
+    { name: t('mongoShell.script.filter'), extensions: ['js', 'mongodb'] },
+    { name: t('mongoShell.script.allFiles'), extensions: ['*'] },
+  ];
+
+  const openScript = async () => {
+    try {
+      const path = await openFileDialog({
+        multiple: false,
+        directory: false,
+        title: t('mongoShell.toolbar.openScript'),
+        filters: scriptFilters,
+      });
+      if (typeof path !== 'string') return;
+      setCommand(await readTextFile(path));
+      rememberScriptPath(path);
+    } catch (err: any) {
+      appendEntries([{ kind: 'error', message: t('mongoShell.script.openFailed', { message: String(err?.message ?? err) }) }]);
+      setTab('console');
+    }
+  };
+
+  const saveScript = async () => {
+    try {
+      const path = await saveFileDialog({
+        title: t('mongoShell.toolbar.saveScript'),
+        defaultPath: scriptPathRef.current ?? 'script.js',
+        filters: scriptFilters,
+      });
+      if (!path) return;
+      await writeTextFile(path, command);
+      rememberScriptPath(path);
+    } catch (err: any) {
+      appendEntries([{ kind: 'error', message: t('mongoShell.script.saveFailed', { message: String(err?.message ?? err) }) }]);
+      setTab('console');
+    }
+  };
+
   const runCommand = async (commandOverride?: string) => {
     const raw = (commandOverride ?? command).trim().replace(/;$/, '');
     if (!raw || running) return;
@@ -1415,7 +1493,7 @@ export const MongoShell: React.FC<MongoShellProps> = ({
     void restartSession();
   };
 
-  runRef.current = () => runCommand();
+  runRef.current = (script) => runCommand(script);
   viewerRef.current = viewer;
 
   useEffect(() => {
@@ -1560,8 +1638,8 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               {t('mongoShell.notes.runningFor', { seconds: runningFor })}
             </span>
           ) : (
-            <span className="font-mono text-[10px] text-muted-foreground">
-              {formatShortcut(shortcutById('run-query')!)}
+            <span className="font-mono text-[10px] text-muted-foreground" data-testid="shell-run-hint">
+              {formatShortcut(shortcutById('shell-run-all')!)}
             </span>
           )}
           {running && inMongosh ? (
@@ -1579,7 +1657,16 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           ) : (
             // Disabled rather than replaced while a recognised command is in
             // its driver phase: Stop could not end that, so it is not offered.
-            <Button size="sm" onClick={() => runRef.current()} disabled={running}>
+            <Button
+              size="sm"
+              onClick={() => runRef.current()}
+              disabled={running}
+              data-testid="shell-run"
+              title={t('mongoShell.toolbar.runTitle', {
+                all: formatShortcut(shortcutById('shell-run-all')!),
+                statement: formatShortcut(shortcutById('run-query')!),
+              })}
+            >
               <Play size={11} />
               {t('mongoShell.toolbar.run')}
             </Button>
@@ -1604,6 +1691,24 @@ export const MongoShell: React.FC<MongoShellProps> = ({
           >
             <Sparkles size={11} />
             {t('mongoShell.toolbar.aiToggleLabel')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void openScript()}
+            data-testid="shell-open-script"
+            title={t('mongoShell.toolbar.openScript')}
+          >
+            <FolderOpen size={11} />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void saveScript()}
+            data-testid="shell-save-script"
+            title={t('mongoShell.toolbar.saveScript')}
+          >
+            <Save size={11} />
           </Button>
         </div>
         <div className="min-h-0 flex-1">
@@ -1631,18 +1736,32 @@ export const MongoShell: React.FC<MongoShellProps> = ({
               contextmenu: false,
               // Enter accepts an open suggestion; otherwise inserts a newline.
               acceptSuggestionOnEnter: 'on',
+              // Suggest while typing, in quoted keys too: a dotted path needs quotes.
+              quickSuggestions: { other: true, comments: false, strings: true },
             }}
             onMount={(editor, monaco) => {
               commandEditor.onMount(editor, monaco);
               attachMonaco(monaco);
               monaco.editor.setTheme(monacoTheme);
               // Enter accepts an open suggestion, else newline. Ctrl/Cmd+Enter
-              // runs — scoped via onKeyDown (not addCommand, which leaks globally).
+              // runs the selection, or the statement under the cursor; Shift+Enter
+              // runs everything. Scoped via onKeyDown (not addCommand, which leaks
+              // globally).
               editor.onKeyDown((e) => {
-                if ((e.ctrlKey || e.metaKey) && e.keyCode === monaco.KeyCode.Enter) {
-                  e.preventDefault();
-                  e.stopPropagation();
+                if (e.keyCode !== monaco.KeyCode.Enter || e.altKey) return;
+                const mod = e.ctrlKey || e.metaKey;
+                if (mod === e.shiftKey) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const model = editor.getModel();
+                const selection = editor.getSelection();
+                const position = editor.getPosition();
+                if (e.shiftKey || !model || !position) {
                   runRef.current();
+                } else if (selection && !selection.isEmpty()) {
+                  runRef.current(model.getValueInRange(selection));
+                } else {
+                  runRef.current(statementAt(model.getValue(), model.getOffsetAt(position)));
                 }
               });
               editor.focus();
@@ -1657,21 +1776,51 @@ export const MongoShell: React.FC<MongoShellProps> = ({
                 noSyntaxValidation: true,
                 noSuggestionDiagnostics: true,
               });
+              // Sampled schemas that have arrived. Suggestions never wait for a
+              // sample: the first ask starts it and offers what needs none, and
+              // the list stays "incomplete" meanwhile, so the next keystroke
+              // asks again and picks the fields up once they are in.
+              const sampled = new Map<string, SchemaMap>();
+              const pending = new Set<string>();
+              const sampledSchema = (text: string): SchemaMap => {
+                const { connectionId: id, db, collection } = schemaScopeRef.current;
+                const coll = shellCollectionAt(text) ?? collection;
+                if (!coll) return new Map();
+                const key = `${id}::${db}::${coll}`;
+                const ready = sampled.get(key);
+                if (ready || pending.has(key)) return ready ?? new Map();
+                pending.add(key);
+                void fetchSchema(id, db, coll).then((schema) => {
+                  pending.delete(key);
+                  sampled.set(key, schema);
+                  // A list still open while the sample was out is asked again,
+                  // now with the fields. `auto` so an empty answer closes it
+                  // instead of pinning "No suggestions" while the user types on.
+                  // The controller itself: editor.trigger() goes through the
+                  // command service, which did not reach this editor here.
+                  if (editor.hasTextFocus() && editor.getDomNode()?.querySelector('.suggest-widget.visible')) {
+                    editor.getContribution<{ dispose(): void; triggerSuggest(onlyFrom?: unknown, auto?: boolean): void }>('editor.contrib.suggestController')?.triggerSuggest(undefined, true);
+                  }
+                });
+                return new Map();
+              };
               const model = editor.getModel();
               if (model) {
                 const uri = model.uri.toString();
                 setModelMeta(uri, {
                   surface: 'shell',
-                  getFields: () => {
+                  getFields: (text) => {
                     const docs = viewerRef.current?.docs ?? [];
                     const keys = new Set<string>(['_id']);
                     docs.forEach((d) => {
                       if (d && typeof d === 'object') Object.keys(d).forEach((k) => keys.add(k));
                     });
+                    sampledSchema(text).forEach((_, path) => keys.add(path));
                     return Array.from(keys);
                   },
-                  getSchema: () => undefined,
+                  getSchema: sampledSchema,
                   getCollections: () => collectionsRef.current,
+                  isIncomplete: () => pending.size > 0,
                 });
                 editor.onDidDispose(() => clearModelMeta(uri));
               }
